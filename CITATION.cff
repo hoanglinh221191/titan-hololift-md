@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: "If you use HoloLift-MD, please cite the paper below."
+title: "HoloLift-MD"
+version: "1.0.0"
+date-released: "2026-09-25"
+license: MIT
+repository-code: "https://github.com/hoanglinh221191/titan-hololift-md"
+authors:
+  - family-names: "O"
+    given-names: "My Na"
+  - family-names: "Ngo"
+    given-names: "Thi Chinh"
+    orcid: "https://orcid.org/0000-0002-8206-5996"
+  - family-names: "Mai"
+    given-names: "Tam V.-T."
+    orcid: "https://orcid.org/0000-0002-4310-2037"
+  - family-names: "Huynh"
+    given-names: "Quang Linh"
+  - family-names: "Li"
+    given-names: "Mai Suan"
+  - family-names: "Nguyen"
+    given-names: "Hoang Linh"
+preferred-citation:
+  type: article
+  title: "HoloLift-MD: Temporal Selection of Periodic Images for Molecular Assemblies in Simulation Trajectories"
+  status: submitted
+  authors:
+    - family-names: "O"
+      given-names: "My Na"
+    - family-names: "Ngo"
+      given-names: "Thi Chinh"
+    - family-names: "Mai"
+      given-names: "Tam V.-T."
+    - family-names: "Huynh"
+      given-names: "Quang Linh"
+    - family-names: "Li"
+      given-names: "Mai Suan"
+    - family-names: "Nguyen"
+      given-names: "Hoang Linh"

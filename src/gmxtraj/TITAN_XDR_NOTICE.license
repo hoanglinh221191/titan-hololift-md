@@ -1,0 +1,18 @@
+TITAN XDR/XTC reader provenance
+
+The original xdrfile.cpp, xdrfile_xtc.cpp, and xdrfile_trr.cpp files in this
+directory come from the standalone GROMACS xdrfile code path with the
+2009-2014 BSD-style notice preserved in each source file.
+
+TITAN's modern XTC compatibility updates for magic 2023, 64-bit compressed
+payload byte counts, and the float-coordinate DataBuffer/receivebits/
+receiveints decoder were derived from the GROMACS 2026.3 xdr3dfcoord reader:
+
+- src/gromacs/fileio/xdrf.h
+- src/gromacs/fileio/libxdrf.cpp
+- src/gromacs/fileio/xtcio.cpp
+
+Those GROMACS files are licensed under LGPL-2.1-or-later by the GROMACS
+authors. Keep this note with any redistribution of TITAN builds that include
+the modernized XTC reader, and include the corresponding GROMACS/TITAN source
+for the modified reader component when distributing binaries.
