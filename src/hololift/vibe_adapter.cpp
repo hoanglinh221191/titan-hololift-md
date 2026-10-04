@@ -5,6 +5,7 @@
 #include "validation.h"
 #include "vibe_contract.h"
 
+#include <algorithm>
 #include <limits>
 #include <span>
 #include <utility>
@@ -12,6 +13,16 @@
 
 namespace titan_hololift {
 namespace {
+
+// Reserve before an append so that a failed allocation leaves the builder
+// untouched, but grow geometrically: reserving exactly size + n on every
+// frame reallocates and copies the whole store each time.
+template <typename T>
+void reserve_for_append(std::vector<T> &values, std::size_t needed) {
+  if (needed <= values.capacity())
+    return;
+  values.reserve(std::max(needed, 2 * values.capacity()));
+}
 
 HoloLiftFrameStatus
 convert_status(titan_pbctopo::PbctopoFrameStatus value) noexcept {
@@ -628,9 +639,11 @@ std::expected<std::size_t, std::string> append_hololift_vibe_frame(
   const std::size_t frame_index = builder.frames.size();
   const std::size_t candidate_base = builder.candidates.size();
   const std::size_t image_base = builder.component_images.size();
-  builder.frames.reserve(frame_index + 1);
-  builder.candidates.reserve(candidate_base + local_candidates.size());
-  builder.component_images.reserve(image_base + local_images.size());
+  reserve_for_append(builder.frames, frame_index + 1);
+  reserve_for_append(builder.candidates,
+                     candidate_base + local_candidates.size());
+  reserve_for_append(builder.component_images,
+                     image_base + local_images.size());
   for (auto &candidate : local_candidates)
     candidate.component_images.begin += image_base;
   local_frame.candidates.begin = candidate_base;

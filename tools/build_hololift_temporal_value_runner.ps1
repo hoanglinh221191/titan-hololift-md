@@ -1,6 +1,10 @@
+# Builds the runner the way TITAN is built (clang++ -O3 -march=native, msys64 ucrt64 on PATH).  Frame binding compares
+# a hash of the wrapped coordinates bit for bit, and on a triclinic cell a g++ -O2 build differs from TITAN's in the
+# last bit, so every triclinic package would fail with "wrapped XTC coordinates do not match VIBE binding".
 param(
-    [string]$Compiler = 'g++',
+    [string]$Compiler = 'clang++',
     [string]$Output = 'build\hololift_temporal_value_runner.exe',
+    [string[]]$OptimizationFlags = @('-O3', '-march=native'),
     [string[]]$ExtraCompilerFlags = @()
 )
 
@@ -17,6 +21,7 @@ $sources = @(
     (Join-Path $repo 'src\hololift\lattice_transport.cpp'),
     (Join-Path $repo 'src\hololift\phase1.cpp'),
     (Join-Path $repo 'src\hololift\spatial_lift.cpp'),
+    (Join-Path $repo 'src\hololift\temporal_runner.cpp'),
     (Join-Path $repo 'src\hololift\validation.cpp'),
     (Join-Path $repo 'src\hololift\vibe_adapter.cpp'),
     (Join-Path $repo 'src\hololift\vibe_contract.cpp'),
@@ -33,7 +38,7 @@ $sources = @(
 # the exit code, not stderr, decides success.
 $previousPreference = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
-& $Compiler -std=c++23 -O2 -pthread -Wall -Wextra -Wpedantic -Wconversion @ExtraCompilerFlags `
+& $Compiler -std=c++23 @OptimizationFlags -pthread -Wall -Wextra -Wpedantic -Wconversion @ExtraCompilerFlags `
     "-I$(Join-Path $repo 'src')" `
     "-I$(Join-Path $repo 'src\gmxtraj\include')" `
     @sources -o $outputPath 2>&1 | ForEach-Object { "$_" }

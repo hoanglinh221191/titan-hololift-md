@@ -1635,6 +1635,92 @@ int main(int argc, char **argv) {
                      .begin()),
          "trajectory audit digest did not bind selected assignment identity");
 
+  // The streamed audit seals the same result for any block size and worker
+  // count, across this fixture's observation gaps and segment boundary, and
+  // returns the coordinates reconstruct_hololift_phase1_frame returns.
+  const auto *one_call = selected_path_audited->result_if_valid();
+  expect(one_call != nullptr, "one-call audit seal is unexpectedly empty");
+  for (const std::size_t block : {std::size_t{1}, std::size_t{2}, std::size_t{4}}) {
+    auto stream =
+        begin_hololift_phase1_audit(*preparation, store, verified, *result);
+    expect(stream.has_value(), "streamed audit failed to start");
+    for (std::size_t first = 0; first < trajectory_views.size();
+         first += block) {
+      const std::size_t count =
+          std::min(block, trajectory_views.size() - first);
+      auto lattice = stream->audit_block(
+          first,
+          std::span<const HoloLiftPhase1TrajectoryFrameView>(trajectory_views)
+              .subspan(first, count),
+          3);
+      expect(lattice.has_value() && lattice->size() == count,
+             "streamed audit block failed");
+      for (std::size_t offset = 0; offset < count; ++offset) {
+        const auto &selection = result->frames[first + offset];
+        if (selection.use != HoloLiftPhase1FrameUse::TemporalObservation) {
+          expect((*lattice)[offset].empty(),
+                 "streamed audit returned coordinates for a gap frame");
+          continue;
+        }
+        auto expected = reconstruct_hololift_phase1_frame(
+            *preparation, store, verified[first + offset], selection,
+            kAtomOrder, coordinates[first + offset]);
+        expect(expected.has_value() && *expected == (*lattice)[offset],
+               "streamed audit coordinates differ from the reconstruction");
+      }
+    }
+    auto streamed = stream->finish();
+    expect(streamed.has_value(), "streamed audit failed to seal");
+    const auto *sealed = streamed->result_if_valid();
+    expect(sealed != nullptr &&
+               std::equal(
+                   streamed->trajectory_audit_digest_sha256().begin(),
+                   streamed->trajectory_audit_digest_sha256().end(),
+                   selected_path_audited->trajectory_audit_digest_sha256()
+                       .begin()) &&
+               sealed->reconstruction_audit.atoms_audited ==
+                   one_call->reconstruction_audit.atoms_audited &&
+               sealed->reconstruction_audit
+                       .atom_temporal_transitions_audited ==
+                   one_call->reconstruction_audit
+                       .atom_temporal_transitions_audited &&
+               sealed->reconstruction_audit
+                       .independent_space_time_edges_audited ==
+                   one_call->reconstruction_audit
+                       .independent_space_time_edges_audited &&
+               sealed->reconstruction_audit
+                       .maximum_atom_peculiar_displacement_A ==
+                   one_call->reconstruction_audit
+                       .maximum_atom_peculiar_displacement_A,
+           "streamed audit seal differs from the one-call audit");
+  }
+  {
+    auto stream =
+        begin_hololift_phase1_audit(*preparation, store, verified, *result);
+    expect(stream.has_value(), "streamed audit failed to start");
+    expect(!stream
+                ->audit_block(1,
+                              std::span<const HoloLiftPhase1TrajectoryFrameView>(
+                                  trajectory_views)
+                                  .subspan(1, 1),
+                              1)
+                .has_value() &&
+               !stream->finish().has_value(),
+           "streamed audit accepted a block out of order");
+    auto short_stream =
+        begin_hololift_phase1_audit(*preparation, store, verified, *result);
+    expect(short_stream.has_value() &&
+               short_stream
+                   ->audit_block(0,
+                                 std::span<const HoloLiftPhase1TrajectoryFrameView>(
+                                     trajectory_views)
+                                     .subspan(0, 2),
+                                 2)
+                   .has_value() &&
+               !short_stream->finish().has_value(),
+           "streamed audit sealed without every frame");
+  }
+
   auto run_atom_order_audit =
       [&](HoloLiftObservationStoreBuilder order_builder,
           std::vector<Coordinates> order_coordinates,

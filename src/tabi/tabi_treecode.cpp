@@ -1,0 +1,237 @@
+#include "tabi_types.h"
+#include "tabi_treecode_internal.h"
+
+namespace TitanPBE::Tabi {
+
+TreeWorkspace build_tree_workspace(const std::vector<Panel> &panels,
+                                   TitanExecutor &executor,
+                                   std::size_t leaf_size,
+                                   double opening_theta,
+                                   const std::string &leaf_near_policy,
+                                   const std::string &leaf_panel_kernel,
+                                   const std::string &adaptive_level,
+                                   const std::string &quad_buffer,
+                                   const std::string &interaction_mode,
+                                   const std::string &node_bounds_mode,
+                                   const std::string &tree_builder,
+                                   const std::string &mac_safety,
+                                   double mac_gap_factor,
+                                   const std::string &moment_audit,
+                                   const std::string &expansion_center,
+                                   const std::string &fragmentation_safety,
+                                   const std::string &expansion_audit,
+                                   int expansion_audit_sample_count,
+                                   int expansion_audit_max_panels,
+                                   const std::string &moment_construction,
+                                   const std::string &moment_sum,
+                                   const std::string &convergence_audit,
+                                   const std::string &convergence_safety,
+                                   double convergence_rho_cap,
+                                   double mac_aspect_cap,
+                                   const std::string &convergence_estimator,
+                                   double convergence_tail_threshold,
+                                   double convergence_estimator_error_cap,
+                                   double convergence_unstable_rho_cap,
+                                   const std::string
+                                       &convergence_calibration,
+                                   const std::string &cluster_policy,
+                                   const std::string
+                                       &convergence_dielectric_amp,
+                                   int target_batch_size,
+                                   int leaf_pair_min_source_panels,
+                                   int leaf_pair_min_targets,
+                                   const std::string
+                                       &convergence_estimator_model,
+                                   const std::string
+                                       &expansion_audit_channel,
+                                   const std::string
+                                       &convergence_channel_calibration,
+                                   const std::string
+                                       &channel_missed_semantics,
+                                   const std::string
+                                       &convergence_split_policy,
+                                   const std::string
+                                       &accepted_miss_diagnostics,
+                                   double convergence_k3_accepted_rho_cap,
+                                   const std::string
+                                       &mac_distance_policy,
+                                   double mac_surface_margin_factor,
+                                   const std::string
+                                       &mac_surface_margin_policy,
+                                   double mac_surface_margin_aspect_threshold,
+                                   double mac_surface_margin_rho_trigger,
+                                   double accepted_miss_absolute_floor,
+                                   const std::string &leaf_pair_kernel,
+                                   const std::string &leaf_kernel_profile,
+                                   const std::string &leaf_work_profile,
+                                   const std::string &jcp_direct_kernel,
+                                   const std::string
+                                       &leaf_pair_selection_profile,
+                                   const std::string &leaf_pair_probe_cache,
+                                   const std::string &leaf_pair_target_group,
+                                   int leaf_pair_max_lookahead,
+                                   const std::string
+                                       &leaf_pair_directness_probe,
+                                   const std::string
+                                       &leaf_pair_directness_cache,
+                                   const std::string
+                                       &leaf_pair_directness_verify,
+                                   const std::string &leaf_pair_scheduler,
+                                   int leaf_pair_worklist_max_active,
+                                   const std::string
+                                       &leaf_pair_worklist_verify,
+                                   const std::string &leaf_block_verify,
+                                   double mac_surface_margin_soft_aspect_threshold,
+                                   double mac_surface_margin_soft_rho_trigger,
+                                   double mac_surface_margin_soft_factor,
+                                   const std::string
+                                       &convergence_split_selectivity,
+                                   double convergence_split_absolute_floor,
+                                   const std::string
+                                       &convergence_overreject_audit,
+                                   const std::string
+                                       &convergence_overreject_detail,
+                                   const std::string
+                                       &convergence_shape_audit,
+                                   const std::string
+                                       &convergence_kernel_response_audit,
+                                   const std::string &leaf_mac,
+                                   const std::string &fmm_m2l) {
+  return detail::build_tree_workspace_impl(
+      panels,
+      executor,
+      leaf_size,
+      opening_theta,
+      leaf_near_policy,
+      leaf_panel_kernel,
+      adaptive_level,
+      quad_buffer,
+      interaction_mode,
+      node_bounds_mode,
+      tree_builder,
+      mac_safety,
+      mac_gap_factor,
+      moment_audit,
+      expansion_center,
+      fragmentation_safety,
+      expansion_audit,
+      expansion_audit_sample_count,
+      expansion_audit_max_panels,
+      moment_construction,
+      moment_sum,
+      convergence_audit,
+      convergence_safety,
+      convergence_rho_cap,
+      mac_aspect_cap,
+      convergence_estimator,
+      convergence_tail_threshold,
+      convergence_estimator_error_cap,
+      convergence_unstable_rho_cap,
+      convergence_calibration,
+      cluster_policy,
+      convergence_dielectric_amp,
+      target_batch_size,
+      leaf_pair_min_source_panels,
+      leaf_pair_min_targets,
+      convergence_estimator_model,
+      expansion_audit_channel,
+      convergence_channel_calibration,
+      channel_missed_semantics,
+      convergence_split_policy,
+      accepted_miss_diagnostics,
+      convergence_k3_accepted_rho_cap,
+      mac_distance_policy,
+      mac_surface_margin_factor,
+      mac_surface_margin_policy,
+      mac_surface_margin_aspect_threshold,
+      mac_surface_margin_rho_trigger,
+      accepted_miss_absolute_floor,
+      leaf_pair_kernel,
+      leaf_kernel_profile,
+      leaf_work_profile,
+      jcp_direct_kernel,
+      leaf_pair_selection_profile,
+      leaf_pair_probe_cache,
+      leaf_pair_target_group,
+      leaf_pair_max_lookahead,
+      leaf_pair_directness_probe,
+      leaf_pair_directness_cache,
+      leaf_pair_directness_verify,
+      leaf_pair_scheduler,
+      leaf_pair_worklist_max_active,
+      leaf_pair_worklist_verify,
+      leaf_block_verify,
+      mac_surface_margin_soft_aspect_threshold,
+      mac_surface_margin_soft_rho_trigger,
+      mac_surface_margin_soft_factor,
+      convergence_split_selectivity,
+      convergence_split_absolute_floor,
+      convergence_overreject_audit,
+      convergence_overreject_detail,
+      convergence_shape_audit,
+      convergence_kernel_response_audit,
+      leaf_mac,
+      fmm_m2l);
+}
+
+void apply_direct_operator(const std::vector<Panel> &panels,
+                           const std::vector<double> &density,
+                           double contrast, double kappa,
+                           TitanExecutor &executor,
+                           std::vector<double> &out,
+                           TreecodeStats *stats) {
+  detail::apply_direct_operator_impl(
+      panels,
+      density,
+      contrast,
+      kappa,
+      executor,
+      out,
+      stats);
+}
+
+void apply_treecode_operator(const std::vector<Panel> &panels,
+                             const std::vector<double> &density,
+                             double contrast, double kappa,
+                             const TreeWorkspace &tree,
+                             TitanExecutor &executor,
+                             std::vector<double> &out,
+                             TreecodeStats *stats) {
+  detail::apply_treecode_operator_impl(
+      panels,
+      density,
+      contrast,
+      kappa,
+      tree,
+      executor,
+      out,
+      stats);
+}
+
+void apply_jcp_treecode_operator(const std::vector<Panel> &panels,
+                                 const std::vector<double> &unknowns,
+                                 double eps_ratio, double kappa,
+                                 double lhs_phi, double lhs_phin,
+                                 bool coupled, const TreeWorkspace &tree,
+                                 const std::string &near_integration,
+                                 const std::string &quad_buffer,
+                                 TitanExecutor &executor,
+                                 std::vector<double> &out,
+                                 TreecodeStats *stats) {
+  detail::apply_jcp_treecode_operator_impl(
+      panels,
+      unknowns,
+      eps_ratio,
+      kappa,
+      lhs_phi,
+      lhs_phin,
+      coupled,
+      tree,
+      near_integration,
+      quad_buffer,
+      executor,
+      out,
+      stats);
+}
+
+} // namespace TitanPBE::Tabi

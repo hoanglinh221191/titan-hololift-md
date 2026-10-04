@@ -2277,11 +2277,18 @@ validate_temporal_path(const HoloLiftVibeImportOptions &options,
         builder.candidates[frame.candidates.begin + *rank - 1];
     const auto &framewise_candidate =
         builder.candidates[frame.selected_candidate_index];
+    // An applied path state is the frame's temporal output. A change whose
+    // replay was refused leaves the frame an inactive diagnostic (no temporal
+    // selection, framewise output), so the row names a proposal only.
+    const bool replay_provenance_consistent =
+        *replay ? *signature ==
+                          frame.provenance.temporal_assignment_signature &&
+                      frame.provenance.output_assignment_signature == *signature
+                : *changed && !frame.provenance.temporal_selected &&
+                      frame.provenance.temporal_assignment_signature == 0;
     if (*signature != temporal_candidate.assignment_signature ||
-        *signature != frame.provenance.temporal_assignment_signature ||
         *changed != (*signature != framewise_candidate.assignment_signature) ||
-        (*replay &&
-         frame.provenance.output_assignment_signature != *signature)) {
+        !replay_provenance_consistent) {
       return std::unexpected(make_error(
           HoloLiftVibeImportCode::ReferentialIntegrity, path, row.line,
           "temporal path signature provenance is inconsistent"));

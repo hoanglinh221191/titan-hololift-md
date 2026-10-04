@@ -2822,24 +2822,468 @@ reconstruct_hololift_phase1_frame(
       spatial->atom_images, wrapped_coordinates);
 }
 
-std::expected<HoloLiftPhase1AuditedResult, std::string>
-audit_hololift_phase1_all_atom_reconstruction(
+namespace {
+
+struct SelectedAtomAuditFrame {
+  std::size_t frame_index = HOLOLIFT_NO_INDEX;
+  std::size_t segment_index = HOLOLIFT_NO_INDEX;
+  HoloLiftHash128 topology_epoch_identity;
+  std::array<double, 6> physical_gram{};
+  std::vector<std::array<double, 3>> wrapped_reference;
+  std::vector<std::array<double, 3>> selected_reference;
+  std::vector<HoloLiftLatticeImage> spatial_images_reference;
+};
+
+// What the audit of one temporal-observation frame contributes before it is
+// reduced, in frame order, into the frame, segment and global counters.
+struct FrameAuditPart {
+  std::vector<std::array<double, 3>> reconstructed;
+  SelectedAtomAuditFrame atom_frame;
+  double maximum_component_representative_error_A = 0.0;
+};
+
+// The same for the transition into a frame from the previous audited frame of
+// its segment.
+struct TransitionAuditPart {
+  bool audited = false;
+  std::size_t nearest_image_violations = 0;
+  std::size_t injectivity_uncertified = 0;
+  std::size_t independent_ambiguities = 0;
+  std::size_t transitions_audited = 0;
+  std::size_t edges_audited = 0;
+  std::size_t curvature_residuals = 0;
+  double maximum_atom_peculiar_displacement_A = 0.0;
+};
+
+// Runs task(index) for every index in [0, count) on up to `workers` threads,
+// the calling thread included.
+template <typename Task>
+void run_indexed_audit_tasks(std::size_t count, std::size_t workers,
+                             Task &&task) {
+  std::atomic<std::size_t> next{0};
+  const auto drain = [&] {
+    for (std::size_t index = next++; index < count; index = next++)
+      task(index);
+  };
+  std::vector<std::thread> pool;
+  const std::size_t threads =
+      std::min(std::max<std::size_t>(workers, 1), count);
+  for (std::size_t worker = 1; worker < threads; ++worker) {
+    try {
+      pool.emplace_back(drain);
+    } catch (...) {
+      break;
+    }
+  }
+  drain();
+  for (auto &thread : pool)
+    thread.join();
+}
+
+std::expected<FrameAuditPart, std::string> audit_selected_frame(
+    const HoloLiftPhase1PreparationContext::Impl &context,
+    const HoloLiftObservationStore &store,
+    std::span<const HoloLiftPhase1PreparedFrame> prepared_frames,
+    const HoloLiftPhase1Result &result, std::size_t frame_index,
+    const HoloLiftPhase1TrajectoryFrameView &trajectory_frame) {
+  const auto &selection = result.frames[frame_index];
+  if (selection.segment_index >= result.segments.size() ||
+      prepared_frames[frame_index].frame_index() != frame_index ||
+      trajectory_frame.trajectory_frame_index !=
+          prepared_frames[frame_index].trajectory_frame_index()) {
+    return std::unexpected(
+        "Phase 1 reconstruction audit selection binding is invalid");
+  }
+  const auto &atom_order = trajectory_frame.atom_order;
+  const auto &wrapped_coordinates = trajectory_frame.wrapped_coordinates;
+  if (atom_order.size() != wrapped_coordinates.size()) {
+    return std::unexpected(
+        "Phase 1 reconstruction audit atom arrays differ in size");
+  }
+  const auto &frame = store.frames()[frame_index];
+  const auto &epoch = store.topology_epochs()[frame.topology_epoch_index];
+  const auto hard_edges = store.hard_edges().subspan(
+      epoch.hard_edges.begin, epoch.hard_edges.count);
+  const auto binding = validate_hololift_frame_binding(
+      epoch, frame, prepared_frames[frame_index].trajectory_frame_index(),
+      prepared_frames[frame_index].box_matrix(), atom_order,
+      wrapped_coordinates);
+  if (!binding)
+    return std::unexpected(
+        "Phase 1 reconstruction audit frame binding failed: " +
+        binding.error());
+  const auto spatial = replay_hololift_spatial_lift(
+      epoch, frame, hard_edges, atom_order, wrapped_coordinates);
+  if (!spatial)
+    return std::unexpected("Phase 1 atom audit spatial replay failed: " +
+                           spatial.error());
+  if (spatial->identity !=
+          prepared_frames[frame_index].spatial_lift_identity() ||
+      spatial->identity != frame.spatial_lift_identity ||
+      spatial->ambiguous_hard_edges !=
+          frame.spatial_lift_ambiguous_hard_edges ||
+      spatial->cycle_residuals != frame.spatial_lift_cycle_residuals) {
+    return std::unexpected("Phase 1 atom audit spatial replay mismatch");
+  }
+  const auto mapping = atom_mapping(context, store, frame, atom_order);
+  if (!mapping)
+    return std::unexpected(mapping.error());
+  auto reconstructed = reconstruct_selected_coordinates(
+      store, prepared_frames[frame_index], selection,
+      mapping->component_by_input_atom, spatial->atom_images,
+      wrapped_coordinates);
+  if (!reconstructed)
+    return std::unexpected(reconstructed.error());
+  const auto &candidate = store.candidates()[selection.candidate_index];
+  if (!candidate.component_images.valid_for(store.component_images().size()) ||
+      candidate.component_images.count != epoch.components.count) {
+    return std::unexpected(
+        "Phase 1 reconstruction audit candidate range is invalid");
+  }
+  const auto component_images = store.component_images().subspan(
+      candidate.component_images.begin, candidate.component_images.count);
+
+  const titan_pbctopo::PbctopoLatticeMetric lattice(
+      prepared_frames[frame_index].box_matrix());
+  if (!lattice.valid())
+    return std::unexpected("Phase 1 reconstruction audit lattice is invalid");
+
+  const auto transport = make_hololift_lattice_basis_transport(
+      selection.lattice_basis_transport_to_segment_reference,
+      prepared_frames[frame_index].box_matrix());
+  if (!transport)
+    return std::unexpected("Phase 1 reconstruction basis replay failed: " +
+                           transport.error());
+  const auto expected_input_gauge = hololift_lattice_image_from_reference(
+      selection.cumulative_global_gauge, *transport);
+  if (!expected_input_gauge ||
+      *expected_input_gauge != selection.cumulative_global_gauge_input_basis) {
+    return std::unexpected(
+        "Phase 1 reconstruction input-basis gauge replay failed");
+  }
+  FrameAuditPart part;
+  auto &atom_frame = part.atom_frame;
+  atom_frame.frame_index = frame_index;
+  atom_frame.segment_index = selection.segment_index;
+  atom_frame.topology_epoch_identity = epoch.topology_epoch_identity;
+  atom_frame.physical_gram = physical_gram(transport->transported_box);
+  const std::size_t canonical_atom_count =
+      mapping->input_index_by_canonical_dense_atom.size();
+  atom_frame.wrapped_reference.resize(canonical_atom_count);
+  atom_frame.selected_reference.resize(canonical_atom_count);
+  atom_frame.spatial_images_reference.resize(canonical_atom_count);
+
+  std::vector<std::array<long double, 3>> component_sums(
+      epoch.components.count);
+  std::vector<long double> component_weight_sums(epoch.components.count,
+                                                 0.0L);
+  std::vector<std::size_t> component_counts(epoch.components.count, 0);
+  for (std::size_t atom_index = 0; atom_index < reconstructed->size();
+       ++atom_index) {
+    const std::uint32_t canonical_index =
+        mapping->canonical_dense_by_input_atom[atom_index];
+    const std::uint32_t component =
+        mapping->component_by_input_atom[atom_index];
+    if (canonical_index >= canonical_atom_count ||
+        component >= component_sums.size() ||
+        atom_index >= mapping->weight_by_input_atom.size())
+      return std::unexpected(
+          "Phase 1 reconstruction audit atom mapping is invalid");
+    const long double atom_weight =
+        static_cast<long double>(mapping->weight_by_input_atom[atom_index]);
+    const auto scaled = lattice.cartesian_to_scaled(
+        (*reconstructed)[atom_index][0], (*reconstructed)[atom_index][1],
+        (*reconstructed)[atom_index][2]);
+    if (!std::all_of(scaled.begin(), scaled.end(),
+                     [](double value) { return std::isfinite(value); })) {
+      return std::unexpected(
+          "Phase 1 reconstruction audit produced non-finite coordinates");
+    }
+    for (std::size_t axis = 0; axis < 3; ++axis)
+      component_sums[component][axis] += atom_weight * scaled[axis];
+    component_weight_sums[component] += atom_weight;
+    ++component_counts[component];
+
+    const auto &wrapped = wrapped_coordinates[atom_index];
+    const auto wrapped_input =
+        lattice.cartesian_to_scaled(wrapped[0], wrapped[1], wrapped[2]);
+    const auto wrapped_reference =
+        hololift_fractional_to_reference(wrapped_input, *transport);
+    const auto spatial_reference = hololift_lattice_image_to_reference(
+        spatial->atom_images[atom_index], *transport);
+    const auto component_reference = hololift_lattice_image_to_reference(
+        component_images[component], *transport);
+    if (!spatial_reference || !component_reference)
+      return std::unexpected(!spatial_reference ? spatial_reference.error()
+                                                : component_reference.error());
+    HoloLiftLatticeImage component_and_gauge_reference;
+    HoloLiftLatticeImage total_reference_image;
+    if (!checked_image_add(*component_reference,
+                           selection.cumulative_global_gauge,
+                           component_and_gauge_reference) ||
+        !checked_image_add(*spatial_reference, component_and_gauge_reference,
+                           total_reference_image) ||
+        !image_is_exact_binary64(total_reference_image)) {
+      return std::unexpected(
+          "Phase 1 atom audit reference-basis image overflows");
+    }
+    std::array<double, 3> selected_reference{};
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+      const std::int64_t image =
+          axis == 0 ? total_reference_image.x
+                    : (axis == 1 ? total_reference_image.y
+                                 : total_reference_image.z);
+      selected_reference[axis] =
+          wrapped_reference[axis] + static_cast<double>(image);
+    }
+    const auto reconstructed_reference =
+        hololift_fractional_to_reference(scaled, *transport);
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+      if (!std::isfinite(wrapped_reference[axis]) ||
+          !std::isfinite(selected_reference[axis]) ||
+          std::fabs(reconstructed_reference[axis] -
+                    selected_reference[axis]) > 1.0e-10) {
+        return std::unexpected(
+            "Phase 1 atom audit disagrees with basis-transport replay");
+      }
+    }
+    atom_frame.wrapped_reference[canonical_index] = wrapped_reference;
+    atom_frame.selected_reference[canonical_index] = selected_reference;
+    atom_frame.spatial_images_reference[canonical_index] = *spatial_reference;
+  }
+
+  const auto prepared_representatives =
+      prepared_frames[frame_index].component_fractional_representatives();
+  const auto prepared_weights =
+      prepared_frames[frame_index].component_weights();
+  const auto components = store.components().subspan(
+      epoch.components.begin, epoch.components.count);
+  const auto gram = prepared_frames[frame_index].physical_gram();
+  const double length_scale =
+      std::sqrt(std::max({gram[0], gram[3], gram[5], 1.0}));
+  const double tolerance_A = 1.0e-9 * length_scale;
+  for (std::size_t component = 0; component < components.size();
+       ++component) {
+    if (component_counts[component] !=
+            components[component].exact_atom_membership.count ||
+        component >= prepared_weights.size() ||
+        std::fabs(static_cast<double>(component_weight_sums[component]) -
+                  prepared_weights[component]) >
+            1.0e-12 * std::max(1.0, prepared_weights[component])) {
+      return std::unexpected(
+          "Phase 1 reconstruction audit component weight is invalid");
+    }
+    HoloLiftLatticeImage component_and_gauge;
+    if (!checked_image_add(component_images[component],
+                           selection.cumulative_global_gauge_input_basis,
+                           component_and_gauge) ||
+        !image_is_exact_binary64(component_and_gauge)) {
+      return std::unexpected(
+          "Phase 1 reconstruction audit component image overflows");
+    }
+    std::array<double, 3> difference{};
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+      const double observed = static_cast<double>(
+          component_sums[component][axis] / component_weight_sums[component]);
+      const std::int64_t image =
+          axis == 0 ? component_and_gauge.x
+                    : (axis == 1 ? component_and_gauge.y
+                                 : component_and_gauge.z);
+      const double expected = prepared_representatives[component][axis] +
+                              static_cast<double>(image);
+      difference[axis] = observed - expected;
+    }
+    const auto cartesian_difference = lattice.scaled_to_cartesian(
+        difference[0], difference[1], difference[2]);
+    const double error_A = std::sqrt(
+        cartesian_difference[0] * cartesian_difference[0] +
+        cartesian_difference[1] * cartesian_difference[1] +
+        cartesian_difference[2] * cartesian_difference[2]);
+    if (!std::isfinite(error_A) || error_A > tolerance_A) {
+      return std::unexpected(
+          "Phase 1 all-atom reconstruction disagrees with component lift");
+    }
+    part.maximum_component_representative_error_A =
+        std::max(part.maximum_component_representative_error_A, error_A);
+  }
+  part.reconstructed = std::move(*reconstructed);
+  return part;
+}
+
+std::expected<TransitionAuditPart, std::string> audit_selected_transition(
+    const SelectedAtomAuditFrame &previous_atom_frame,
+    const SelectedAtomAuditFrame &atom_frame,
+    std::span<const HoloLiftHardEdgeRecord> hard_edges) {
+  const std::size_t canonical_atom_count = atom_frame.wrapped_reference.size();
+  if (previous_atom_frame.topology_epoch_identity !=
+          atom_frame.topology_epoch_identity ||
+      previous_atom_frame.selected_reference.size() != canonical_atom_count ||
+      previous_atom_frame.wrapped_reference.size() != canonical_atom_count ||
+      previous_atom_frame.spatial_images_reference.size() !=
+          canonical_atom_count) {
+    return std::unexpected(
+        "Phase 1 atom temporal audit topology changed within segment");
+  }
+  std::array<double, 6> transition_gram{};
+  for (std::size_t index = 0; index < transition_gram.size(); ++index) {
+    transition_gram[index] = 0.5 * (previous_atom_frame.physical_gram[index] +
+                                    atom_frame.physical_gram[index]);
+  }
+  const titan_pbctopo::PbctopoLatticeMetric temporal_metric(transition_gram);
+  if (!temporal_metric.valid())
+    return std::unexpected("Phase 1 atom temporal audit metric is invalid");
+  const double injectivity_radius_A =
+      0.5 * std::min(shortest_lattice_vector_lower_bound(
+                         previous_atom_frame.physical_gram),
+                     shortest_lattice_vector_lower_bound(
+                         atom_frame.physical_gram));
+  if (!std::isfinite(injectivity_radius_A) || injectivity_radius_A <= 0.0) {
+    return std::unexpected(
+        "Phase 1 atom temporal injectivity radius is invalid");
+  }
+
+  TransitionAuditPart part;
+  part.audited = true;
+  std::vector<HoloLiftLatticeImage> independent_temporal_images;
+  independent_temporal_images.reserve(canonical_atom_count);
+  for (std::size_t atom_index = 0; atom_index < canonical_atom_count;
+       ++atom_index) {
+    std::array<double, 3> selected_delta{};
+    std::array<double, 3> wrapped_delta{};
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+      selected_delta[axis] =
+          atom_frame.selected_reference[atom_index][axis] -
+          previous_atom_frame.selected_reference[atom_index][axis];
+      wrapped_delta[axis] =
+          atom_frame.wrapped_reference[atom_index][axis] -
+          previous_atom_frame.wrapped_reference[atom_index][axis];
+    }
+    const auto selected_nearest = temporal_metric.nearest_image_scaled(
+        selected_delta[0], selected_delta[1], selected_delta[2]);
+    const auto independent_nearest = temporal_metric.nearest_image_scaled(
+        wrapped_delta[0], wrapped_delta[1], wrapped_delta[2]);
+    if (!selected_nearest.valid || !independent_nearest.valid) {
+      return std::unexpected(
+          "Phase 1 atom temporal closest-image audit failed");
+    }
+    if (!temporal_metric.image_is_nearest_equivalent_scaled(
+            selected_delta[0], selected_delta[1], selected_delta[2], 0, 0, 0,
+            selected_nearest)) {
+      ++part.nearest_image_violations;
+    }
+    const auto cartesian_delta = temporal_metric.scaled_to_cartesian(
+        selected_delta[0], selected_delta[1], selected_delta[2]);
+    const double displacement_A =
+        std::sqrt(cartesian_delta[0] * cartesian_delta[0] +
+                  cartesian_delta[1] * cartesian_delta[1] +
+                  cartesian_delta[2] * cartesian_delta[2]);
+    if (!std::isfinite(displacement_A))
+      return std::unexpected(
+          "Phase 1 atom temporal displacement is not finite");
+    part.maximum_atom_peculiar_displacement_A =
+        std::max(part.maximum_atom_peculiar_displacement_A, displacement_A);
+    const double injectivity_tolerance =
+        1.0e-12 * std::max(1.0, injectivity_radius_A);
+    if (displacement_A >= injectivity_radius_A - injectivity_tolerance)
+      ++part.injectivity_uncertified;
+    if (independent_nearest.ambiguous)
+      ++part.independent_ambiguities;
+    independent_temporal_images.push_back({independent_nearest.image_x,
+                                           independent_nearest.image_y,
+                                           independent_nearest.image_z});
+  }
+  part.transitions_audited = canonical_atom_count;
+
+  for (const auto &edge : hard_edges) {
+    if (edge.atom_a >= canonical_atom_count ||
+        edge.atom_b >= canonical_atom_count) {
+      return std::unexpected(
+          "Phase 1 independent cochain edge is out of range");
+    }
+    HoloLiftLatticeImage previous_spatial_edge;
+    HoloLiftLatticeImage current_spatial_edge;
+    HoloLiftLatticeImage previous_path;
+    HoloLiftLatticeImage current_path;
+    HoloLiftLatticeImage curvature;
+    const bool closed =
+        checked_image_subtract(
+            previous_atom_frame.spatial_images_reference[edge.atom_b],
+            previous_atom_frame.spatial_images_reference[edge.atom_a],
+            previous_spatial_edge) &&
+        checked_image_subtract(atom_frame.spatial_images_reference[edge.atom_b],
+                               atom_frame.spatial_images_reference[edge.atom_a],
+                               current_spatial_edge) &&
+        checked_image_add(previous_spatial_edge,
+                          independent_temporal_images[edge.atom_b],
+                          previous_path) &&
+        checked_image_add(current_spatial_edge,
+                          independent_temporal_images[edge.atom_a],
+                          current_path) &&
+        checked_image_subtract(previous_path, current_path, curvature);
+    if (!closed)
+      return std::unexpected(
+          "Phase 1 independent space-time cochain overflows");
+    if (curvature != HoloLiftLatticeImage{})
+      ++part.curvature_residuals;
+    ++part.edges_audited;
+  }
+  return part;
+}
+
+} // namespace
+
+struct HoloLiftPhase1AuditStream::Impl {
+  const HoloLiftPhase1PreparationContext::Impl *context = nullptr;
+  const HoloLiftObservationStore *store = nullptr;
+  std::span<const HoloLiftPhase1PreparedFrame> prepared_frames;
+  HoloLiftPhase1Result working_result;
+  HoloLiftPhase1ReconstructionAudit audit;
+  SelectedAtomAuditFrame previous_atom_frame;
+  bool has_previous_atom_frame = false;
+  std::vector<std::size_t> audited_segment_frames;
+  std::vector<std::size_t> audited_segment_transitions;
+  std::size_t next_frame = 0;
+  bool failed = false;
+};
+
+HoloLiftPhase1AuditStream::HoloLiftPhase1AuditStream(
+    std::unique_ptr<Impl> impl) noexcept
+    : impl_(std::move(impl)) {}
+
+HoloLiftPhase1AuditStream::HoloLiftPhase1AuditStream(
+    HoloLiftPhase1AuditStream &&) noexcept = default;
+
+HoloLiftPhase1AuditStream &HoloLiftPhase1AuditStream::operator=(
+    HoloLiftPhase1AuditStream &&) noexcept = default;
+
+HoloLiftPhase1AuditStream::~HoloLiftPhase1AuditStream() = default;
+
+const HoloLiftPhase1Result *
+HoloLiftPhase1AuditStream::result_if_valid() const noexcept {
+  return impl_ && !impl_->failed ? &impl_->working_result : nullptr;
+}
+
+std::expected<HoloLiftPhase1AuditStream, std::string>
+begin_hololift_phase1_audit(
     HoloLiftPhase1PreparationContext &context,
     const HoloLiftObservationStore &store,
     std::span<const HoloLiftPhase1PreparedFrame> prepared_frames,
-    HoloLiftPhase1Result result,
-    std::span<const HoloLiftPhase1TrajectoryFrameView> trajectory_frames) {
+    HoloLiftPhase1Result result) {
   if (!context.impl_ || context.impl_->store != &store)
     return std::unexpected("Phase 1 reconstruction audit context mismatch");
   if (prepared_frames.size() != store.frames().size() ||
-      trajectory_frames.size() != store.frames().size() ||
       result.frames.size() != store.frames().size() ||
       result.api_version != HOLOLIFT_PHASE1_API_VERSION) {
     return std::unexpected(
         "Phase 1 reconstruction audit frame coverage is invalid");
   }
 
-  HoloLiftPhase1Result working_result = std::move(result);
+  auto state = std::make_unique<HoloLiftPhase1AuditStream::Impl>();
+  state->context = context.impl_.get();
+  state->store = &store;
+  state->prepared_frames = prepared_frames;
+  state->working_result = std::move(result);
+  HoloLiftPhase1Result &working_result = state->working_result;
   for (auto &selection : working_result.frames) {
     selection.atoms_audited = 0;
     selection.atom_temporal_transitions_audited = 0;
@@ -2879,425 +3323,204 @@ audit_hololift_phase1_all_atom_reconstruction(
   working_result.certificate.atom_temporal_injectivity_audit_passed = false;
   working_result.certificate.independent_space_time_cochain_audited = false;
   working_result.certificate.independent_space_time_cochain_closed = false;
-  HoloLiftPhase1ReconstructionAudit audit;
-  struct SelectedAtomAuditFrame {
-    std::size_t frame_index = HOLOLIFT_NO_INDEX;
-    std::size_t segment_index = HOLOLIFT_NO_INDEX;
-    HoloLiftHash128 topology_epoch_identity;
-    std::array<double, 6> physical_gram{};
-    std::vector<std::array<double, 3>> wrapped_reference;
-    std::vector<std::array<double, 3>> selected_reference;
-    std::vector<HoloLiftLatticeImage> spatial_images_reference;
+  state->audited_segment_frames.assign(working_result.segments.size(), 0);
+  state->audited_segment_transitions.assign(working_result.segments.size(), 0);
+  return HoloLiftPhase1AuditStream(std::move(state));
+}
+
+std::expected<std::vector<std::vector<std::array<double, 3>>>, std::string>
+HoloLiftPhase1AuditStream::audit_block(
+    std::size_t first_frame,
+    std::span<const HoloLiftPhase1TrajectoryFrameView> trajectory_frames,
+    std::size_t workers) {
+  if (!impl_ || impl_->failed)
+    return std::unexpected("Phase 1 reconstruction audit stream is unusable");
+  auto &state = *impl_;
+  const auto &store = *state.store;
+  auto &working_result = state.working_result;
+  const auto fail = [&](std::string message)
+      -> std::expected<std::vector<std::vector<std::array<double, 3>>>,
+                       std::string> {
+    state.failed = true;
+    return std::unexpected(std::move(message));
   };
-  SelectedAtomAuditFrame previous_atom_frame;
-  bool has_previous_atom_frame = false;
-  std::vector<std::size_t> audited_segment_frames(
-      working_result.segments.size(), 0);
-  std::vector<std::size_t> audited_segment_transitions(
-      working_result.segments.size(), 0);
-  for (std::size_t frame_index = 0; frame_index < store.frames().size();
-       ++frame_index) {
-    auto &selection = working_result.frames[frame_index];
-    if (selection.use != HoloLiftPhase1FrameUse::TemporalObservation)
+  if (first_frame != state.next_frame ||
+      trajectory_frames.size() > store.frames().size() - first_frame)
+    return fail("Phase 1 reconstruction audit frame coverage is invalid");
+  const std::size_t count = trajectory_frames.size();
+  const auto temporal = [&](std::size_t offset) {
+    return working_result.frames[first_frame + offset].use ==
+           HoloLiftPhase1FrameUse::TemporalObservation;
+  };
+
+  // 1. every temporal-observation frame of the block on its own
+  std::vector<std::expected<FrameAuditPart, std::string>> parts(count);
+  run_indexed_audit_tasks(count, workers, [&](std::size_t offset) {
+    if (!temporal(offset))
+      return;
+    try {
+      parts[offset] = audit_selected_frame(
+          *state.context, store, state.prepared_frames, working_result,
+          first_frame + offset, trajectory_frames[offset]);
+    } catch (const std::exception &error) {
+      parts[offset] = std::unexpected(
+          std::string("Phase 1 reconstruction audit failed: ") + error.what());
+    }
+  });
+
+  // 2. the transition into each of them from the previous audited frame,
+  //    which may close an earlier block, when both lie in one segment
+  constexpr std::size_t kNone = HOLOLIFT_NO_INDEX;
+  constexpr std::size_t kCarried = HOLOLIFT_NO_INDEX - 1;
+  std::vector<std::size_t> predecessor(count, kNone);
+  std::size_t last = state.has_previous_atom_frame ? kCarried : kNone;
+  for (std::size_t offset = 0; offset < count; ++offset) {
+    if (!temporal(offset))
       continue;
-    if (selection.segment_index >= working_result.segments.size() ||
-        prepared_frames[frame_index].frame_index() != frame_index ||
-        trajectory_frames[frame_index].trajectory_frame_index !=
-            prepared_frames[frame_index].trajectory_frame_index()) {
-      return std::unexpected(
-          "Phase 1 reconstruction audit selection binding is invalid");
-    }
-    auto &segment = working_result.segments[selection.segment_index];
-    const auto &atom_order = trajectory_frames[frame_index].atom_order;
-    const auto &wrapped_coordinates =
-        trajectory_frames[frame_index].wrapped_coordinates;
-    if (atom_order.size() != wrapped_coordinates.size()) {
-      return std::unexpected(
-          "Phase 1 reconstruction audit atom arrays differ in size");
-    }
-    const auto &frame = store.frames()[frame_index];
-    const auto &epoch = store.topology_epochs()[frame.topology_epoch_index];
-    const auto hard_edges = store.hard_edges().subspan(
-        epoch.hard_edges.begin, epoch.hard_edges.count);
-    const auto binding = validate_hololift_frame_binding(
-        epoch, frame,
-        prepared_frames[frame_index].trajectory_frame_index(),
-        prepared_frames[frame_index].box_matrix(), atom_order,
-        wrapped_coordinates);
-    if (!binding)
-      return std::unexpected(
-          "Phase 1 reconstruction audit frame binding failed: " +
-          binding.error());
-    const auto spatial = replay_hololift_spatial_lift(
-        epoch, frame, hard_edges, atom_order, wrapped_coordinates);
-    if (!spatial)
-      return std::unexpected("Phase 1 atom audit spatial replay failed: " +
-                             spatial.error());
-    if (spatial->identity !=
-            prepared_frames[frame_index].spatial_lift_identity() ||
-        spatial->identity != frame.spatial_lift_identity ||
-        spatial->ambiguous_hard_edges !=
-            frame.spatial_lift_ambiguous_hard_edges ||
-        spatial->cycle_residuals != frame.spatial_lift_cycle_residuals) {
-      return std::unexpected(
-          "Phase 1 atom audit spatial replay mismatch");
-    }
-    const auto mapping = atom_mapping(*context.impl_, store, frame, atom_order);
-    if (!mapping)
-      return std::unexpected(mapping.error());
-    const auto reconstructed = reconstruct_selected_coordinates(
-        store, prepared_frames[frame_index], selection,
-        mapping->component_by_input_atom, spatial->atom_images,
-        wrapped_coordinates);
-    if (!reconstructed)
-      return std::unexpected(reconstructed.error());
-    const auto &candidate = store.candidates()[selection.candidate_index];
-    if (!candidate.component_images.valid_for(store.component_images().size()) ||
-        candidate.component_images.count != epoch.components.count) {
-      return std::unexpected(
-          "Phase 1 reconstruction audit candidate range is invalid");
-    }
-    const auto component_images = store.component_images().subspan(
-        candidate.component_images.begin, candidate.component_images.count);
-
-    const titan_pbctopo::PbctopoLatticeMetric lattice(
-        prepared_frames[frame_index].box_matrix());
-    if (!lattice.valid())
-      return std::unexpected(
-          "Phase 1 reconstruction audit lattice is invalid");
-
-    const auto transport = make_hololift_lattice_basis_transport(
-        selection.lattice_basis_transport_to_segment_reference,
-        prepared_frames[frame_index].box_matrix());
-    if (!transport)
-      return std::unexpected("Phase 1 reconstruction basis replay failed: " +
-                             transport.error());
-    const auto expected_input_gauge = hololift_lattice_image_from_reference(
-        selection.cumulative_global_gauge, *transport);
-    if (!expected_input_gauge ||
-        *expected_input_gauge !=
-            selection.cumulative_global_gauge_input_basis) {
-      return std::unexpected(
-          "Phase 1 reconstruction input-basis gauge replay failed");
-    }
-    SelectedAtomAuditFrame atom_frame;
-    atom_frame.frame_index = frame_index;
-    atom_frame.segment_index = selection.segment_index;
-    atom_frame.topology_epoch_identity = epoch.topology_epoch_identity;
-    atom_frame.physical_gram = physical_gram(transport->transported_box);
-    const std::size_t canonical_atom_count =
-        mapping->input_index_by_canonical_dense_atom.size();
-    atom_frame.wrapped_reference.resize(canonical_atom_count);
-    atom_frame.selected_reference.resize(canonical_atom_count);
-    atom_frame.spatial_images_reference.resize(canonical_atom_count);
-
-    std::vector<std::array<long double, 3>> component_sums(
-        epoch.components.count);
-    std::vector<long double> component_weight_sums(epoch.components.count,
-                                                   0.0L);
-    std::vector<std::size_t> component_counts(epoch.components.count, 0);
-    for (std::size_t atom_index = 0; atom_index < reconstructed->size();
-         ++atom_index) {
-      const std::uint32_t canonical_index =
-          mapping->canonical_dense_by_input_atom[atom_index];
-      const std::uint32_t component =
-          mapping->component_by_input_atom[atom_index];
-      if (canonical_index >= canonical_atom_count ||
-          component >= component_sums.size() ||
-          atom_index >= mapping->weight_by_input_atom.size())
-        return std::unexpected(
-            "Phase 1 reconstruction audit atom mapping is invalid");
-      const long double atom_weight =
-          static_cast<long double>(mapping->weight_by_input_atom[atom_index]);
-      const auto scaled = lattice.cartesian_to_scaled(
-          (*reconstructed)[atom_index][0], (*reconstructed)[atom_index][1],
-          (*reconstructed)[atom_index][2]);
-      if (!std::all_of(scaled.begin(), scaled.end(),
-                       [](double value) { return std::isfinite(value); })) {
-        return std::unexpected(
-            "Phase 1 reconstruction audit produced non-finite coordinates");
-      }
-      for (std::size_t axis = 0; axis < 3; ++axis)
-        component_sums[component][axis] += atom_weight * scaled[axis];
-      component_weight_sums[component] += atom_weight;
-      ++component_counts[component];
-
-      const auto &wrapped = wrapped_coordinates[atom_index];
-      const auto wrapped_input = lattice.cartesian_to_scaled(
-          wrapped[0], wrapped[1], wrapped[2]);
-      const auto wrapped_reference =
-          hololift_fractional_to_reference(wrapped_input, *transport);
-      const auto spatial_reference = hololift_lattice_image_to_reference(
-          spatial->atom_images[atom_index], *transport);
-      const auto component_reference = hololift_lattice_image_to_reference(
-          component_images[component], *transport);
-      if (!spatial_reference || !component_reference)
-        return std::unexpected(!spatial_reference
-                                   ? spatial_reference.error()
-                                   : component_reference.error());
-      HoloLiftLatticeImage component_and_gauge_reference;
-      HoloLiftLatticeImage total_reference_image;
-      if (!checked_image_add(*component_reference,
-                             selection.cumulative_global_gauge,
-                             component_and_gauge_reference) ||
-          !checked_image_add(*spatial_reference,
-                             component_and_gauge_reference,
-                             total_reference_image) ||
-          !image_is_exact_binary64(total_reference_image)) {
-        return std::unexpected(
-            "Phase 1 atom audit reference-basis image overflows");
-      }
-      std::array<double, 3> selected_reference{};
-      for (std::size_t axis = 0; axis < 3; ++axis) {
-        const std::int64_t image =
-            axis == 0 ? total_reference_image.x
-                      : (axis == 1 ? total_reference_image.y
-                                   : total_reference_image.z);
-        selected_reference[axis] =
-            wrapped_reference[axis] + static_cast<double>(image);
-      }
-      const auto reconstructed_reference =
-          hololift_fractional_to_reference(scaled, *transport);
-      for (std::size_t axis = 0; axis < 3; ++axis) {
-        if (!std::isfinite(wrapped_reference[axis]) ||
-            !std::isfinite(selected_reference[axis]) ||
-            std::fabs(reconstructed_reference[axis] -
-                      selected_reference[axis]) > 1.0e-10) {
-          return std::unexpected(
-              "Phase 1 atom audit disagrees with basis-transport replay");
-        }
-      }
-      atom_frame.wrapped_reference[canonical_index] = wrapped_reference;
-      atom_frame.selected_reference[canonical_index] = selected_reference;
-      atom_frame.spatial_images_reference[canonical_index] =
-          *spatial_reference;
-    }
-
-    const auto prepared_representatives =
-        prepared_frames[frame_index].component_fractional_representatives();
-    const auto prepared_weights =
-        prepared_frames[frame_index].component_weights();
-    const auto components = store.components().subspan(
-        epoch.components.begin, epoch.components.count);
-    const auto gram = prepared_frames[frame_index].physical_gram();
-    const double length_scale = std::sqrt(
-        std::max({gram[0], gram[3], gram[5], 1.0}));
-    const double tolerance_A = 1.0e-9 * length_scale;
-    for (std::size_t component = 0; component < components.size();
-         ++component) {
-      if (component_counts[component] !=
-              components[component].exact_atom_membership.count ||
-          component >= prepared_weights.size() ||
-          std::fabs(static_cast<double>(component_weight_sums[component]) -
-                    prepared_weights[component]) >
-              1.0e-12 * std::max(1.0, prepared_weights[component])) {
-        return std::unexpected(
-            "Phase 1 reconstruction audit component weight is invalid");
-      }
-      HoloLiftLatticeImage component_and_gauge;
-      if (!checked_image_add(component_images[component],
-                             selection.cumulative_global_gauge_input_basis,
-                             component_and_gauge) ||
-          !image_is_exact_binary64(component_and_gauge)) {
-        return std::unexpected(
-            "Phase 1 reconstruction audit component image overflows");
-      }
-      std::array<double, 3> difference{};
-      for (std::size_t axis = 0; axis < 3; ++axis) {
-        const double observed = static_cast<double>(
-            component_sums[component][axis] /
-            component_weight_sums[component]);
-        const std::int64_t image =
-            axis == 0 ? component_and_gauge.x
-                      : (axis == 1 ? component_and_gauge.y
-                                   : component_and_gauge.z);
-        const double expected = prepared_representatives[component][axis] +
-                                static_cast<double>(image);
-        difference[axis] = observed - expected;
-      }
-      const auto cartesian_difference = lattice.scaled_to_cartesian(
-          difference[0], difference[1], difference[2]);
-      const double error_A = std::sqrt(
-          cartesian_difference[0] * cartesian_difference[0] +
-          cartesian_difference[1] * cartesian_difference[1] +
-          cartesian_difference[2] * cartesian_difference[2]);
-      if (!std::isfinite(error_A) || error_A > tolerance_A) {
-        return std::unexpected(
-            "Phase 1 all-atom reconstruction disagrees with component lift");
-      }
-      audit.maximum_component_representative_error_A = std::max(
-          audit.maximum_component_representative_error_A, error_A);
-      selection.maximum_component_representative_error_A = std::max(
-          selection.maximum_component_representative_error_A, error_A);
-      segment.maximum_component_representative_error_A = std::max(
-          segment.maximum_component_representative_error_A, error_A);
-    }
-
-    if (has_previous_atom_frame &&
-        previous_atom_frame.segment_index == atom_frame.segment_index) {
-      if (previous_atom_frame.topology_epoch_identity !=
-              atom_frame.topology_epoch_identity ||
-          previous_atom_frame.selected_reference.size() !=
-              canonical_atom_count ||
-          previous_atom_frame.wrapped_reference.size() !=
-              canonical_atom_count ||
-          previous_atom_frame.spatial_images_reference.size() !=
-              canonical_atom_count) {
-        return std::unexpected(
-            "Phase 1 atom temporal audit topology changed within segment");
-      }
-      std::array<double, 6> transition_gram{};
-      for (std::size_t index = 0; index < transition_gram.size(); ++index) {
-        transition_gram[index] =
-            0.5 * (previous_atom_frame.physical_gram[index] +
-                   atom_frame.physical_gram[index]);
-      }
-      const titan_pbctopo::PbctopoLatticeMetric temporal_metric(
-          transition_gram);
-      if (!temporal_metric.valid())
-        return std::unexpected(
-            "Phase 1 atom temporal audit metric is invalid");
-      const double injectivity_radius_A =
-          0.5 * std::min(
-                    shortest_lattice_vector_lower_bound(
-                        previous_atom_frame.physical_gram),
-                    shortest_lattice_vector_lower_bound(
-                        atom_frame.physical_gram));
-      if (!std::isfinite(injectivity_radius_A) ||
-          injectivity_radius_A <= 0.0) {
-        return std::unexpected(
-            "Phase 1 atom temporal injectivity radius is invalid");
-      }
-
-      std::vector<HoloLiftLatticeImage> independent_temporal_images;
-      independent_temporal_images.reserve(canonical_atom_count);
-      for (std::size_t atom_index = 0; atom_index < canonical_atom_count;
-           ++atom_index) {
-        std::array<double, 3> selected_delta{};
-        std::array<double, 3> wrapped_delta{};
-        for (std::size_t axis = 0; axis < 3; ++axis) {
-          selected_delta[axis] =
-              atom_frame.selected_reference[atom_index][axis] -
-              previous_atom_frame.selected_reference[atom_index][axis];
-          wrapped_delta[axis] =
-              atom_frame.wrapped_reference[atom_index][axis] -
-              previous_atom_frame.wrapped_reference[atom_index][axis];
-        }
-        const auto selected_nearest = temporal_metric.nearest_image_scaled(
-            selected_delta[0], selected_delta[1], selected_delta[2]);
-        const auto independent_nearest = temporal_metric.nearest_image_scaled(
-            wrapped_delta[0], wrapped_delta[1], wrapped_delta[2]);
-        if (!selected_nearest.valid || !independent_nearest.valid) {
-          return std::unexpected(
-              "Phase 1 atom temporal closest-image audit failed");
-        }
-        if (!temporal_metric.image_is_nearest_equivalent_scaled(
-                selected_delta[0], selected_delta[1], selected_delta[2], 0,
-                0, 0, selected_nearest)) {
-          ++selection.atom_temporal_nearest_image_violations;
-          ++segment.atom_temporal_nearest_image_violations;
-          ++audit.atom_temporal_nearest_image_violations;
-        }
-        const auto cartesian_delta = temporal_metric.scaled_to_cartesian(
-            selected_delta[0], selected_delta[1], selected_delta[2]);
-        const double displacement_A = std::sqrt(
-            cartesian_delta[0] * cartesian_delta[0] +
-            cartesian_delta[1] * cartesian_delta[1] +
-            cartesian_delta[2] * cartesian_delta[2]);
-        if (!std::isfinite(displacement_A))
-          return std::unexpected(
-              "Phase 1 atom temporal displacement is not finite");
-        selection.maximum_atom_peculiar_displacement_A = std::max(
-            selection.maximum_atom_peculiar_displacement_A, displacement_A);
-        segment.maximum_atom_peculiar_displacement_A = std::max(
-            segment.maximum_atom_peculiar_displacement_A, displacement_A);
-        audit.maximum_atom_peculiar_displacement_A = std::max(
-            audit.maximum_atom_peculiar_displacement_A, displacement_A);
-        const double injectivity_tolerance =
-            1.0e-12 * std::max(1.0, injectivity_radius_A);
-        if (displacement_A >=
-            injectivity_radius_A - injectivity_tolerance) {
-          ++selection.atom_temporal_injectivity_uncertified;
-          ++segment.atom_temporal_injectivity_uncertified;
-          ++audit.atom_temporal_injectivity_uncertified;
-        }
-        if (independent_nearest.ambiguous) {
-          ++selection.independent_temporal_image_ambiguities;
-          ++segment.independent_temporal_image_ambiguities;
-          ++audit.independent_temporal_image_ambiguities;
-        }
-        independent_temporal_images.push_back(
-            {independent_nearest.image_x, independent_nearest.image_y,
-             independent_nearest.image_z});
-      }
-      segment.atom_temporal_transitions_audited += canonical_atom_count;
-      selection.atom_temporal_transitions_audited += canonical_atom_count;
-      audit.atom_temporal_transitions_audited += canonical_atom_count;
-
-      for (const auto &edge : hard_edges) {
-        if (edge.atom_a >= canonical_atom_count ||
-            edge.atom_b >= canonical_atom_count) {
-          return std::unexpected(
-              "Phase 1 independent cochain edge is out of range");
-        }
-        HoloLiftLatticeImage previous_spatial_edge;
-        HoloLiftLatticeImage current_spatial_edge;
-        HoloLiftLatticeImage previous_path;
-        HoloLiftLatticeImage current_path;
-        HoloLiftLatticeImage curvature;
-        const bool closed =
-            checked_image_subtract(
-                previous_atom_frame.spatial_images_reference[edge.atom_b],
-                previous_atom_frame.spatial_images_reference[edge.atom_a],
-                previous_spatial_edge) &&
-            checked_image_subtract(
-                atom_frame.spatial_images_reference[edge.atom_b],
-                atom_frame.spatial_images_reference[edge.atom_a],
-                current_spatial_edge) &&
-            checked_image_add(previous_spatial_edge,
-                              independent_temporal_images[edge.atom_b],
-                              previous_path) &&
-            checked_image_add(current_spatial_edge,
-                              independent_temporal_images[edge.atom_a],
-                              current_path) &&
-            checked_image_subtract(previous_path, current_path, curvature);
-        if (!closed)
-          return std::unexpected(
-              "Phase 1 independent space-time cochain overflows");
-        if (curvature != HoloLiftLatticeImage{}) {
-          ++selection.independent_space_time_curvature_residuals;
-          ++segment.independent_space_time_curvature_residuals;
-          ++audit.independent_space_time_curvature_residuals;
-        }
-        ++segment.independent_space_time_edges_audited;
-        ++selection.independent_space_time_edges_audited;
-        ++audit.independent_space_time_edges_audited;
-      }
-      ++audited_segment_transitions[selection.segment_index];
-    }
-
-    ++audit.temporal_frames_audited;
-    audit.atoms_audited += reconstructed->size();
-    selection.atoms_audited = reconstructed->size();
-    ++segment.temporal_frames_audited;
-    segment.atoms_audited += reconstructed->size();
-    ++audited_segment_frames[selection.segment_index];
-    previous_atom_frame = std::move(atom_frame);
-    has_previous_atom_frame = true;
+    predecessor[offset] = last;
+    last = offset;
   }
+  std::vector<std::expected<TransitionAuditPart, std::string>> transitions(
+      count);
+  run_indexed_audit_tasks(count, workers, [&](std::size_t offset) {
+    if (!temporal(offset) || !parts[offset] || predecessor[offset] == kNone)
+      return;
+    const SelectedAtomAuditFrame *previous =
+        predecessor[offset] == kCarried
+            ? &state.previous_atom_frame
+            : (parts[predecessor[offset]]
+                   ? &parts[predecessor[offset]]->atom_frame
+                   : nullptr);
+    // A failed predecessor stops the reduction below before this frame.
+    if (previous == nullptr ||
+        previous->segment_index != parts[offset]->atom_frame.segment_index)
+      return;
+    const auto &frame = store.frames()[first_frame + offset];
+    const auto &epoch = store.topology_epochs()[frame.topology_epoch_index];
+    try {
+      transitions[offset] = audit_selected_transition(
+          *previous, parts[offset]->atom_frame,
+          store.hard_edges().subspan(epoch.hard_edges.begin,
+                                     epoch.hard_edges.count));
+    } catch (const std::exception &error) {
+      transitions[offset] = std::unexpected(
+          std::string("Phase 1 reconstruction audit failed: ") + error.what());
+    }
+  });
 
+  // 3. in frame order, as the one-pass audit did: the first failure wins, and
+  //    the counts and maxima do not depend on how frames were distributed
+  auto &audit = state.audit;
+  std::vector<std::vector<std::array<double, 3>>> coordinates(count);
+  std::size_t last_audited = kNone;
+  for (std::size_t offset = 0; offset < count; ++offset) {
+    if (!temporal(offset))
+      continue;
+    if (!parts[offset])
+      return fail(parts[offset].error());
+    auto &part = *parts[offset];
+    auto &selection = working_result.frames[first_frame + offset];
+    auto &segment = working_result.segments[selection.segment_index];
+    const double component_error_A =
+        part.maximum_component_representative_error_A;
+    audit.maximum_component_representative_error_A =
+        std::max(audit.maximum_component_representative_error_A,
+                 component_error_A);
+    selection.maximum_component_representative_error_A =
+        std::max(selection.maximum_component_representative_error_A,
+                 component_error_A);
+    segment.maximum_component_representative_error_A =
+        std::max(segment.maximum_component_representative_error_A,
+                 component_error_A);
+    if (!transitions[offset])
+      return fail(transitions[offset].error());
+    const auto &transition = *transitions[offset];
+    if (transition.audited) {
+      selection.atom_temporal_nearest_image_violations +=
+          transition.nearest_image_violations;
+      segment.atom_temporal_nearest_image_violations +=
+          transition.nearest_image_violations;
+      audit.atom_temporal_nearest_image_violations +=
+          transition.nearest_image_violations;
+      selection.atom_temporal_injectivity_uncertified +=
+          transition.injectivity_uncertified;
+      segment.atom_temporal_injectivity_uncertified +=
+          transition.injectivity_uncertified;
+      audit.atom_temporal_injectivity_uncertified +=
+          transition.injectivity_uncertified;
+      selection.independent_temporal_image_ambiguities +=
+          transition.independent_ambiguities;
+      segment.independent_temporal_image_ambiguities +=
+          transition.independent_ambiguities;
+      audit.independent_temporal_image_ambiguities +=
+          transition.independent_ambiguities;
+      const double displacement_A =
+          transition.maximum_atom_peculiar_displacement_A;
+      selection.maximum_atom_peculiar_displacement_A = std::max(
+          selection.maximum_atom_peculiar_displacement_A, displacement_A);
+      segment.maximum_atom_peculiar_displacement_A = std::max(
+          segment.maximum_atom_peculiar_displacement_A, displacement_A);
+      audit.maximum_atom_peculiar_displacement_A = std::max(
+          audit.maximum_atom_peculiar_displacement_A, displacement_A);
+      segment.atom_temporal_transitions_audited +=
+          transition.transitions_audited;
+      selection.atom_temporal_transitions_audited +=
+          transition.transitions_audited;
+      audit.atom_temporal_transitions_audited += transition.transitions_audited;
+      selection.independent_space_time_curvature_residuals +=
+          transition.curvature_residuals;
+      segment.independent_space_time_curvature_residuals +=
+          transition.curvature_residuals;
+      audit.independent_space_time_curvature_residuals +=
+          transition.curvature_residuals;
+      segment.independent_space_time_edges_audited += transition.edges_audited;
+      selection.independent_space_time_edges_audited +=
+          transition.edges_audited;
+      audit.independent_space_time_edges_audited += transition.edges_audited;
+      ++state.audited_segment_transitions[selection.segment_index];
+    }
+
+    const std::size_t atoms = part.reconstructed.size();
+    ++audit.temporal_frames_audited;
+    audit.atoms_audited += atoms;
+    selection.atoms_audited = atoms;
+    ++segment.temporal_frames_audited;
+    segment.atoms_audited += atoms;
+    ++state.audited_segment_frames[selection.segment_index];
+    coordinates[offset] = std::move(part.reconstructed);
+    last_audited = offset;
+  }
+  if (last_audited != kNone) {
+    state.previous_atom_frame = std::move(parts[last_audited]->atom_frame);
+    state.has_previous_atom_frame = true;
+  }
+  state.next_frame += count;
+  return coordinates;
+}
+
+std::expected<HoloLiftPhase1AuditedResult, std::string>
+HoloLiftPhase1AuditStream::finish() {
+  if (!impl_ || impl_->failed)
+    return std::unexpected("Phase 1 reconstruction audit stream is unusable");
+  const std::unique_ptr<Impl> state = std::move(impl_);
+  const auto &store = *state->store;
+  auto &working_result = state->working_result;
+  auto &audit = state->audit;
+  if (state->next_frame != store.frames().size())
+    return std::unexpected(
+        "Phase 1 reconstruction audit frame coverage is invalid");
   if (audit.temporal_frames_audited !=
       working_result.temporal_observation_frames)
     return std::unexpected(
         "Phase 1 reconstruction audit omitted a temporal observation");
   for (std::size_t segment_index = 0;
        segment_index < working_result.segments.size(); ++segment_index) {
-    if (audited_segment_frames[segment_index] !=
+    if (state->audited_segment_frames[segment_index] !=
         working_result.segments[segment_index].frame_count) {
       return std::unexpected(
           "Phase 1 reconstruction audit omitted a segment frame");
     }
-    if (audited_segment_transitions[segment_index] !=
+    if (state->audited_segment_transitions[segment_index] !=
         working_result.segments[segment_index].temporal_transition_count) {
       return std::unexpected(
           "Phase 1 atom audit omitted a selected temporal transition");
@@ -3307,8 +3530,7 @@ audit_hololift_phase1_all_atom_reconstruction(
   audit.selected_frames_complete = true;
   audit.atom_temporal_injectivity_audited =
       std::all_of(working_result.segments.begin(),
-                  working_result.segments.end(),
-                  [](const auto &segment) {
+                  working_result.segments.end(), [](const auto &segment) {
                     return segment.temporal_transition_count > 0;
                   });
   audit.independent_space_time_cochain_audited =
@@ -3367,8 +3589,7 @@ audit_hololift_phase1_all_atom_reconstruction(
   working_result.certificate.temporal_lift_locally_certified =
       working_result.temporal_transition_coverage_complete &&
       std::all_of(working_result.segments.begin(),
-                  working_result.segments.end(),
-                  [](const auto &segment) {
+                  working_result.segments.end(), [](const auto &segment) {
                     return segment.temporal_lift_locally_certified;
                   });
   working_result.certificate.complete_domain_trajectory_claim_eligible =
@@ -3379,19 +3600,38 @@ audit_hololift_phase1_all_atom_reconstruction(
       working_result.certificate.source_trajectory_coverage_complete &&
       working_result.certificate.retained_candidate_bands_complete &&
       working_result.certificate.optimal_path_exact_on_retained_graph &&
-      working_result.certificate
-          .optimal_path_proven_on_complete_bounded_domain;
+      working_result.certificate.optimal_path_proven_on_complete_bounded_domain;
   const auto hierarchy =
       validate_all_atom_audit_hierarchy(store, working_result);
   if (!hierarchy)
     return std::unexpected(hierarchy.error());
-  const auto digest =
-      compute_phase1_audit_digest(store, prepared_frames, working_result);
+  const auto digest = compute_phase1_audit_digest(
+      store, state->prepared_frames, working_result);
   if (!digest)
     return std::unexpected(digest.error());
   return HoloLiftPhase1AuditedResult(
       std::make_unique<HoloLiftPhase1Result>(std::move(working_result)),
       *digest);
+}
+
+std::expected<HoloLiftPhase1AuditedResult, std::string>
+audit_hololift_phase1_all_atom_reconstruction(
+    HoloLiftPhase1PreparationContext &context,
+    const HoloLiftObservationStore &store,
+    std::span<const HoloLiftPhase1PreparedFrame> prepared_frames,
+    HoloLiftPhase1Result result,
+    std::span<const HoloLiftPhase1TrajectoryFrameView> trajectory_frames) {
+  auto stream = begin_hololift_phase1_audit(context, store, prepared_frames,
+                                            std::move(result));
+  if (!stream)
+    return std::unexpected(stream.error());
+  if (trajectory_frames.size() != store.frames().size())
+    return std::unexpected(
+        "Phase 1 reconstruction audit frame coverage is invalid");
+  const auto audited = stream->audit_block(0, trajectory_frames, 1);
+  if (!audited)
+    return std::unexpected(audited.error());
+  return stream->finish();
 }
 
 std::expected<void, std::string> validate_hololift_phase1_audited_result(

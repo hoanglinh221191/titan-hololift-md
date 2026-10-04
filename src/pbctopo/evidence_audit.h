@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -49,6 +50,7 @@ struct PbctopoSelectedEvidenceAudit {
   std::size_t evidence_connected_component_count = 0;
   std::size_t unconstrained_relative_components = 0;
   std::size_t relative_lattice_degrees_of_freedom = 0;
+  std::vector<std::size_t> evidence_component_labels;
   std::size_t contacts_checked = 0;
   std::size_t contacts_lost = 0;
   PbctopoHash128 observed_pair_hash;
@@ -460,6 +462,9 @@ audit_pbctopo_selected_hypotheses(
   result.evidence_edge_count = connected_edges.size();
 
   std::vector<unsigned char> seen(selected_assignment.component_ids.size(), 0);
+  result.evidence_component_labels.assign(
+      selected_assignment.component_ids.size(),
+      std::numeric_limits<std::size_t>::max());
   std::vector<std::vector<std::size_t>> adjacency(seen.size());
   for (const auto &[a, b] : connected_edges) {
     if (a >= seen.size() || b >= seen.size()) {
@@ -473,14 +478,18 @@ audit_pbctopo_selected_hypotheses(
     if (seen[start] != 0)
       continue;
     ++result.evidence_connected_component_count;
+    const std::size_t label =
+        result.evidence_connected_component_count - 1;
     std::vector<std::size_t> stack{start};
     seen[start] = 1;
+    result.evidence_component_labels[start] = label;
     while (!stack.empty()) {
       const auto node = stack.back();
       stack.pop_back();
       for (const auto next : adjacency[node]) {
         if (seen[next] == 0) {
           seen[next] = 1;
+          result.evidence_component_labels[next] = label;
           stack.push_back(next);
         }
       }

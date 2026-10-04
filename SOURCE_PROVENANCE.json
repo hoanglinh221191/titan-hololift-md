@@ -1,0 +1,24 @@
+{
+ "package": "HoloLift-MD 1.1.0",
+ "titan_commit": "25fc99e888d62417b1e7ec3b56100dad79c3414e",
+ "titan_build_stamp": "0.2.0-dev.330+g25fc99e888d6",
+ "exported_paths": [
+  "src",
+  "Makefile",
+  "VERSION",
+  "manual.txt",
+  "tools/generate_build_info.py",
+  "tools/generate_cli_registry.py",
+  "tools/hololift_temporal_value_runner.cpp",
+  "tools/build_hololift_temporal_value_runner.ps1",
+  "test/hololift_phase0_smoke.ps1",
+  "test/hololift_phase1_smoke.ps1"
+ ],
+ "changes": [
+  "manual.txt moved to docs/TITAN_MANUAL.txt",
+  "Makefile: build stamp pinned to the TITAN commit; PROFILE defaults to portable",
+  "tools/build_hololift_temporal_value_runner.ps1: output under build\\",
+  "README, LICENSE, THIRD_PARTY_NOTICES, CITATION, .gitignore and TITAN_XDR_NOTICE.license added"
+ ],
+ "source_files_modified": []
+}

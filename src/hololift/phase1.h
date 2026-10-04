@@ -124,6 +124,7 @@ class HoloLiftPhase1PreparationContext;
 struct HoloLiftPhase1FrameSelection;
 struct HoloLiftPhase1Result;
 struct HoloLiftPhase1TrajectoryFrameView;
+class HoloLiftPhase1AuditStream;
 
 using HoloLiftPhase1AuditDigest = std::array<std::byte, 32>;
 
@@ -160,6 +161,7 @@ private:
   std::unique_ptr<HoloLiftPhase1Result> result_;
   HoloLiftPhase1AuditDigest trajectory_audit_digest_{};
 
+  friend class HoloLiftPhase1AuditStream;
   friend std::expected<HoloLiftPhase1AuditedResult, std::string>
   audit_hololift_phase1_all_atom_reconstruction(
       HoloLiftPhase1PreparationContext &, const HoloLiftObservationStore &,
@@ -210,6 +212,11 @@ private:
       HoloLiftPhase1PreparationContext &, const HoloLiftObservationStore &,
       std::span<const HoloLiftPhase1PreparedFrame>, HoloLiftPhase1Result,
       std::span<const HoloLiftPhase1TrajectoryFrameView>);
+  friend std::expected<HoloLiftPhase1AuditStream, std::string>
+  begin_hololift_phase1_audit(HoloLiftPhase1PreparationContext &,
+                              const HoloLiftObservationStore &,
+                              std::span<const HoloLiftPhase1PreparedFrame>,
+                              HoloLiftPhase1Result);
 };
 
 std::expected<HoloLiftPhase1PreparationContext, std::string>
@@ -602,6 +609,60 @@ audit_hololift_phase1_all_atom_reconstruction(
     std::span<const HoloLiftPhase1PreparedFrame> prepared_frames,
     HoloLiftPhase1Result result,
     std::span<const HoloLiftPhase1TrajectoryFrameView> trajectory_frames);
+
+// The same audit fed one block of trajectory frames at a time, so that the
+// trajectory need not be held in memory. Blocks arrive in frame order and
+// together cover every frame of the store. The frames of a block, and the
+// transition into each of them, are audited on up to `workers` threads; the
+// counts and maxima are then reduced in frame order, so the sealed result and
+// its digest equal those of the one-call audit for any block size or worker
+// count. The context, store and prepared frames must outlive the stream.
+class HoloLiftPhase1AuditStream {
+public:
+  HoloLiftPhase1AuditStream(HoloLiftPhase1AuditStream &&) noexcept;
+  HoloLiftPhase1AuditStream &operator=(HoloLiftPhase1AuditStream &&) noexcept;
+  ~HoloLiftPhase1AuditStream();
+
+  HoloLiftPhase1AuditStream(const HoloLiftPhase1AuditStream &) = delete;
+  HoloLiftPhase1AuditStream &
+  operator=(const HoloLiftPhase1AuditStream &) = delete;
+
+  // The solver result under audit: final selections, counters still filling.
+  // Null after a failure or finish().
+  [[nodiscard]] const HoloLiftPhase1Result *result_if_valid() const noexcept;
+
+  // Audits frames [first_frame, first_frame + trajectory_frames.size()). For
+  // each frame of the block, returns what reconstruct_hololift_phase1_frame
+  // returns: the selected-path coordinates in the frame's atom order, empty
+  // for a frame that is not a temporal observation. A failure ends the stream.
+  std::expected<std::vector<std::vector<std::array<double, 3>>>, std::string>
+  audit_block(std::size_t first_frame,
+              std::span<const HoloLiftPhase1TrajectoryFrameView>
+                  trajectory_frames,
+              std::size_t workers);
+
+  // Seals the result once every frame has been audited.
+  std::expected<HoloLiftPhase1AuditedResult, std::string> finish();
+
+private:
+  struct Impl;
+  explicit HoloLiftPhase1AuditStream(std::unique_ptr<Impl> impl) noexcept;
+
+  std::unique_ptr<Impl> impl_;
+
+  friend std::expected<HoloLiftPhase1AuditStream, std::string>
+  begin_hololift_phase1_audit(HoloLiftPhase1PreparationContext &,
+                              const HoloLiftObservationStore &,
+                              std::span<const HoloLiftPhase1PreparedFrame>,
+                              HoloLiftPhase1Result);
+};
+
+std::expected<HoloLiftPhase1AuditStream, std::string>
+begin_hololift_phase1_audit(
+    HoloLiftPhase1PreparationContext &context,
+    const HoloLiftObservationStore &store,
+    std::span<const HoloLiftPhase1PreparedFrame> prepared_frames,
+    HoloLiftPhase1Result result);
 
 // Recomputes the complete frame -> segment -> global audit hierarchy and the
 // deterministic trajectory/assignment digest held by the sealed result.
