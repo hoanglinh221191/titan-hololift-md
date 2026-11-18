@@ -253,11 +253,15 @@ public:
     auto version = parse_integer<std::uint32_t>(reader, row, "schema_version");
     if (!version)
       return std::unexpected(version.error());
-    if (*version != titan_pbctopo::VIBE_OBSERVATION_SCHEMA_VERSION) {
+    if (*version < titan_pbctopo::VIBE_OBSERVATION_MIN_READABLE_SCHEMA_VERSION ||
+        *version > titan_pbctopo::VIBE_OBSERVATION_SCHEMA_VERSION) {
       return std::unexpected(make_error(
           HoloLiftVibeImportCode::ContractMismatch, reader.path(), row.line,
           "unsupported VIBE observation schema version " +
-              std::to_string(*version) + "; supported version is " +
+              std::to_string(*version) + "; supported versions are " +
+              std::to_string(
+                  titan_pbctopo::VIBE_OBSERVATION_MIN_READABLE_SCHEMA_VERSION) +
+              " to " +
               std::to_string(
                   titan_pbctopo::VIBE_OBSERVATION_SCHEMA_VERSION)));
     }
@@ -274,6 +278,12 @@ public:
     }
     if (producer_version_.empty())
       producer_version_ = producer;
+    if (schema_version_ != 0 && *version != schema_version_) {
+      return std::unexpected(
+          make_error(HoloLiftVibeImportCode::ContractMismatch, reader.path(),
+                     row.line, "mixed schema versions in one VIBE package"));
+    }
+    schema_version_ = *version;
     if (reader.get(row, "coordinate_unit") != "angstrom" ||
         reader.get(row, "time_unit") != "ps" ||
         reader.get(row, "endianness") != "not_applicable_text") {
@@ -304,6 +314,10 @@ public:
   [[nodiscard]] const std::string &producer_version() const noexcept {
     return producer_version_;
   }
+  // Schema version shared by every row read so far (0 before the first).
+  [[nodiscard]] std::uint32_t schema_version() const noexcept {
+    return schema_version_;
+  }
 
 private:
   template <typename Integer>
@@ -323,6 +337,7 @@ private:
   }
 
   std::string producer_version_;
+  std::uint32_t schema_version_ = 0;
 };
 
 template <typename Integer>
@@ -717,6 +732,8 @@ import_layout(const HoloLiftVibeImportOptions &options,
   }
   builder.source_contract = make_hololift_vibe_contract(
       contract.producer_version(), options.package_id, options.trajectory_id);
+  // The topology epoch identities of a package hash its own schema version.
+  builder.source_contract.schema_version = contract.schema_version();
 
   const auto hard_edge_path =
       options.package_directory / "pbctopo_hard_edges.csv";
@@ -943,6 +960,8 @@ parse_evidence_state(const CsvReader &reader, const CsvRow &row) {
     return titan_pbctopo::PbctopoEvidenceState::Contradicted;
   if (value == "weak_ambiguous")
     return titan_pbctopo::PbctopoEvidenceState::WeakAmbiguous;
+  if (value == "extended_periodic")
+    return titan_pbctopo::PbctopoEvidenceState::ExtendedPeriodic;
   return std::unexpected(make_error(HoloLiftVibeImportCode::InvalidValue,
                                     reader.path(), row.line,
                                     "unknown evidence_state"));
@@ -1404,6 +1423,11 @@ parse_frame_row(const CsvReader &reader, const CsvRow &row) {
     return std::unexpected(compatible_loss_count.error());
   if (!no_support_relation_count)
     return std::unexpected(no_support_relation_count.error());
+  // Schema 8 extended_periodic frames are read with the schema-7 state, the
+  // evidence semantics every HoloLift check below is written for.
+  *evidence_state = titan_pbctopo::pbctopo_schema7_evidence_state(
+      *evidence_state, *ambiguous_relation_count, *no_support_relation_count,
+      *evidence_graph_connected);
   if (!selected_relation_has_support)
     return std::unexpected(selected_relation_has_support.error());
   if (!hypothesis_construction_attempted)

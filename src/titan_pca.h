@@ -9,6 +9,7 @@
 #include <chrono>
 #include <Eigen/Dense>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -25,7 +26,9 @@ struct FES_Grid {
   double pc2{0.0};
   int count{0};
   double count_w{0.0};
-  double free_energy{20.0};
+  // KIN-11: NaN for a bin without weight (written as "nan"); it used to
+  // hold 20 kJ/mol, indistinguishable from a sampled bin
+  double free_energy{std::numeric_limits<double>::quiet_NaN()};
   int sink_id{-1}; // -1 means unassigned, else indexes a local minimum
 };
 

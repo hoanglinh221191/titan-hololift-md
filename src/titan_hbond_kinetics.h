@@ -3,8 +3,11 @@
 
 #include "Multi_MOL.h"
 #include "arguments.h"
+#include "titan_interaction_primitives.h"
 
+#include <array>
 #include <cstddef>
+#include <optional>
 #include <cstdint>
 #include <deque>
 #include <fstream>
@@ -103,9 +106,26 @@ private:
     std::string atom_name;
   };
 
+  // A donor and its hydrogens: cache.donor_hydrogens[hydrogen_begin, +count).
   struct DonorSite {
     std::size_t donor_index{0};
-    std::size_t hydrogen_index{0};
+    std::size_t hydrogen_begin{0};
+    std::size_t hydrogen_count{0};
+  };
+
+  // Event identity without strings: hbond (donor_mol, donor, acceptor_mol,
+  // acceptor, 0); salt (acid_mol, acid, base_mol, base, 0); water (water,
+  // mol_a, atom_a, mol_b, atom_b).
+  using EventKey = std::array<int, 5>;
+  struct EventKeyHash {
+    std::size_t operator()(const EventKey &key) const noexcept {
+      std::uint64_t hash = 1469598103934665603ULL;
+      for (const int value : key) {
+        hash ^= static_cast<std::uint32_t>(value);
+        hash *= 1099511628211ULL;
+      }
+      return static_cast<std::size_t>(hash);
+    }
   };
 
   struct MoleculeCache {
@@ -113,6 +133,7 @@ private:
     std::string label;
     std::vector<AtomLabel> atoms;
     std::vector<DonorSite> donors;
+    std::vector<std::size_t> donor_hydrogens;
     std::vector<std::size_t> acceptors;
     std::vector<std::size_t> acidic_atoms;
     std::vector<std::size_t> basic_atoms;
@@ -184,7 +205,7 @@ private:
     std::string scope_label;
     std::string status{"inactive"};
     titan_hbond_kinetics::StreamingKinetics kinetics;
-    std::unordered_map<std::string, int> id_by_key;
+    std::unordered_map<EventKey, int, EventKeyHash> id_by_key;
     std::vector<Descriptor> descriptors;
 
     void reset(std::size_t maxlag) {
@@ -281,6 +302,9 @@ private:
 
   MoleculeCache mol1_cache_;
   MoleculeCache mol2_cache_;
+  // Minimum image of the current frame when its box is valid; every
+  // distance and angle of the frame's searches goes through it.
+  std::optional<titan_interaction::PeriodicImage> frame_image_;
 
   std::vector<std::size_t> water_hit_buffer_a_;
   std::vector<std::size_t> water_hit_buffer_b_;

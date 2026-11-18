@@ -1,5 +1,4 @@
 #include "Multi_MOL.h"
-#include "cscd.h"
 #include "distance_v2.h"
 #include "folder.h"
 #include "force.h"
@@ -356,62 +355,6 @@ std::istream &safeGetline(std::istream &is, std::string &t) {
   }
 }
 
-bool check_in_list(vector<double> &dat, vector<vector<double>> &dat_is_checked,
-                   size_t &I) {
-  for (size_t i{}; i < dat_is_checked.size(); ++i) {
-    if (dat[0] - dat_is_checked[i][0] < 0.01 &&
-        dat_is_checked[i][0] - dat[0] < 0.01) {
-      I = i;
-      return true;
-    }
-  }
-  return false;
-}
-
-int post_proc_cscd(vector<string> &list_input_name) {
-  for (auto &input_name : list_input_name) {
-    vector<vector<double>> Info;
-    vector<size_t> Size;
-    fstream input(input_name, ios::in);
-    if (!input.is_open())
-      return 1;
-    for (string temp{}; getline(input, temp);) {
-      double dat{};
-      vector<double> vec_dat;
-      istringstream is(temp);
-      size_t i;
-      while (is >> dat)
-        vec_dat.emplace_back(dat);
-      if (Info.empty()) {
-        if (!vec_dat.empty()) {
-          Info.emplace_back(vec_dat);
-          Size.emplace_back(1);
-        }
-      } else {
-        if (check_in_list(vec_dat, Info, i)) {
-          for (size_t j{1}; j < Info[i].size(); ++j)
-            Info[i][j] += vec_dat[j];
-          Size[i] += 1;
-        } else {
-          Info.emplace_back(vec_dat);
-          Size.emplace_back(1);
-        }
-      }
-    }
-    fstream out("processed_" + input_name, ios::out);
-    out.precision(3);
-    for (size_t i{}; i < Info.size(); ++i) {
-      out << setw(10) << fixed << Info[i][0];
-      for (size_t j{1}; j < Info[i].size(); ++j)
-        out << setw(12) << fixed << Info[i][j] / Size[i];
-      out << '\n';
-    }
-    input.close();
-    out.close();
-  }
-  return 0;
-}
-
 bool check_end_cal(arguments &Arguments, vector<string> &input_line,
                    int &input_name) {
   if (!input_line.empty()) {
@@ -429,16 +372,6 @@ bool check_end_cal(arguments &Arguments, vector<string> &input_line,
     ++input_name;
   }
   return false;
-}
-
-int print_cscd(arguments &Arguments, all_cscd &out_dis,
-               vector<string> &list_file_name) {
-  if (Arguments.cal_dis_sc_contact == false)
-    return 1;
-  else {
-    out_dis.printResult(list_file_name);
-    return 0;
-  }
 }
 
 int find_maxforce_res(vector<energy_res> &Energy_res, string name,
@@ -555,8 +488,12 @@ string add_input_file_type(arguments &Arguments) {
     return Arguments.pdb_name;
 }
 
+// Time metadata of a newly opened input. The per-row times (time_of_snap)
+// are not set here: when an input is opened pro_in holds only its reference
+// frame (the -s structure, or the first model), not the analysed frames, so
+// the engine records one time per row as the frames are analysed.
 int process_time_of_infiles(Multi_MOL &pro_in, arguments &Arguments,
-                            info &info_output, vector<double> &time_of_snap) {
+                            info &info_output) {
   if (pro_in.m_mol.size() >= 2 && Arguments.dt == 0 &&
       pro_in.m_mol[1].time_of_snap - pro_in.m_mol[0].time_of_snap > 0) {
     info_output.set_current_dt(pro_in.m_mol[1].time_of_snap -
@@ -568,28 +505,6 @@ int process_time_of_infiles(Multi_MOL &pro_in, arguments &Arguments,
   if (Arguments.flag_end_set == true)
     info_output.set_current_end_time(
         pro_in.m_mol[pro_in.m_mol.size() - 1].get_time());
-
-  if (Arguments.flag_cat_result_multi_infile == false) {
-    if (pro_in.m_mol.size() > time_of_snap.size())
-      for (size_t i{time_of_snap.size()}; i < pro_in.m_mol.size(); ++i) {
-        time_of_snap.emplace_back(pro_in.m_mol[i].time_of_snap);
-        if (Arguments.tu == "ns")
-          time_of_snap[i] /= 1000.;
-      }
-  } else {
-    for (size_t i{}; i < pro_in.m_mol.size(); ++i) {
-      double current_snap_time{
-          time_of_snap.empty() ? 0 : time_of_snap[time_of_snap.size() - 1]};
-      if (Arguments.tu == "ns")
-        current_snap_time *= 1000.;
-
-      double time_temp{info_output.get_current_dt() + current_snap_time};
-
-      if (Arguments.tu == "ns")
-        time_temp /= 1000.;
-      time_of_snap.emplace_back(time_temp);
-    }
-  }
   return 0;
 }
 
@@ -667,27 +582,3 @@ int process_adding_energies_forces(
   return 0;
 }
 
-int sup_cal_dis_res_com(vector<multi_points> &com_res,
-                        vector<double> &distances, vector<string> &name_res,
-                        bool flag_o) {
-  double tot_mass{};
-  point average_com_weighted{};
-
-  for (size_t i{}; i < com_res.size(); ++i)
-    for (size_t j{}; j < com_res[i].points.size(); ++j) {
-      tot_mass += com_res[i].mass[j];
-
-      average_com_weighted += com_res[i].points[j] * com_res[i].mass[j];
-    }
-  average_com_weighted /= tot_mass;
-  for (size_t i{}; i < com_res.size(); ++i)
-    for (size_t j{}; j < com_res[i].points.size(); ++j) {
-      distances.emplace_back(
-          sqrt(square(com_res[i].points[j].x - average_com_weighted.x) +
-               square(com_res[i].points[j].y - average_com_weighted.y) +
-               square(com_res[i].points[j].z - average_com_weighted.z)));
-      if (flag_o == true)
-        name_res.emplace_back(com_res[i].name[j]);
-    }
-  return 0;
-}

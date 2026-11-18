@@ -49,6 +49,12 @@ struct NodePatchGeometry {
   std::vector<std::size_t> adjacent_nodes;
   std::size_t solid_angle_fallbacks{0};
   std::size_t solid_angle_clamps{0};
+  // Where each node normal came from: the analytic SES at the vertex, or the
+  // area-weighted star of its triangles.  `analytic_normal_rejected` counts
+  // analytic normals turned down because the star faces another sheet.
+  std::size_t analytic_normal_nodes{0};
+  std::size_t averaged_normal_nodes{0};
+  std::size_t analytic_normal_rejected{0};
   std::shared_ptr<const CurvedNodePatchGeometry> curved;
 };
 
@@ -71,6 +77,15 @@ struct Panel {
   double source_x{0.0};
   double source_y{0.0};
   double source_z{0.0};
+  // With the centroid, the unit mean normal of the patch (its normal
+  // integral, normalized).  The collocation normal below is the surface
+  // normal at the vertex; on a curved surface the two differ by about the
+  // curvature times the vertex-centroid offset, an error of the one-point
+  // source rule that does not decay with distance if the vertex normal is
+  // used.  Read through panel_source_n*() below.
+  double source_nx{0.0};
+  double source_ny{0.0};
+  double source_nz{0.0};
   bool has_source_quadrature_center{false};
   double nx{0.0};
   double ny{0.0};
@@ -93,9 +108,35 @@ struct Panel {
   std::size_t v2_index{static_cast<std::size_t>(-1)};
   bool has_triangle_geometry{false};
   std::shared_ptr<const SpherePatchQuadrature> sphere_patch_quadrature;
+  // Unit analytic surface normal per mesh vertex, indexed by v*_index and
+  // shared by every triangle of one mesh; NaN where the vertex is not on the
+  // analytic surface.  Null when the surface has no analytic description.
+  std::shared_ptr<const std::vector<std::array<double, 3>>>
+      analytic_vertex_normals;
   std::shared_ptr<const NodePatchGeometry> node_patch_geometry;
   std::size_t node_patch_index{static_cast<std::size_t>(-1)};
 };
+
+// A panel as a one-point source: the patch centroid and mean normal of a node
+// patch, the collocation point and normal of any other panel.
+inline double panel_source_x(const Panel &p) noexcept {
+  return p.has_source_quadrature_center ? p.source_x : p.x;
+}
+inline double panel_source_y(const Panel &p) noexcept {
+  return p.has_source_quadrature_center ? p.source_y : p.y;
+}
+inline double panel_source_z(const Panel &p) noexcept {
+  return p.has_source_quadrature_center ? p.source_z : p.z;
+}
+inline double panel_source_nx(const Panel &p) noexcept {
+  return p.has_source_quadrature_center ? p.source_nx : p.nx;
+}
+inline double panel_source_ny(const Panel &p) noexcept {
+  return p.has_source_quadrature_center ? p.source_ny : p.ny;
+}
+inline double panel_source_nz(const Panel &p) noexcept {
+  return p.has_source_quadrature_center ? p.source_nz : p.nz;
+}
 
 inline const std::array<double, 4> &sphere_patch_sphere(const Panel &panel) {
   return panel.sphere_patch_quadrature->spheres->at(panel.atom_index);
@@ -126,6 +167,9 @@ struct Vertex {
   double ny{0.0};
   double nz{0.0};
   std::size_t atom_index{0};
+  // True when (nx, ny, nz) is the certified analytic SES normal at a vertex
+  // that lies on the surface, false for a star or marching normal.
+  bool normal_analytic{false};
 };
 
 struct Triangle {
@@ -248,9 +292,20 @@ struct Options {
   // Matches the CLI default in arguments.h; see
   // docs/TITAN_SES_ENGINE_FIX_2026-09-15.md for why it is not `current`.
   std::string analytic_ses_engine{"patch-ray-experimental"};
+  // patch-ray-resolution remeshing target edge in A: 0 = grid spacing,
+  // negative = keep the marching-tetrahedra mesh.
+  double ses_remesh_edge{0.0};
+  int ses_remesh_iterations{6};
+  // Charge-adaptive remeshing (calderon::ChargeRefinement): alpha, 0 = off,
+  // and the smallest target edge in A.
+  double ses_charge_refine{0.0};
+  double ses_charge_refine_min_edge{0.2};
+  double ses_charge_refine_min_charge{0.1};
   double ses_grid_spacing{0.75};
   std::size_t ses_max_grid_vertices{4000000};
   std::string sphere_mesh_mode{"auto"};
+  // See Arguments::tabi_sphere_patch_clip.
+  bool sphere_patch_clip{true};
   int tree_leaf_size{32};
   int curved_pair_cache_mb{256};
   bool tree_leaf_size_explicit{false};
@@ -261,6 +316,20 @@ struct Options {
   std::string formulation{"jcp2013"};
   std::string discretization{"centroid"};
   std::string energy_projection{"boundary"};
+  // Curved surfaces: cells farther than this many cell radii from an atom
+  // enter its reaction potential as one aggregate point.  0 sums every sample.
+  // A one-point cell leaves an error of order 1/eta^2 that does not fall with
+  // the mesh spacing (the dipole kernel is scale free on a surface); 32 keeps
+  // it near 1e-4 on the Kirkwood sphere.
+  double energy_far_eta{32.0};
+  // Gauss order per direction of the stored curved dual-cell samples.
+  int curved_sample_order{2};
+  // FMM route only: a non-adjacent pair is integrated over the curved cell
+  // when the target lies within this many cell radii of the source vertex,
+  // and takes the one-point kernel beyond (CurvedNodePatchGeometry).  As with
+  // energy_far_eta the one-point error goes as 1/zone^2 independent of the
+  // spacing: about 8e-4 at 4, 3e-4 at 6, 1.5e-4 at 8 on the Kirkwood sphere.
+  double curved_near_zone_radii{8.0};
   std::string preconditioner{"auto"};
   std::string preconditioner_block_near{"singular"};
   int preconditioner_block_panel_cap{32};
@@ -391,6 +460,8 @@ struct Options {
   std::string fmm_local_refine_probe_mode{"rademacher"};
   std::string fmm_local_geometry_guard{"off"};
   double fmm_local_geometry_theta{0.0};
+  // See Arguments::tabi_fmm_local_geometry_sweep (diagnostic only).
+  bool fmm_local_geometry_sweep{false};
   std::string progress{"off"};
   int progress_interval_seconds{5};
   std::string true_residual_probe{"restart"};
@@ -1105,8 +1176,14 @@ struct Result {
   double preconditioner_coarse_verify_rel_error_max{0.0};
   std::string surface_generator{"titan_sphere_patch"};
   std::string discretization{"centroid"};
-  // "curved_dual", "flat_legacy", or "n/a" when not node-patch.
+  // "curved_dual", "curved_pn", "flat_legacy", or "n/a" when not node-patch.
   std::string node_patch_representation{"n/a"};
+  // "analytic=A;averaged=B;rejected=C" node-normal sources, "n/a" otherwise.
+  std::string node_patch_normal_source{"n/a"};
+  // "key=value;..." PN-lift and near-pair quadrature certificate of a
+  // curved node-patch surface (node_patch_certificate in tabi_solver.cpp),
+  // "n/a" otherwise.
+  std::string node_patch_certificate{"n/a"};
   double rhs_scale{1.0};
   double dielectric_contrast{0.0};
   double operator_contrast{0.0};

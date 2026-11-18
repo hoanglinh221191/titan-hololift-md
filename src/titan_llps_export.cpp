@@ -355,6 +355,11 @@ void TitanLLPS::export_results(const info &info_output, std::fstream &log) const
       out << "percolated: " << (result_.is_percolated ? "yes" : "no") << "\n";
       out << "percolation_time_ns: " << result_.percolation_time_ns << "\n";
       out << "tau_ns: " << result_.tau_ns << "\n";
+      // C(t) window: post-percolation frames (all frames without
+      // percolation), every stored frame an origin, lag = k * stride * dt
+      out << "ct_origin_frames: " << ct_origin_frames_ << "\n";
+      out << "ct_frame_stride: " << ct_stride_ << "\n";
+      out << "ct_dt_ns: " << ct_dt_ns_ << "\n";
       out << "n_macronodes: " << n_macro_ << "\n";
       out << "dimer_size: " << dimer_size_ << "\n";
       double mean_rg = 0.0;
@@ -389,8 +394,10 @@ void TitanLLPS::export_results(const info &info_output, std::fstream &log) const
       out << "# Mean per-frame number density (nm^-3) on fixed fractional bins, displayed in first accepted cell; variable cells are not a fixed Cartesian density map.\n";
       int dims[3]={grid_nx_,grid_ny_,grid_nz_};
       const auto& b=density_reference_cell_;
-      out << "origin " << .5*(b[0]/dims[0]+b[1]/dims[1]+b[2]/dims[2]) << " " << .5*(b[3]/dims[0]+b[4]/dims[1]+b[5]/dims[2]) << " " << .5*(b[6]/dims[0]+b[7]/dims[1]+b[8]/dims[2]) << "\n";
-      for(int k=0;k<3;++k) out << "delta " << b[k]/dims[k] << " " << b[3+k]/dims[k] << " " << b[6+k]/dims[k] << "\n";
+      // STR-01: rows of the cell matrix are the lattice vectors (bin k runs
+      // along lattice vector k)
+      out << "origin " << .5*(b[0]/dims[0]+b[3]/dims[1]+b[6]/dims[2]) << " " << .5*(b[1]/dims[0]+b[4]/dims[1]+b[7]/dims[2]) << " " << .5*(b[2]/dims[0]+b[5]/dims[1]+b[8]/dims[2]) << "\n";
+      for(int k=0;k<3;++k) out << "delta " << b[3*k]/dims[k] << " " << b[3*k+1]/dims[k] << " " << b[3*k+2]/dims[k] << "\n";
       out << "object 2 class gridconnections counts " << grid_nx_ << " "
           << grid_ny_ << " " << grid_nz_ << "\n";
       out << "object 3 class array type double rank 0 items " << total

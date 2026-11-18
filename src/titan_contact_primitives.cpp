@@ -30,7 +30,7 @@ bool residue_less_for_pair_order(const titan_contact::ResidueKey &lhs,
 }
 
 bool residue_name_starts_gly(const std::string &resname) {
-  return resname.starts_with("GLY");
+  return is_glycine_residue_name(resname);
 }
 
 } // namespace
@@ -103,10 +103,7 @@ const char *contact_mode_name(ContactMode mode) noexcept {
 }
 
 bool is_backbone_atom_name(std::string_view atom_name) {
-  const std::string atom = uppercase_copy(trim_copy(atom_name));
-  return atom == "N" || atom == "CA" || atom == "C" || atom == "O" ||
-         atom == "OXT" || atom == "H" || atom == "H1" || atom == "H2" ||
-         atom == "H3" || atom == "HA";
+  return is_amino_acid_backbone_atom(uppercase_copy(trim_copy(atom_name)));
 }
 
 bool is_hydrogen_atom_name(std::string_view atom_name) {
@@ -138,9 +135,7 @@ bool is_selected_contact_atom(const mol_info &info, ContactMode mode) {
   case ContactMode::CA:
     return atom == "CA";
   case ContactMode::Backbone:
-    return !is_hydrogen_atom_name(atom) &&
-           (atom == "N" || atom == "CA" || atom == "C" || atom == "O" ||
-            atom == "OXT");
+    return !is_hydrogen_atom_name(atom) && is_amino_acid_backbone_atom(atom);
   }
   return false;
 }

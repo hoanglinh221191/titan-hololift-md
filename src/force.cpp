@@ -1,5 +1,6 @@
 #include "titan_topology_energy.h"
 #include "gromos_nonbonded.h"
+#include "titan_lj_pair_override.h"
 #include "Multi_MOL.h"
 #include "cache_sigma_epsilon.h"
 #include "charmm_nonbonded.h"
@@ -105,7 +106,7 @@ int force_energy_add(const cache_sigma_epsilon &CachedData, size_t i,
     double lambda_debye = 0.0;
     if (screened) {
       lambda_debye = titan_electrostatics::debye_length_nm(
-          Arguments.salt_concentration);
+          Arguments.salt_concentration, Arguments.gbsa_temperature);
       screening = std::exp(-d / lambda_debye);
     }
     const double electro_pair = charge_prefactor * screening / d;
@@ -153,11 +154,16 @@ int force_energy_add(const cache_sigma_epsilon &CachedData, size_t i,
            (Arguments.flag_interchain_energy == true &&
             lg.info[lg_pos].get_chain() == rec.info[rec_pos].get_chain())))
         return 1;
+      double v_val = temp_vdw * (c_12 - c_6);
+      double sd{square(1. / d)},
+          temp_par_vdw{temp_vdw * (12. * c_12 * sd - 6. * c_6 * sd)};
+      if (CachedData.has_charmm_pair_overrides())
+        titan_lj::override_lj_energy_force(CachedData, rec_parameters,
+                                           lg_parameters, rec_pos, lg_pos, d,
+                                           v_val, temp_par_vdw);
       electro_energy += electro_pair;
-      van_der_waals_energy += temp_vdw * (c_12 - c_6);
+      van_der_waals_energy += v_val;
       if (Arguments.flag_cal_force == true) {
-        double sd{square(1. / d)},
-            temp_par_vdw{temp_vdw * (12. * c_12 * sd - 6. * c_6 * sd)};
         force_elec.add(0.1 * electro_force_prefactor * dx,
                        0.1 * electro_force_prefactor * dy,
                        0.1 * electro_force_prefactor * dz);
@@ -182,12 +188,17 @@ int force_energy_add(const cache_sigma_epsilon &CachedData, size_t i,
             lg.info[lg_pos].get_chain() == rec.info[rec_pos].get_chain())))
         return 1;
 
+      double v_val = temp_vdw * (c_12 - c_6);
+      double sd{square(1. / d)},
+          temp_par_vdw{temp_vdw * (12. * c_12 * sd - 6. * c_6 * sd)};
+      if (CachedData.has_charmm_pair_overrides())
+        titan_lj::override_lj_energy_force(CachedData, rec_parameters,
+                                           lg_parameters, rec_pos, lg_pos, d,
+                                           v_val, temp_par_vdw);
       electro_energy += electro_pair;
-      van_der_waals_energy += temp_vdw * (c_12 - c_6);
+      van_der_waals_energy += v_val;
 
       if (Arguments.flag_cal_force == true) {
-        double sd{square(1. / d)},
-            temp_par_vdw{temp_vdw * (12. * c_12 * sd - 6. * c_6 * sd)};
         force_elec.add(0.1 * electro_force_prefactor * dx,
                        0.1 * electro_force_prefactor * dy,
                        0.1 * electro_force_prefactor * dz);
@@ -315,7 +326,7 @@ void cal_energy_force_amber(const MOL &rec, const MOL &lg,
   const bool screened = Arguments.flag_elec_screening;
   const double lambda_debye =
       screened ? titan_electrostatics::debye_length_nm(
-                     Arguments.salt_concentration)
+                     Arguments.salt_concentration, Arguments.gbsa_temperature)
                : 0.0;
 
   for (size_t j{begin}; j < end; ++j) {
@@ -365,6 +376,10 @@ void cal_energy_force_amber(const MOL &rec, const MOL &lg,
           c_6 = 0.000;
         temp_par_vdw = temp_vdw * (12. * c_12 * sd - 6. * c_6 * sd);
         v_val = temp_vdw * (c_12 - c_6);
+        if (CachedData.has_charmm_pair_overrides())
+          titan_lj::override_lj_energy_force(CachedData, rec_parameters,
+                                             lg_parameters, i, j, d, v_val,
+                                             temp_par_vdw);
       }
 
       if (Arguments.distance_energy_cutoff > 0. &&
@@ -415,6 +430,7 @@ void cal_energy_force_opls(const MOL &rec, const MOL &lg,
   Energy.set_energy(0., 0.);
   Force.set_force(force(0., 0., 0.), force(0., 0., 0.));
   const double epsilon_in = std::max(1.0e-12, Arguments.epsilon_in);
+  const bool has_overrides = CachedData.has_charmm_pair_overrides();
 
   for (size_t j{begin}; j < end; ++j) {
     double temp_epsilon_lg{16. * lg_parameters[j].get_epsilon()},
@@ -439,6 +455,11 @@ void cal_energy_force_opls(const MOL &rec, const MOL &lg,
           c_6{c6(sqrt(temp_sigma_lg * rec_parameters[i].get_sigma()) / d)},
           c_12{square(c_6)},
           temp_par_vdw{temp_vdw * (12. * c_12 * sd - 6. * c_6 * sd)};
+      double v_val = temp_vdw * (c_12 - c_6);
+      if (has_overrides)
+        titan_lj::override_lj_energy_force(CachedData, rec_parameters,
+                                           lg_parameters, i, j, d, v_val,
+                                           temp_par_vdw);
 
       if (Arguments.distance_energy_cutoff > 0. &&
           d > Arguments.distance_energy_cutoff) {
@@ -455,12 +476,12 @@ void cal_energy_force_opls(const MOL &rec, const MOL &lg,
       }
 
       if (CachedData.elec_ener.empty()) {
-        Energy += cache_energy(charge, temp_vdw * (c_12 - c_6));
+        Energy += cache_energy(charge, v_val);
         Force += cache_force(0.1 * temp_elec * dx, 0.1 * temp_elec * dy,
                              0.1 * temp_elec * dz, 0.1 * temp_par_vdw * dx,
                              0.1 * temp_par_vdw * dy, 0.1 * temp_par_vdw * dz);
       } else {
-        CachedData.set_elec_vdw(pos, charge, temp_vdw * (c_12 - c_6));
+        CachedData.set_elec_vdw(pos, charge, v_val);
         CachedData.set_force(pos, 0.1 * temp_elec * dx, 0.1 * temp_elec * dy,
                              0.1 * temp_elec * dz, 0.1 * temp_par_vdw * dx,
                              0.1 * temp_par_vdw * dy, 0.1 * temp_par_vdw * dz);

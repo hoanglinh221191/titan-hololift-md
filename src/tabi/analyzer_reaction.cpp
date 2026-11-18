@@ -774,10 +774,19 @@ AnalyzerImpl::solve_tabi_reaction_field(const std::vector<Atom> &atoms,
   options.ses_grid_spacing = args_.tabi_ses_grid_spacing;
   options.ses_max_grid_vertices = args_.tabi_ses_max_grid_vertices;
   options.sphere_mesh_mode = args_.tabi_sphere_mesh;
+  options.sphere_patch_clip = args_.tabi_sphere_patch_clip;
   options.tree_leaf_size = args_.tabi_tree_leaf_size;
   options.curved_pair_cache_mb = args_.tabi_curved_pair_cache_mb;
   options.tree_leaf_size_explicit = args_.tabi_tree_leaf_size_explicit;
   options.tree_opening_theta = args_.tabi_tree_opening_theta;
+  options.energy_far_eta = args_.tabi_energy_far_eta;
+  options.ses_remesh_edge = args_.tabi_ses_remesh_edge;
+  options.ses_remesh_iterations = args_.tabi_ses_remesh_iterations;
+  options.ses_charge_refine = args_.tabi_ses_charge_refine;
+  options.ses_charge_refine_min_edge = args_.tabi_ses_charge_refine_min_edge;
+  options.ses_charge_refine_min_charge = args_.tabi_ses_charge_refine_min_charge;
+  options.curved_sample_order = args_.tabi_curved_sample_order;
+  options.curved_near_zone_radii = args_.tabi_curved_near_zone_radii;
   options.tree_opening_theta_explicit =
       args_.tabi_tree_opening_theta_explicit;
   options.taylor_order = args_.tabi_taylor_order;
@@ -946,6 +955,7 @@ AnalyzerImpl::solve_tabi_reaction_field(const std::vector<Atom> &atoms,
   options.fmm_local_refine_probe_mode = args_.tabi_fmm_local_refine_probe_mode;
   options.fmm_local_geometry_guard = args_.tabi_fmm_local_geometry_guard;
   options.fmm_local_geometry_theta = args_.tabi_fmm_local_geometry_theta;
+  options.fmm_local_geometry_sweep = args_.tabi_fmm_local_geometry_sweep;
   options.true_residual_probe = args_.tabi_true_residual_probe;
   options.true_residual_probe_scope = args_.tabi_true_residual_probe_scope;
   options.true_residual_probe_interval =
@@ -1941,6 +1951,8 @@ AnalyzerImpl::solve_tabi_reaction_field(const std::vector<Atom> &atoms,
   solve.tabi_surface_generator = tabi.surface_generator;
   solve.tabi_discretization = tabi.discretization;
   solve.tabi_node_patch_representation = tabi.node_patch_representation;
+  solve.tabi_node_patch_normal_source = tabi.node_patch_normal_source;
+  solve.tabi_node_patch_certificate = tabi.node_patch_certificate;
   solve.tabi_rhs_scale = tabi.rhs_scale;
   solve.tabi_dielectric_contrast = tabi.dielectric_contrast;
   solve.tabi_operator_contrast = tabi.operator_contrast;
@@ -2007,18 +2019,28 @@ AnalyzerImpl::solve_tabi_reaction_field(const std::vector<Atom> &atoms,
   solve.boundary_max = tabi.residual;
   solve.linear_residual = tabi.residual;
   solve.charge_assigned = tabi.total_charge;
-  solve.energy_kcal_mol = tabi.energy_kcal_mol;
-  solve.energy_kj_mol = tabi.energy_kj_mol;
-  solve.energy_kt = tabi.energy_kt;
-  solve.atom_corrected_kcal_mol = tabi.energy_kcal_mol;
-  solve.atom_corrected_kj_mol = tabi.energy_kj_mol;
-  solve.atom_corrected_kt = tabi.energy_kt;
-  solve.grid_corrected_kcal_mol = tabi.energy_kcal_mol;
-  solve.grid_corrected_kj_mol = tabi.energy_kj_mol;
-  solve.grid_corrected_kt = tabi.energy_kt;
-  solve.solvent_phase_kcal_mol = tabi.energy_kcal_mol;
-  solve.solvent_phase_kj_mol = tabi.energy_kj_mol;
-  solve.solvent_phase_kt = tabi.energy_kt;
+  // A solve that did not succeed has no reaction energy. Its value here is 0
+  // when nothing was computed (a refused operator) or the projection of an
+  // unconverged solution, and either one read downstream as a result. The
+  // projection stays in tabi_boundary_energy for diagnosis. A Born fallback
+  // keeps its value; its energy source says what it is.
+  const bool energy_valid = tabi.status == "ok" || tabi.status == "fallback";
+  const double no_energy = std::numeric_limits<double>::quiet_NaN();
+  const double energy_kcal = energy_valid ? tabi.energy_kcal_mol : no_energy;
+  const double energy_kj = energy_valid ? tabi.energy_kj_mol : no_energy;
+  const double energy_kt = energy_valid ? tabi.energy_kt : no_energy;
+  solve.energy_kcal_mol = energy_kcal;
+  solve.energy_kj_mol = energy_kj;
+  solve.energy_kt = energy_kt;
+  solve.atom_corrected_kcal_mol = energy_kcal;
+  solve.atom_corrected_kj_mol = energy_kj;
+  solve.atom_corrected_kt = energy_kt;
+  solve.grid_corrected_kcal_mol = energy_kcal;
+  solve.grid_corrected_kj_mol = energy_kj;
+  solve.grid_corrected_kt = energy_kt;
+  solve.solvent_phase_kcal_mol = energy_kcal;
+  solve.solvent_phase_kj_mol = energy_kj;
+  solve.solvent_phase_kt = energy_kt;
   if (tabi.surface_only) {
     solve.reaction_energy_source = tabi.reaction_energy_source;
     solve.converged = tabi.status == "ok";

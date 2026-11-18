@@ -7,6 +7,8 @@
 
 #include "titan_kinetics.h"
 #include "titan_markov_estimator.h"
+#include "titan_its.h"
+#include "titan_seeded_random.h"
 #include <Eigen/Dense>
 #include <Eigen/Eigenvalues>
 #include <array>
@@ -66,7 +68,8 @@ inline bool build_tpm_for_lag(const std::vector<int> &discrete_traj,
                               const std::vector<int> &boundaries, int n_k,
                               int lag, Eigen::MatrixXd &count_tmp,
                               Eigen::MatrixXd &c_sym_tmp,
-                              Eigen::MatrixXd &tpm_tmp) {
+                              Eigen::MatrixXd &tpm_tmp,
+                              Eigen::VectorXd *stationary_out = nullptr) {
   count_tmp.setZero();
   for (std::size_t s = 0; s + 1 < boundaries.size(); ++s) {
     const int seg_start = boundaries[s];
@@ -80,37 +83,20 @@ inline bool build_tpm_for_lag(const std::vector<int> &discrete_traj,
   (void)c_sym_tmp;
   Eigen::VectorXd stationary;
   std::string error;
-  return titan_markov::reversible_mle(count_tmp, tpm_tmp, stationary, error);
+  const bool ok =
+      titan_markov::reversible_mle(count_tmp, tpm_tmp, stationary, error);
+  if (stationary_out != nullptr)
+    *stationary_out = stationary;
+  return ok;
 }
 
 inline std::vector<double> compute_its_values_from_eigenvalues(
     const Eigen::VectorXcd &evals, int n_k, int lag, double dt_ns,
     int n_timescales) {
-  std::vector<int> idx(static_cast<size_t>(n_k));
-  std::iota(idx.begin(), idx.end(), 0);
-  std::sort(idx.begin(), idx.end(), [&](int a, int b) {
-    return std::abs(evals[a]) > std::abs(evals[b]);
-  });
-
-  std::vector<double> values;
-  values.reserve(static_cast<size_t>(std::max(0, n_timescales)));
-  int written = 0;
-  for (int rank = 1; rank < n_k && written < n_timescales; ++rank) {
-    const int ei = idx[rank];
-    const double abs_l = std::abs(evals[ei]);
-    const double im_l = std::abs(evals[ei].imag());
-    if (abs_l >= 1.0 || im_l > 1e-6 || abs_l < 1e-15) {
-      values.push_back(std::numeric_limits<double>::quiet_NaN());
-    } else {
-      values.push_back(-static_cast<double>(lag) * dt_ns / std::log(abs_l));
-    }
-    ++written;
-  }
-  while (written < n_timescales) {
-    values.push_back(std::numeric_limits<double>::quiet_NaN());
-    ++written;
-  }
-  return values;
+  // KIN-06: the shared ITS convention (titan_its.h), NaN columns keep rank
+  return titan_its::implied_timescales(evals.head(n_k),
+                                       static_cast<double>(lag) * dt_ns,
+                                       n_timescales, /*pad=*/true);
 }
 
 inline std::string format_its_value(double v) {
@@ -124,7 +110,8 @@ inline std::string format_its_value(double v) {
 inline bool solve_its_eigenvalues(
     const Eigen::MatrixXd &tpm, TitanMSMItsSolverMode mode, int n_timescales,
     int its_topk, int its_max_k_full, Eigen::VectorXcd &out_evals,
-    std::string &effective_solver_mode) {
+    std::string &effective_solver_mode, std::uint64_t seed,
+    const Eigen::VectorXd *stationary = nullptr) {
   const int n_k = static_cast<int>(tpm.rows());
   TitanMSMItsSolverMode chosen_mode = mode;
   if (chosen_mode == TitanMSMItsSolverMode::Full && n_k > its_max_k_full) {
@@ -132,6 +119,16 @@ inline bool solve_its_eigenvalues(
   }
 
   auto try_full = [&]() -> bool {
+    // KIN-09: reversible estimates use the symmetric solver (real spectrum)
+    if (stationary != nullptr) {
+      Eigen::VectorXd real_values;
+      if (titan_markov::reversible_spectrum(tpm, *stationary, real_values,
+                                            nullptr)) {
+        out_evals = real_values.cast<std::complex<double>>();
+        effective_solver_mode = "full(symmetric)";
+        return true;
+      }
+    }
     Eigen::EigenSolver<Eigen::MatrixXd> es(tpm, /*computeEigenvectors=*/false);
     if (es.info() != Eigen::Success)
       return false;
@@ -188,7 +185,9 @@ inline bool solve_its_eigenvalues(
     constexpr int max_subspace_iter = 64;
     constexpr double subspace_tol = 1e-8;
 
-    Eigen::MatrixXd Q = Eigen::MatrixXd::Random(n_k, topk);
+    // KIN-08: seeded start block; Eigen's Random used the process-wide
+    // rand() state, shared by the threads of the ITS lag scan
+    Eigen::MatrixXd Q = titan_random::uniform_block(n_k, topk, seed);
     Q.col(0).setConstant(1.0);
 
     auto orthonormalize = [&](Eigen::MatrixXd &M) {
@@ -611,6 +610,7 @@ TitanMSM::get_per_replica_box_volumes_nm3() const {
 void TitanMSM::train_kmeans(TitanExecutor &executor, int max_iter,
                             unsigned int seed) {
   n_threads_ = std::max(1, static_cast<int>(executor.capacity()));
+  random_seed_ = titan_random::solver_seed(seed); // KIN-08: also the ITS solver
   // --- Preconditions -------------------------------------------------------
   if (n_proj_frames_ == 0) {
     TitanUI::print_error(
@@ -640,31 +640,41 @@ void TitanMSM::train_kmeans(TitanExecutor &executor, int max_iter,
   }
 
   // -------------------------------------------------------------------------
-  // K-Means++ Initialization — parallel weight computation per centroid step
+  // K-Means++ Initialization — parallel weight update per centroid step
   // -------------------------------------------------------------------------
-  std::vector<double> weights(N, 0.0);
+  // KIN-07: weights[i] holds the squared distance of frame i to its nearest
+  // chosen centroid and is lowered with each new centroid only, O(N k d) in
+  // all instead of rescanning every chosen centroid, O(N k^2 d). Each distance
+  // is the same per-pair value the full scan computed, so the minima and the
+  // centroids drawn from them are unchanged.
+  std::vector<double> weights(N, std::numeric_limits<double>::infinity());
 
-  auto compute_weights_parallel = [&](int up_to_c) {
+  auto lower_weights_parallel = [&](int c) {
+    const double *centroid =
+        centroids_.data() + static_cast<ptrdiff_t>(c) * n_comp_;
+    const double *frame_data = proj_mat_.data();
     const int64_t chunk = (N + n_threads_ - 1) / n_threads_;
     executor.parallel_do(static_cast<size_t>(n_threads_), [&](size_t t_sz) {
       const int t = static_cast<int>(t_sz);
       const int64_t start = t * chunk;
       const int64_t end = std::min(start + chunk, N);
-      if (start >= end)
-        return;
-      scan_best_centroids_blocked(
-          proj_mat_, start, end, centroids_, up_to_c, n_comp_,
-          [&](int64_t i, int /*best_c*/, double min_d2) {
-            weights[static_cast<size_t>(i)] = min_d2;
-          });
+      for (int64_t i = start; i < end; ++i) {
+        const double d2 = squared_distance_rowmajor_avx2(
+            frame_data + static_cast<ptrdiff_t>(i) * n_comp_, centroid,
+            n_comp_);
+        if (d2 < weights[static_cast<size_t>(i)])
+          weights[static_cast<size_t>(i)] = d2;
+      }
     });
   };
 
+  lower_weights_parallel(0);
   for (int c = 1; c < n_k_; ++c) {
-    compute_weights_parallel(c);
     std::discrete_distribution<int64_t> weighted(weights.begin(),
                                                  weights.end());
     centroids_.row(c) = proj_mat_.row(weighted(rng));
+    if (c + 1 < n_k_)
+      lower_weights_parallel(c);
   }
 
   TitanUI::print_info("  K-Means++ initialization complete (" +
@@ -883,6 +893,7 @@ void TitanMSM::build_markov_model(int msm_lag_time) {
   }
 
   msm_lag_time_ = msm_lag_time;
+  unit_eigenvalue_count_ = 0;
 
   // -------------------------------------------------------------------------
   // Step 1 — Count matrix (boundary-aware)
@@ -921,11 +932,39 @@ void TitanMSM::build_markov_model(int msm_lag_time) {
 
   // Fix 4: cache eigendecomposition NOW (once, used by ITS + PCCA)
   {
-    Eigen::EigenSolver<Eigen::MatrixXd> es(tpm_, /*computeEigenvectors=*/true);
-    if (es.info() == Eigen::Success) {
-      cached_eigenvalues_ = es.eigenvalues();
-      cached_eigenvectors_ = es.eigenvectors();
+    // KIN-09: the reversible estimate is in detailed balance with
+    // stationary_dist_, so the symmetric solver applies (real spectrum,
+    // pi-orthogonal right eigenvectors); the general solver remains the
+    // fallback.
+    Eigen::VectorXd real_values;
+    Eigen::MatrixXd real_vectors;
+    bool solved = titan_markov::reversible_spectrum(
+        tpm_, stationary_dist_, real_values, &real_vectors);
+    if (solved) {
+      cached_eigenvalues_ = real_values.cast<std::complex<double>>();
+      cached_eigenvectors_ = real_vectors.cast<std::complex<double>>();
+    } else {
+      Eigen::EigenSolver<Eigen::MatrixXd> es(tpm_,
+                                             /*computeEigenvectors=*/true);
+      solved = es.info() == Eigen::Success;
+      if (solved) {
+        cached_eigenvalues_ = es.eigenvalues();
+        cached_eigenvectors_ = es.eigenvectors();
+      }
+    }
+    if (solved) {
       eigen_solved_ = true;
+      // KIN-06: more than one eigenvalue at 1 means more than one
+      // stationary distribution (the model is not ergodic)
+      unit_eigenvalue_count_ =
+          titan_its::count_unit_eigenvalues(cached_eigenvalues_);
+      if (unit_eigenvalue_count_ > 1) {
+        TitanUI::print_warning(
+            "MSM: " + std::to_string(unit_eigenvalue_count_) +
+            " eigenvalues of the transition matrix lie within 1e-8 of 1; the "
+            "model is not ergodic (disconnected or numerically decoupled "
+            "sets) and the matching implied timescales are reported as NaN.");
+      }
     } else {
       TitanUI::print_info(
           "[WARNING] TitanMSM: EigenSolver failed to converge — "
@@ -948,42 +987,14 @@ TitanMSM::compute_implied_timescales(int n_timescales) const {
   if (!eigen_solved_)
     return {};
 
-  // Fix 4: use cached eigenvalues from build_markov_model
-  const auto &evals = cached_eigenvalues_;
-
-  // Sort indices by descending |eigenvalue|
-  const int k = n_k_;
-  std::vector<int> idx(k);
-  std::iota(idx.begin(), idx.end(), 0);
-  std::sort(idx.begin(), idx.end(), [&](int a, int b) {
-    return std::abs(evals[a]) > std::abs(evals[b]);
-  });
-
-  std::vector<double> timescales;
-  timescales.reserve(n_timescales);
-
-  for (int rank = 1;
-       rank < k && static_cast<int>(timescales.size()) < n_timescales; ++rank) {
-    int ei = idx[rank];
-    double abs_lambda = std::abs(evals[ei]);
-    double imag_part = std::abs(evals[ei].imag());
-
-    if (abs_lambda >= 1.0) {
-      continue;
-    }
-    if (imag_part > 1e-6) {
-      continue;
-    }
-    if (abs_lambda < 1e-15) {
-      continue;
-    }
-
-    double t_i =
-        -static_cast<double>(msm_lag_time_) * dt_ns_ / std::log(abs_lambda);
-    timescales.push_back(t_i);
-  }
-
-  return timescales;
+  // Fix 4: use cached eigenvalues from build_markov_model.
+  // KIN-06: ranks 1..n_timescales in the shared convention (titan_its.h); a
+  // mode with |lambda| >= 1, lambda within 1e-8 of 1 or complex lambda gives
+  // NaN at its own rank instead of being skipped (which shifted every later
+  // timescale one rank up and disagreed with the ITS scan).
+  return titan_its::implied_timescales(
+      cached_eigenvalues_, static_cast<double>(msm_lag_time_) * dt_ns_,
+      n_timescales);
 }
 
 // ============================================================================
@@ -1283,6 +1294,11 @@ void TitanMSM::export_results(
   TitanUI::log_kv(log, "MSM Kinetic Interpretation",
                   kinetics_interpretable ? "physical continuity available"
                                          : "disabled (REMD state streams)");
+  if (eigen_solved_) {
+    TitanUI::log_kv(log, "MSM Eigenvalues Within 1e-8 Of 1",
+                    std::to_string(unit_eigenvalue_count_) +
+                        (unit_eigenvalue_count_ > 1 ? " (not ergodic)" : ""));
+  }
 
   // =========================================================================
   // 2. Write TPM
@@ -1410,24 +1426,23 @@ void TitanMSM::export_results(
         TitanUI::print_info(
             "[WARNING] Eigenvalues not cached; skipping table.");
       } else {
+        // KIN-06: one row per rank 1..n_timescales; a mode without a
+        // timescale (|lambda| >= 1, lambda within 1e-8 of 1, complex) is a
+        // "nan" row at its own rank, as in the ITS scan.
         const auto &evals = cached_eigenvalues_;
-        std::vector<int> idx(n_k_);
-        std::iota(idx.begin(), idx.end(), 0);
-        std::sort(idx.begin(), idx.end(), [&](int a, int b) {
-          return std::abs(evals[a]) > std::abs(evals[b]);
-        });
-
+        const auto order = titan_its::its_order(evals);
+        const double lag_time = static_cast<double>(msm_lag_time_) * dt_ns_;
         int written = 0;
-        for (int rank = 1; rank < n_k_ && written < n_timescales; ++rank) {
-          int ei = idx[rank];
-          double abs_lambda = std::abs(evals[ei]);
-          double imag_part = std::abs(evals[ei].imag());
-          if (abs_lambda >= 1.0 || imag_part > 1e-6 || abs_lambda < 1e-15)
-            continue;
-          double t_i = -static_cast<double>(msm_lag_time_) * dt_ns_ /
-                       std::log(abs_lambda);
-          f << std::fixed << written << "  " << t_i << "  " << abs_lambda
-            << '\n';
+        for (std::size_t rank = 1;
+             rank < order.size() && written < n_timescales; ++rank) {
+          const auto lambda = evals[order[rank]];
+          const double t_i = titan_its::implied_timescale(lambda, lag_time);
+          f << std::fixed << written << "  ";
+          if (std::isfinite(t_i))
+            f << t_i;
+          else
+            f << "nan";
+          f << "  " << std::abs(lambda) << '\n';
           ++written;
         }
       }
@@ -1482,6 +1497,7 @@ void TitanMSM::export_results(
           Eigen::MatrixXd c_tmp(n_k_, n_k_);
           Eigen::MatrixXd c_sym_tmp(n_k_, n_k_);
           Eigen::MatrixXd t_tmp(n_k_, n_k_);
+          Eigen::VectorXd pi_tmp;
           Eigen::VectorXcd evals_tmp;
 
           for (int li = shard_begin; li < shard_end; ++li) {
@@ -1490,7 +1506,7 @@ void TitanMSM::export_results(
             res.lag = lag;
 
             if (!build_tpm_for_lag(discrete_traj_, boundaries, n_k_, lag, c_tmp,
-                                  c_sym_tmp, t_tmp)) {
+                                  c_sym_tmp, t_tmp, &pi_tmp)) {
               res.its_values.assign(static_cast<size_t>(std::max(0, n_timescales)),
                                     std::numeric_limits<double>::quiet_NaN());
               res.solver_mode = "invalid_counts_or_mle_failure";
@@ -1501,7 +1517,7 @@ void TitanMSM::export_results(
             std::string effective_mode;
             if (!solve_its_eigenvalues(t_tmp, its_solver_mode, n_timescales,
                                        its_topk, its_max_k_full, evals_tmp,
-                                       effective_mode)) {
+                                       effective_mode, random_seed_, &pi_tmp)) {
               res.its_values.assign(static_cast<size_t>(std::max(0, n_timescales)),
                                     std::numeric_limits<double>::quiet_NaN());
               res.solver_mode = "failed";

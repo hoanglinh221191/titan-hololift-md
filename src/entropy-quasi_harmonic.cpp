@@ -5,6 +5,7 @@
 #include "functions.h"
 #include "groups.h"
 #include "info.h"
+#include "titan_executor.h"
 #include "titan_qha_model.h"
 #include <Eigen/Dense>
 #include <Eigen/Eigenvalues>
@@ -59,7 +60,8 @@ Eigen::MatrixXd extract_frame(size_t frame_index,
   return mat;
 }
 
-double imp_cal_entropy(groups_cal &groups, const Multi_MOL &mol1,
+double imp_cal_entropy(TitanExecutor *executor, groups_cal &groups,
+                       const Multi_MOL &mol1,
                        const Multi_MOL &mol2, arguments &Arguments,
                        size_t group_index, const folders &paths,
                        size_t file_pos, const info &info_output) {
@@ -119,15 +121,10 @@ double imp_cal_entropy(groups_cal &groups, const Multi_MOL &mol1,
 
   Eigen::MatrixXd X(3 * N_filtered, M_frames);
 
-  size_t nt = std::min(std::max<size_t>(1, Arguments.nt), M_frames);
-  std::vector<std::thread> threads(nt);
-  size_t chunk_size = M_frames / nt;
-
-  for (size_t t = 0; t < nt; ++t) {
-    size_t start_frame = t * chunk_size;
-    size_t end_frame = (t == nt - 1) ? M_frames : (t + 1) * chunk_size;
-
-    threads[t] = std::thread([&, start_frame, end_frame]() {
+  // CORE-05: every frame fills its own column of X; the shared executor
+  // splits the frames (no threads created per chunk).
+  const size_t nt = std::min(std::max<size_t>(1, Arguments.nt), M_frames);
+  const auto fill_columns = [&](size_t start_frame, size_t end_frame) {
       for (size_t j = start_frame; j < end_frame; ++j) {
         Eigen::MatrixXd Q_raw = extract_frame(j, filtered_indices, mol1, mol2);
         Eigen::Vector3d Q_centroid = Q_raw.rowwise().mean();
@@ -143,12 +140,14 @@ double imp_cal_entropy(groups_cal &groups, const Multi_MOL &mol1,
           X(i * 3 + 2, j) = sqrt_m * (Q_aligned(2, i) - P(2, i));
         }
       }
-    });
-  }
-
-  for (auto &t : threads) {
-    if (t.joinable())
-      t.join();
+  };
+  if (executor == nullptr || nt <= 1) {
+    fill_columns(0, M_frames);
+  } else {
+    executor->parallel_for(M_frames, nt, 1,
+                           [&](size_t, size_t begin, size_t end) {
+                             fill_columns(begin, end);
+                           });
   }
 
   // Mean center X across columns just to be completely rigorous
@@ -190,21 +189,22 @@ double imp_cal_entropy(groups_cal &groups, const Multi_MOL &mol1,
 
 int cal_entropy(const Multi_MOL &mol1, const Multi_MOL &mol2,
                 groups_cal &groups, arguments &Arguments, const folders &paths,
-                size_t file_pos, const info &info_output) {
+                size_t file_pos, const info &info_output,
+                TitanExecutor *executor) {
   if (Arguments.entropy_quasi == true && Arguments.group_entropy_com == -1)
     groups.create_group_entropy(mol1, mol2, Arguments, "calpha");
 
-  double com_entropy = imp_cal_entropy(groups, mol1, mol2, Arguments,
+  double com_entropy = imp_cal_entropy(executor, groups, mol1, mol2, Arguments,
                                        groups.group_entropy_com_index(), paths,
                                        file_pos, info_output);
   cout << "com entropy done, entropy= " << com_entropy
        << "\n----------------------\n";
-  double rec_entropy = imp_cal_entropy(groups, mol1, mol2, Arguments,
+  double rec_entropy = imp_cal_entropy(executor, groups, mol1, mol2, Arguments,
                                        groups.group_entropy_rec_index(), paths,
                                        file_pos, info_output);
   cout << "rec entropy done, entropy= " << rec_entropy
        << "\n----------------------\n";
-  double lg_entropy = imp_cal_entropy(groups, mol1, mol2, Arguments,
+  double lg_entropy = imp_cal_entropy(executor, groups, mol1, mol2, Arguments,
                                       groups.group_entropy_lg_index(), paths,
                                       file_pos, info_output);
   cout << "lg entropy done, entropy= " << lg_entropy

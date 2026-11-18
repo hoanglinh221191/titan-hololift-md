@@ -285,30 +285,6 @@ int probe_xdr_frame(XDRFILE *xdr_handle, const std::string &xdr_type,
   return exdrOK;
 }
 
-int read_xdr_opaque_discard(XDRFILE *xdr_handle, int64_t byte_count,
-                            std::string &error) {
-  if (byte_count < 0) {
-    error = "XDR: invalid negative opaque byte count while skipping.";
-    return exdrINT;
-  }
-
-  static thread_local std::vector<char> scratch;
-  constexpr int64_t kChunkBytes = 1024LL * 1024LL;
-  scratch.resize(static_cast<size_t>(kChunkBytes));
-
-  int64_t remaining = byte_count;
-  while (remaining > 0) {
-    const int chunk =
-        static_cast<int>(std::min<int64_t>(remaining, kChunkBytes));
-    if (xdrfile_read_opaque(scratch.data(), chunk, xdr_handle) != chunk) {
-      error = "XDR: failed to read compressed XTC payload while skipping.";
-      return exdr3DX;
-    }
-    remaining -= chunk;
-  }
-  return exdrOK;
-}
-
 int skip_xtc_frame_payload_after_header(XDRFILE *xdr_handle,
                                         int expected_natoms,
                                         std::string &error) {
@@ -392,7 +368,16 @@ int skip_xtc_frame_payload_after_header(XDRFILE *xdr_handle,
     return exdr3DX;
   }
 
-  return read_xdr_opaque_discard(xdr_handle, opaque_bytes, error);
+  // CORE-03: seek over the compressed block, as the TRR path does, instead
+  // of reading it through a scratch buffer. XDR opaque data is padded to a
+  // multiple of 4 bytes.
+  const int64_t padded_bytes = (opaque_bytes + 3) & ~int64_t{3};
+  const int rc = xdr_seek(xdr_handle, padded_bytes, SEEK_CUR);
+  if (rc != exdrOK) {
+    error = "XDR: failed to seek across the compressed XTC payload (rc=" +
+            std::to_string(rc) + ", " + xdr_status_message(rc) + ")";
+  }
+  return rc;
 }
 
 int skip_trr_frame_payload_after_header(XDRFILE *xdr_handle,

@@ -1,5 +1,5 @@
 #pragma once
-#include "titan_nonbonded_topology.h"
+#include "topology/nonbonded_topology.h"
 #include "cache_sigma_epsilon.h"
 #include "MOL.h"
 #include "MOL_info.h"

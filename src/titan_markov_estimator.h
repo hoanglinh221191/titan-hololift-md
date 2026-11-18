@@ -1,5 +1,6 @@
 #pragma once
 #include <Eigen/Dense>
+#include <Eigen/Eigenvalues>
 #include <Eigen/LU>
 #include <algorithm>
 #include <cmath>
@@ -88,5 +89,45 @@ inline bool reversible_mle(const Eigen::MatrixXd &input, Eigen::MatrixXd &tpm,
   }
   error="reversible MSM maximum-likelihood iteration did not converge";
   tpm.resize(0,0);pi.resize(0);return false;
+}
+
+// KIN-09: spectrum of a transition matrix in detailed balance with pi.
+// S = D^{1/2} T D^{-1/2} (D = diag pi) is symmetric, so its eigenvalues are
+// real and its eigenvectors u orthonormal; the right eigenvectors of T are
+// D^{-1/2} u (pi-orthogonal, as PCCA+ needs), returned at unit 2-norm like
+// those of a general eigensolver. Returns false (caller falls back to the
+// general solver) when pi is not positive or detailed balance does not hold
+// to rel_tol.
+inline bool reversible_spectrum(const Eigen::MatrixXd &tpm,
+                                const Eigen::VectorXd &pi,
+                                Eigen::VectorXd &eigenvalues,
+                                Eigen::MatrixXd *right_eigenvectors,
+                                double rel_tol=1e-10) {
+  const int n=static_cast<int>(tpm.rows());
+  if(n==0 || tpm.cols()!=n || pi.size()!=n || !tpm.allFinite() ||
+     !pi.allFinite() || pi.minCoeff()<=0) return false;
+  double flux_max=0, asymmetry=0;
+  for(int i=0;i<n;++i) for(int j=0;j<n;++j) {
+    flux_max=std::max(flux_max,std::abs(pi[i]*tpm(i,j)));
+    asymmetry=std::max(asymmetry,std::abs(pi[i]*tpm(i,j)-pi[j]*tpm(j,i)));
+  }
+  if(flux_max<=0 || asymmetry>rel_tol*flux_max) return false;
+  const Eigen::VectorXd root=pi.cwiseSqrt();
+  Eigen::MatrixXd s=root.asDiagonal()*tpm*root.cwiseInverse().asDiagonal();
+  s=(0.5*(s+s.transpose())).eval();
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(
+      s, right_eigenvectors!=nullptr ? Eigen::ComputeEigenvectors
+                                     : Eigen::EigenvaluesOnly);
+  if(solver.info()!=Eigen::Success) return false;
+  eigenvalues=solver.eigenvalues();
+  if(right_eigenvectors!=nullptr) {
+    *right_eigenvectors=root.cwiseInverse().asDiagonal()*solver.eigenvectors();
+    for(int k=0;k<n;++k) {
+      const double norm=right_eigenvectors->col(k).norm();
+      if(!(norm>0)) return false;
+      right_eigenvectors->col(k)/=norm;
+    }
+  }
+  return true;
 }
 } // namespace titan_markov

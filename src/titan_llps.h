@@ -52,6 +52,7 @@ struct LLPSResult {
   bool is_percolated = false;
   double percolation_time_ns = -1.0;
   std::vector<double> pk_mean; // P(k) mean over trajectory
+  // STR-04: standard deviation of the per-frame P(k) across frames (1/N)
   std::vector<double> pk_std;
   // Residue-level contact frequency, aggregated over sticker-bead contacts.
   std::vector<std::vector<float>> contact_freq; // [n_residue][n_residue]
@@ -66,6 +67,18 @@ struct LLPSLifetimeDistributionResult {
   double median_ns{0.0};
   double p90_ns{0.0};
   double max_ns{0.0};
+  // Liquidity v3: censoring. A contact still present at the last analysed
+  // frame is right-censored (its "lifetime" is a lower bound); one present
+  // from the first to the last frame spans the whole window. Statistics over
+  // contacts whose formation AND rupture were both observed are kept apart.
+  uint64_t right_censored_events{0};
+  uint64_t full_window_events{0};
+  uint64_t uncensored_events{0};
+  double uncensored_mean_ns{0.0};
+  double uncensored_median_ns{0.0};
+  double uncensored_p90_ns{0.0};
+  double uncensored_p99_ns{0.0};
+  double window_ns{0.0};
 };
 
 struct LLPSContactDynamicsResult {
@@ -275,14 +288,23 @@ private:
 
   int n_pairs_;
   int n_words_;
-  int max_lag_frames_ = 500;
-  std::vector<std::vector<uint64_t>> adj_ring_;
-  int ring_count_ = 0;
-  int max_ring_cap_ = 0;
-  std::vector<double> ct_num_;
-  std::vector<double> ct_den_;
-  std::vector<int> ct_count_;
-  int ct_total_frames_ = 0;
+  // C(t) window (STR-03): the frames from the percolation frame on (every
+  // frame while the system has not percolated). The macro-node adjacency of
+  // each window frame is kept (n_words_ per stored frame) so that C(t) runs
+  // over every origin of the window once the persistent pattern is known;
+  // when the history would pass ct_budget_bytes_ every second stored frame is
+  // dropped and the stride doubles. pair_contact_cnt_ counts every window
+  // frame, so the pattern and its threshold use the same frames.
+  void record_ct_frame(const std::vector<uint64_t> &contacts, bool restart);
+  std::vector<uint64_t> ct_history_;
+  std::vector<uint64_t> ct_bits_buf_;
+  std::size_t ct_stored_frames_ = 0;
+  int ct_stride_ = 1;
+  int ct_window_frames_ = 0;
+  std::size_t ct_budget_bytes_ = 0;
+  bool ct_budget_warned_ = false;
+  std::size_t ct_origin_frames_ = 0;
+  double ct_dt_ns_ = 0.0;
   std::vector<int> pair_contact_cnt_;
 
   int pk_max_k_ = -1;
@@ -308,6 +330,7 @@ private:
   mutable std::vector<std::pair<int, int>> contacts_buf_;
   mutable std::vector<uint64_t> macro_contact_keys_buf_;
   mutable std::vector<int> degree_buf_;
+  mutable std::vector<int> degree_hist_buf_; // STR-04: nodes per degree, one frame
   mutable std::vector<int> gcc_macros_buf_;
   mutable std::vector<uint64_t> sticker_pair_keys_buf_;
   mutable std::vector<uint64_t> protein_chain_pair_keys_buf_;
@@ -358,6 +381,9 @@ private:
   std::unordered_map<uint64_t, ActiveContactRun> active_prna_contacts_;
   std::vector<double> sticker_contact_lifetimes_ns_;
   std::vector<double> prna_contact_lifetimes_ns_;
+  // Liquidity v3: lifetimes whose start and end were both observed.
+  std::vector<double> sticker_contact_lifetimes_uncensored_ns_;
+  std::vector<double> prna_contact_lifetimes_uncensored_ns_;
   std::vector<ContactEventRow> contact_trace_rows_;
   std::ofstream contact_trace_out_;
   bool contact_trace_streaming_{false};

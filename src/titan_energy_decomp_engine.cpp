@@ -308,11 +308,18 @@ std::string csv_field(const std::string &text) {
   return escaped;
 }
 
-void write_stats(std::ostream &out, const PairStatistics &stats) {
-  out << stats.elec_signed_mean << ',' << stats.elec_abs_mean << ','
-      << stats.elec_mean_abs << ',' << stats.vdw_signed_mean << ','
-      << stats.vdw_abs_mean << ',' << stats.vdw_mean_abs << ','
-      << stats.signed_mean << ',' << stats.abs_mean << ',' << stats.mean_abs;
+// Statistics are kept in kJ/mol; every energy written is divided by
+// kj_per_unit (exact for kJ/mol, where it is 1).
+void write_stats(std::ostream &out, const PairStatistics &stats,
+                 double kj_per_unit) {
+  out << stats.elec_signed_mean / kj_per_unit << ','
+      << stats.elec_abs_mean / kj_per_unit << ','
+      << stats.elec_mean_abs / kj_per_unit << ','
+      << stats.vdw_signed_mean / kj_per_unit << ','
+      << stats.vdw_abs_mean / kj_per_unit << ','
+      << stats.vdw_mean_abs / kj_per_unit << ','
+      << stats.signed_mean / kj_per_unit << ','
+      << stats.abs_mean / kj_per_unit << ',' << stats.mean_abs / kj_per_unit;
 }
 
 double endpoint_metric_value(const EndpointEntityStatistics &stats,
@@ -329,13 +336,16 @@ double endpoint_metric_value(const EndpointEntityStatistics &stats,
 }
 
 void write_endpoint_stats(std::ostream &out,
-                          const EndpointEntityStatistics &stats) {
-  out << stats.e_elec_mean << ',' << stats.e_vdw_mean << ','
-      << stats.e_mm_mean << ',' << stats.g_polar_gb_mean << ','
-      << stats.g_nonpolar_sasa_mean << ','
-      << stats.delta_g_no_entropy_mean << ',' << stats.abs_mean << ','
-      << stats.mean_abs << ',' << stats.pooled_frame_mean << ','
-      << stats.samples;
+                          const EndpointEntityStatistics &stats,
+                          double kj_per_unit) {
+  out << stats.e_elec_mean / kj_per_unit << ','
+      << stats.e_vdw_mean / kj_per_unit << ','
+      << stats.e_mm_mean / kj_per_unit << ','
+      << stats.g_polar_gb_mean / kj_per_unit << ','
+      << stats.g_nonpolar_sasa_mean / kj_per_unit << ','
+      << stats.delta_g_no_entropy_mean / kj_per_unit << ','
+      << stats.abs_mean / kj_per_unit << ',' << stats.mean_abs / kj_per_unit
+      << ',' << stats.pooled_frame_mean / kj_per_unit << ',' << stats.samples;
 }
 
 struct EndpointOutputLabels {
@@ -361,7 +371,7 @@ EndpointOutputLabels endpoint_output_labels(std::string_view source) {
 void write_component_matrix(const std::filesystem::path &path,
                             const DenseMatrix &matrix,
                             const EntityAxis &rows, const EntityAxis &cols,
-                            std::string_view component) {
+                            std::string_view component, double kj_per_unit) {
   std::ofstream out(path);
   out << "row_index,row_label,col_index,col_label,component,signed_mean,"
          "abs_mean,mean_abs\n";
@@ -383,14 +393,15 @@ void write_component_matrix(const std::filesystem::path &path,
       }
       out << row << ',' << csv_field(rows.entities[row].label) << ',' << col
           << ',' << csv_field(cols.entities[col].label) << ',' << component
-          << ',' << signed_mean << ',' << abs_mean << ',' << mean_abs << '\n';
+          << ',' << signed_mean / kj_per_unit << ','
+          << abs_mean / kj_per_unit << ',' << mean_abs / kj_per_unit << '\n';
     }
   }
 }
 
 void write_edges(const std::filesystem::path &path,
                  const std::vector<SparseEdge> &edges, const EntityAxis &rows,
-                 const EntityAxis &cols) {
+                 const EntityAxis &cols, double kj_per_unit) {
   std::ofstream out(path);
   out << "rank,row_index,row_label,col_index,col_label,elec_signed_mean,"
          "elec_abs_mean,elec_mean_abs,vdw_signed_mean,vdw_abs_mean,"
@@ -401,7 +412,7 @@ void write_edges(const std::filesystem::path &path,
     out << rank + 1 << ',' << edge.row << ','
         << csv_field(rows.entities[edge.row].label) << ',' << edge.col << ','
         << csv_field(cols.entities[edge.col].label) << ',';
-    write_stats(out, edge.stats);
+    write_stats(out, edge.stats, kj_per_unit);
     out << '\n';
   }
 }
@@ -417,7 +428,7 @@ void write_combined_rankings(const std::filesystem::path &path,
                              const EntityAxis &mol1_axis,
                              const std::vector<EntityRanking> &mol2_rankings,
                              const EntityAxis &mol2_axis,
-                             const EngineConfig &config) {
+                             const EngineConfig &config, double kj_per_unit) {
   std::vector<RankingRow> rows;
   rows.reserve(mol1_rankings.size() + mol2_rankings.size());
   for (const auto &ranking : mol1_rankings)
@@ -448,14 +459,15 @@ void write_combined_rankings(const std::filesystem::path &path,
         << ','
         << csv_field(row.axis->entities[row.ranking.entity_index].label)
         << ',';
-    write_stats(out, row.ranking.stats);
+    write_stats(out, row.ranking.stats, kj_per_unit);
     out << '\n';
   }
 }
 
 void write_endpoint_map(const std::filesystem::path &path,
                         const std::vector<EndpointEntityResultRow> &rows,
-                        const EndpointOutputLabels &labels) {
+                        const EndpointOutputLabels &labels,
+                        double kj_per_unit) {
   std::ofstream out(path);
   out << "molecule_role,entity_index,entity_label,E_elec,E_vdw,E_MM,"
       << labels.polar << ',' << labels.nonpolar
@@ -464,7 +476,7 @@ void write_endpoint_map(const std::filesystem::path &path,
   for (const auto &row : rows) {
     out << row.molecule_role << ',' << row.entity_index << ','
         << csv_field(row.metadata.label) << ',';
-    write_endpoint_stats(out, row.stats);
+    write_endpoint_stats(out, row.stats, kj_per_unit);
     out << '\n';
   }
 }
@@ -472,7 +484,7 @@ void write_endpoint_map(const std::filesystem::path &path,
 void write_endpoint_ranking(
     const std::filesystem::path &path,
     const std::vector<EndpointEntityResultRow> &rows,
-    const EndpointOutputLabels &labels) {
+    const EndpointOutputLabels &labels, double kj_per_unit) {
   std::ofstream out(path);
   out << "rank,molecule_role,entity_index,entity_label,E_elec,E_vdw,E_MM,"
       << labels.polar << ',' << labels.nonpolar
@@ -482,7 +494,7 @@ void write_endpoint_ranking(
     const auto &row = rows[rank];
     out << rank + 1 << ',' << row.molecule_role << ',' << row.entity_index
         << ',' << csv_field(row.metadata.label) << ',';
-    write_endpoint_stats(out, row.stats);
+    write_endpoint_stats(out, row.stats, kj_per_unit);
     out << '\n';
   }
 }
@@ -693,26 +705,48 @@ void EnergyDecompositionEngine::process_frame(const FrameEnergySource &source,
         }
       });
 
+  // ENE-17(c) (22/10/2026): the atom -> residue aggregation ran serially over
+  // all N1 x N2 pairs. Tasks now own whole mol2 residues (residue rows and
+  // mol2 atom sums) and then column ranges (mol1 atom sums); every sum still
+  // adds rows in ascending order and columns in ascending order, so the
+  // results are the same bit for bit.
   const std::size_t mol1_residue_count = mol1_axes_.residues.entities.size();
-  for (std::size_t row = 0; row < mol2_atom_count; ++row) {
-    const std::size_t row_residue =
-        mol2_axes_.residues.atom_to_entity[row];
-    for (std::size_t col = 0; col < mol1_atom_count; ++col) {
-      const std::size_t atom_pair = row * mol1_atom_count + col;
-      const std::size_t col_residue =
-          mol1_axes_.residues.atom_to_entity[col];
-      const std::size_t residue_pair =
-          row_residue * mol1_residue_count + col_residue;
-      const double elec = scratch.atom_elec[atom_pair];
-      const double vdw = scratch.atom_vdw[atom_pair];
-      scratch.residue_elec[residue_pair] += elec;
-      scratch.residue_vdw[residue_pair] += vdw;
-      scratch.mol1_atom_elec[col] += elec;
-      scratch.mol1_atom_vdw[col] += vdw;
-      scratch.mol2_atom_elec[row] += elec;
-      scratch.mol2_atom_vdw[row] += vdw;
-    }
-  }
+  const std::size_t mol2_residue_count = mol2_axes_.residues.entities.size();
+  std::vector<std::vector<std::size_t>> rows_of_residue(mol2_residue_count);
+  for (std::size_t row = 0; row < mol2_atom_count; ++row)
+    rows_of_residue[mol2_axes_.residues.atom_to_entity[row]].push_back(row);
+  executor.parallel_for(
+      mol2_residue_count, executor.capacity(), 1,
+      [&](std::size_t, std::size_t residue_begin, std::size_t residue_end) {
+        for (std::size_t row_residue = residue_begin; row_residue < residue_end;
+             ++row_residue) {
+          for (const std::size_t row : rows_of_residue[row_residue]) {
+            for (std::size_t col = 0; col < mol1_atom_count; ++col) {
+              const std::size_t atom_pair = row * mol1_atom_count + col;
+              const std::size_t residue_pair =
+                  row_residue * mol1_residue_count +
+                  mol1_axes_.residues.atom_to_entity[col];
+              const double elec = scratch.atom_elec[atom_pair];
+              const double vdw = scratch.atom_vdw[atom_pair];
+              scratch.residue_elec[residue_pair] += elec;
+              scratch.residue_vdw[residue_pair] += vdw;
+              scratch.mol2_atom_elec[row] += elec;
+              scratch.mol2_atom_vdw[row] += vdw;
+            }
+          }
+        }
+      });
+  executor.parallel_for(
+      mol1_atom_count, executor.capacity(), 64,
+      [&](std::size_t, std::size_t col_begin, std::size_t col_end) {
+        for (std::size_t row = 0; row < mol2_atom_count; ++row) {
+          const std::size_t offset = row * mol1_atom_count;
+          for (std::size_t col = col_begin; col < col_end; ++col) {
+            scratch.mol1_atom_elec[col] += scratch.atom_elec[offset + col];
+            scratch.mol1_atom_vdw[col] += scratch.atom_vdw[offset + col];
+          }
+        }
+      });
   for (std::size_t row = 0; row < mol2_axes_.residues.entities.size(); ++row) {
     for (std::size_t col = 0; col < mol1_residue_count; ++col) {
       const std::size_t pair = row * mol1_residue_count + col;
@@ -900,12 +934,14 @@ std::string with_suffix(std::string_view stem, std::string_view suffix,
 void export_named_result(const ResultCore &result,
                          const std::filesystem::path &base_dir,
                          std::string_view suffix,
-                         const EngineConfig &config) {
+                         const EngineConfig &config, const OutputUnit &unit) {
+  const double kj = unit.kj_per_unit;
   std::filesystem::create_directories(base_dir);
   std::ofstream summary(
       base_dir / with_suffix("edecomp_summary", suffix, ".dat"));
   summary << "MM energy decomposition summary\n"
           << "frames: " << result.frames << '\n'
+          << "energy_unit: " << unit.name << '\n'
           << "abs_mean = abs(signed_mean)\n"
           << "mean_abs = mean(abs(frame_energy))\n"
           << "dense residue matrices retain every residue pair\n"
@@ -924,72 +960,75 @@ void export_named_result(const ResultCore &result,
       base_dir /
           with_suffix("edecomp_mm_residue_matrix_elec", suffix, ".csv"),
       result.residues, result.mol2_axes.residues, result.mol1_axes.residues,
-      "elec");
+      "elec", kj);
   write_component_matrix(
       base_dir / with_suffix("edecomp_mm_residue_matrix_vdw", suffix, ".csv"),
       result.residues, result.mol2_axes.residues, result.mol1_axes.residues,
-      "vdw");
+      "vdw", kj);
   write_component_matrix(
       base_dir /
           with_suffix("edecomp_mm_residue_matrix_total", suffix, ".csv"),
       result.residues, result.mol2_axes.residues, result.mol1_axes.residues,
-      "total");
+      "total", kj);
   write_edges(base_dir / with_suffix("edecomp_mm_residue_edges", suffix,
                                      ".csv"),
               result.residue_edges, result.mol2_axes.residues,
-              result.mol1_axes.residues);
+              result.mol1_axes.residues, kj);
   write_edges(base_dir / with_suffix("edecomp_mm_atom_edges", suffix, ".csv"),
-              result.atom_edges, result.mol2_axes.atoms, result.mol1_axes.atoms);
+              result.atom_edges, result.mol2_axes.atoms, result.mol1_axes.atoms,
+              kj);
   write_combined_rankings(
       base_dir /
           with_suffix("edecomp_mm_residue_ranking", suffix, ".csv"),
       result.mol1_residue_rankings, result.mol1_axes.residues,
-      result.mol2_residue_rankings, result.mol2_axes.residues, config);
+      result.mol2_residue_rankings, result.mol2_axes.residues, config, kj);
   write_combined_rankings(
       base_dir / with_suffix("edecomp_mm_atom_ranking", suffix, ".csv"),
               result.mol1_atom_rankings, result.mol1_axes.atoms,
-              result.mol2_atom_rankings, result.mol2_axes.atoms, config);
+              result.mol2_atom_rankings, result.mol2_axes.atoms, config, kj);
 }
 
 } // namespace
 
 void export_result(const ResultCore &result,
                    const std::filesystem::path &base_dir,
-                   std::string_view suffix) {
-  export_named_result(result, base_dir, suffix, {});
+                   std::string_view suffix, const OutputUnit &unit) {
+  export_named_result(result, base_dir, suffix, {}, unit);
 }
 
 void export_all_results(const AllTrajectoryResult &result,
                         const std::filesystem::path &base_dir,
-                        std::string_view suffix) {
-  export_named_result(result.trajectory_equal, base_dir, suffix, {});
-  export_named_result(result.pooled_frames, base_dir, "_pooled_frames", {});
+                        std::string_view suffix, const OutputUnit &unit) {
+  export_named_result(result.trajectory_equal, base_dir, suffix, {}, unit);
+  export_named_result(result.pooled_frames, base_dir, "_pooled_frames", {},
+                      unit);
 }
 
 void export_endpoint_result(const EndpointEntityResult &result,
                             const std::filesystem::path &base_dir,
                             std::string_view source,
-                            std::string_view suffix) {
+                            std::string_view suffix, const OutputUnit &unit) {
+  const double kj = unit.kj_per_unit;
   std::filesystem::create_directories(base_dir);
   const std::string source_text(source);
   const EndpointOutputLabels labels = endpoint_output_labels(source);
   write_endpoint_map(
       base_dir / with_suffix("edecomp_" + source_text + "_residue_map", suffix,
                              ".csv"),
-      result.residue_map, labels);
+      result.residue_map, labels, kj);
   write_endpoint_ranking(
       base_dir /
           with_suffix("edecomp_" + source_text + "_residue_ranking", suffix,
                       ".csv"),
-      result.residue_ranking, labels);
+      result.residue_ranking, labels, kj);
   write_endpoint_map(
       base_dir / with_suffix("edecomp_" + source_text + "_atom_map", suffix,
                              ".csv"),
-      result.atom_map, labels);
+      result.atom_map, labels, kj);
   write_endpoint_ranking(
       base_dir / with_suffix("edecomp_" + source_text + "_atom_ranking", suffix,
                              ".csv"),
-      result.atom_ranking, labels);
+      result.atom_ranking, labels, kj);
 
   std::ofstream summary(base_dir / with_suffix("edecomp_summary", suffix,
                                                ".dat"),
@@ -998,6 +1037,7 @@ void export_endpoint_result(const EndpointEntityResult &result,
           << "source: " << source_text << '\n'
           << "frames: " << result.frames << '\n'
           << "trajectories: " << result.trajectories << '\n'
+          << "energy_unit: " << unit.name << '\n'
           << "map_semantics: " << labels.semantics_note << '\n';
 }
 
@@ -1005,9 +1045,11 @@ void export_endpoint_all_results(const EndpointEntityResult &trajectory_equal,
                                  const EndpointEntityResult &pooled_frames,
                                  const std::filesystem::path &base_dir,
                                  std::string_view source,
-                                 std::string_view suffix) {
-  export_endpoint_result(trajectory_equal, base_dir, source, suffix);
-  export_endpoint_result(pooled_frames, base_dir, source, "_pooled_frames");
+                                 std::string_view suffix,
+                                 const OutputUnit &unit) {
+  export_endpoint_result(trajectory_equal, base_dir, source, suffix, unit);
+  export_endpoint_result(pooled_frames, base_dir, source, "_pooled_frames",
+                         unit);
 }
 
 } // namespace titan_energy_decomp

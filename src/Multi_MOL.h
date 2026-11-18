@@ -9,7 +9,7 @@
 #include "c6c12.h"
 #include "index_v2.h"
 #include "info.h"
-#include "mol_topology.h"
+#include "topology/mol_topology.h"
 #include <cstdint>
 #include <expected>
 #include <fstream>
@@ -31,8 +31,15 @@ struct topo_info_temp;
 struct cache_sigma_epsilon;
 class TitanExecutor;
 class groups_cal;
+namespace pbctopo_solve {
+class PbctopoSolveRun;
+}
 
 class Multi_MOL {
+  // The PBCTOPO solver (src/pbctopo/solve/) records per-frame status and falls
+  // back to the image-envelope reconstruction of this class.
+  friend class pbctopo_solve::PbctopoSolveRun;
+
 private:
   vector<unsigned char> pbctopo_frame_certified_;
   vector<string> pbctopo_frame_status_;
@@ -72,7 +79,11 @@ private:
   int process_atom_from_topo(fstream &input_topo_protein, string &protein_1,
                              string &lig_name, int &i,
                              vector<topo_info_temp> &info_topo);
-  int post_process_atom_from_topo(vector<topo_info_temp> &info_topo);
+  // stop_on_name_mismatch: return 2 when more than 5% of the positional
+  // atom names differ (false for MARTINI, whose parameters are assigned
+  // afterwards by parse_martini_topology from its own reader).
+  int post_process_atom_from_topo(vector<topo_info_temp> &info_topo,
+                                  bool stop_on_name_mismatch = true);
   int helper_check_side_chain(const arguments &Arguments, size_t begin,
                               size_t end);
 
@@ -85,12 +96,6 @@ private:
                                  std::string_view force_f, para &parameters,
                                  fstream &input_topo_protein, string &lig_name);
 
-  int impl_cal_distribution_distance_charged_atoms(
-      vector<vector<double>> &distances,
-      vector<vector<double>> &distances_negative_charges,
-      vector<vector<double>> &distances_positive_charges, size_t begin,
-      size_t end);
-  int find_water(vector<size_t> &list_atoms, vector<size_t> &list_heavy_atoms);
 
   int helper_parse_pdb(arguments &Arguments, box &Box_temp, bool &flag_set_time,
                        double &time_of_snap_temp, string_view input_pdb,
@@ -228,7 +233,8 @@ public:
   int solve_pbc_int(size_t init, size_t nt);
   int solve_pbc_new(Multi_MOL &mol2, arguments &Arguments,
                     const amino_acid &amine);
-  int solv_pbc_pbcn(Multi_MOL &mol2, arguments &Arguments);
+  int solv_pbc_pbcn(Multi_MOL &mol2, arguments &Arguments,
+                    TitanExecutor *executor = nullptr);
   int solve_pbc_pbctopo(Multi_MOL &mol2, arguments &Arguments,
                         TitanExecutor *executor = nullptr,
                         size_t frame_report_offset = 0);
@@ -267,30 +273,18 @@ public:
 
   int check_side_chain(const arguments &Arguments);
   int set_chainnum();
-  int com_dis_2mol(Multi_MOL &rhs, arguments &Arguments,
-                   const ::info &info_output, fstream &output_dis);
+  // The heavy atoms of water residues (list_atoms) and of every other residue
+  // but ions (list_heavy_atoms); hydrogens are left out by atom type.
+  int find_water(vector<size_t> &list_atoms, vector<size_t> &list_heavy_atoms);
   int solve_pbc_cluster(arguments &Arguments, ::info &output_info);
   int init_chains_connect(arguments &Arguments, const amino_acid &amine,
                           map<size_t, size_t> &chains_connect);
   int solv_pbc_ref(arguments &Arguments, const amino_acid &amine,
                    map<size_t, size_t> &chains_connect, size_t ind,
                    size_t ref_ind);
-  int impl_com_dis_2mol(Multi_MOL &rhs, const arguments &Arguments,
-                        const ::info &info_output, fstream &output_dis,
-                        size_t i);
-  int cal_dipole_moment(const ::info &info_output, const arguments &Arguments,
-                        std::string_view prefix_name);
-  int impl_cal_dipole_moment(const arguments &Arguments, vector<force> &dipoles,
-                             size_t begin, size_t end);
-  int cal_distribution_distance_charged_atoms(const arguments &Arguments,
-                                              const ::info &output_info);
-  int cal_angle_dipole_water_elecField(const arguments &Arguments,
-                                       ::info &output_info);
   bool check_and_pop_size_2last_snaps(size_t &I, std::string_view name = " ");
 
   [[nodiscard]] double total_charge() const;
-  int cal_dis_res_2_com(const arguments &Arguments, fstream &output);
-  int cal_volumes(vector<double> &vol_out) const;
   int gen_pop(MOL &mol_seed, de_arg &DE_arguments, const vector<mol_info> &info,
               string_view mol_type, vector<force> &tran_data);
 };

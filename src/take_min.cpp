@@ -71,24 +71,3 @@ size_t min_v(d_min& dmin_t)
 	}
 	return pos;
 }
-int find_d_rescom_com(vector<com>& cen_cas, Multi_MOL& lig, d_min &dmin, size_t begin, size_t end, 
-	size_t begin2, size_t end2, string force_f, int flag, double d_standard)
-{
-	
-	for (size_t I{ begin }; I < end; ++I)
-	{
-		double com_lig[3]{}, mass{};
-		for (size_t i{};i < lig.m_mol[begin2].size();++i)
-		{
-			com_lig[0] += lig.m_mol[begin2].pos.x[i]*lig.parameters[i].get_mass();
-			com_lig[1] += lig.m_mol[begin2].pos.y[i]*lig.parameters[i].get_mass();
-			com_lig[2] += lig.m_mol[begin2].pos.z[i]*lig.parameters[i].get_mass();
-			mass += lig.parameters[i].get_mass();
-		}
-		com_lig[0] /= mass; com_lig[1] /= mass; com_lig[2] /= mass;
-		dmin.base.emplace_back(sqrt(square(cen_cas[I].get_x() - com_lig[0]) + square(cen_cas[I].get_y() - com_lig[1]) + square(cen_cas[I].get_z() - com_lig[2])),
-			lig.info[0].get_chain(), cen_cas[I].get_chain(), 0u, cen_cas[I].get_res_num(), 0u, cen_cas[I].get_atom_num(), 
-			cen_cas[I].get_res_name(), lig.info[0].get_res_name(),cen_cas[I].get_chainid(),lig.info[0].get_chainnum(),cen_cas[I].get_respos());
-	}
-	return 0;
-}

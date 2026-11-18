@@ -65,6 +65,10 @@ private:
     std::size_t resnr{0};
     std::size_t head_atom{0};
     std::vector<std::vector<std::size_t>> tails;
+    // Accumulator keys per tail and bond, built once (MDB-18):
+    // "<resname>,tail<t>,bond<b>" and "tail<t>:bond<b>".
+    std::vector<std::vector<std::string>> order_keys;
+    std::vector<std::vector<std::string>> proximity_keys;
   };
 
   struct ThicknessCell {
@@ -181,10 +185,21 @@ private:
                                std::span<const std::uint8_t> near_lipids = {});
   void update_flipflop(const std::vector<int> &leaflets, std::size_t frame,
                        double time_ps);
-  void compute_interdigitation(const MOL &frame,
+  void compute_interdigitation(const MOL &frame, const box &active_box,
                                const std::array<double, 3> &normal,
                                const std::vector<int> &leaflets,
                                double &overlap, double &penetration) const;
+  // Head beads re-imaged around the bilayer centre, so that a bilayer that
+  // straddles the box along its normal is one slab before the normal, the
+  // leaflets and the heights are computed (STR-22). The centre is the
+  // periodic (circular) mean of the tail beads of the frame: the tails fill
+  // the hydrophobic core and no water layer, so the mean cannot fall into the
+  // water even when the bilayer is thicker than half the box, which the head
+  // beads alone cannot tell apart; lipids without tails fall back to heads.
+  void reimage_heads(const MOL &frame, const box &active_box);
+  // Height of head bead i above the membrane centre along the normal.
+  [[nodiscard]] double signed_height(std::size_t lipid,
+                                     const std::array<double, 3> &normal) const;
   void update_thickness_map(const MOL &frame, const box &active_box,
                             const std::array<double, 3> &normal,
                             const std::vector<int> &leaflets,
@@ -256,6 +271,11 @@ private:
 
   mutable std::array<double, 3> previous_normal_{0.0, 0.0, 1.0};
   mutable bool have_previous_normal_{false};
+  std::array<double, 3> membrane_center_{0.0, 0.0, 0.0};
+  int stacking_axis_{2}; // lattice direction the bilayer is stacked along
+  AlignedDoubleVector core_x_;
+  AlignedDoubleVector core_y_;
+  AlignedDoubleVector core_z_;
   AlignedDoubleVector head_x_;
   AlignedDoubleVector head_y_;
   AlignedDoubleVector head_z_;

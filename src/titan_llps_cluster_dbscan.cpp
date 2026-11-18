@@ -40,8 +40,16 @@ std::vector<LLPSNode> TitanLLPSCluster::extract_nodes(
         {mol.pos.x.size(), mol.pos.y.size(), mol.pos.z.size(), info.size()});
     for (std::size_t i = 0; i < n; ++i) {
       const std::string &atom = info[i].get_atom();
-      if (atom == "BB" || atom == "CA" || atom == "BB1" || atom == "BB2" ||
-          atom == "BB3" || atom == "P") {
+      // Liquidity v3: "P" is a nucleic-acid backbone name only. In the
+      // Martini phosphoserine used here the side-chain phosphate bead of
+      // SER176/180/184/188 is also called "P"; accepting it for the protein
+      // made every phos chain carry 4 side-chain beads as extra "backbone"
+      // nodes (423 vs 419), i.e. a different unit definition for WT and phos.
+      const bool protein_backbone = (mol_type == 1) && (atom == "BB" || atom == "CA");
+      const bool nucleic_backbone =
+          (mol_type != 1) && (atom == "BB" || atom == "BB1" || atom == "BB2" ||
+                              atom == "BB3" || atom == "P");
+      if (protein_backbone || nucleic_backbone) {
         nodes.push_back({nid++, mol_type,
                          static_cast<int>(info[i].get_chainnum()), mol.pos.x[i],
                          mol.pos.y[i], mol.pos.z[i], 0, false});
@@ -65,6 +73,24 @@ void TitanLLPSCluster::run_dbscan(TitanExecutor &executor,
     throw std::invalid_argument("DBSCAN coordinates must be finite");
   const TitanExactPeriodicBox bmat(Box);
   const double bx=bmat.heights[0],by=bmat.heights[1],bz=bmat.heights[2];
+  // Liquidity v3 (performance only): for an orthorhombic cell the nearest
+  // image is exactly the per-axis rounding, so skip the general lattice
+  // solver, which made this O(pairs) loop cost ~2.4 s per frame for 1.1e4
+  // nodes. Triclinic cells still use the exact solver.
+  const bool ortho_cell =
+      std::abs(bmat.m[1][0]) <= 1e-9 * bmat.m[0][0] &&
+      std::abs(bmat.m[2][0]) <= 1e-9 * bmat.m[0][0] &&
+      std::abs(bmat.m[2][1]) <= 1e-9 * bmat.m[1][1];
+  const double lx_o = bmat.m[0][0], ly_o = bmat.m[1][1], lz_o = bmat.m[2][2];
+  const auto fast_mic = [&](double &dx, double &dy, double &dz) {
+    if (ortho_cell) {
+      dx -= lx_o * std::nearbyint(dx / lx_o);
+      dy -= ly_o * std::nearbyint(dy / ly_o);
+      dz -= lz_o * std::nearbyint(dz / lz_o);
+    } else {
+      bmat.apply_mic(dx, dy, dz);
+    }
+  };
   // Larger candidate cells are conservative. Bound the dense grid independently
   // of a nearly empty but very large simulation cell.
   const int limit=std::clamp(int(std::ceil(std::cbrt(double(nodes.size())*8))),1,256);
@@ -139,7 +165,7 @@ void TitanLLPSCluster::run_dbscan(TitanExecutor &executor,
                     nodes[static_cast<std::size_t>(j)].y;
         double dz = nodes[static_cast<std::size_t>(node_index)].z -
                     nodes[static_cast<std::size_t>(j)].z;
-        bmat.apply_mic(dx, dy, dz);
+        fast_mic(dx, dy, dz);
         if (dx * dx + dy * dy + dz * dz <= eps_sq_)
           fn(j);
       }

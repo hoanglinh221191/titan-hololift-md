@@ -79,8 +79,14 @@ void AnalyzerImpl::finalize(std::fstream &log) {
   std::ofstream summary("pbe_summary.dat", std::ios::out | std::ios::trunc);
   if (summary.is_open()) {
     const double variance =
-        frames_total_ > 1 ? energy_m2_ / static_cast<double>(frames_total_ - 1)
-                          : 0.0;
+        energy_frames_ > 1
+            ? energy_m2_ / static_cast<double>(energy_frames_ - 1)
+            : 0.0;
+    // No frame with an energy (every BIE solve failed): report none, not 0.
+    if (energy_frames_ == 0) {
+      energy_mean_ = energy_min_ = energy_max_ =
+          std::numeric_limits<double>::quiet_NaN();
+    }
     const double energy_kcal_mean = energy_mean_ / kKcalToKJ;
     const double energy_kcal_std = std::sqrt(variance) / kKcalToKJ;
     summary << "# TITAN PBE v1 summary\n";
@@ -275,6 +281,7 @@ void AnalyzerImpl::finalize(std::fstream &log) {
     summary << "mg_pre " << args_.mg_pre << "\n";
     summary << "mg_post " << args_.mg_post << "\n";
     summary << "mg_coarse_iter " << args_.mg_coarse_iter << "\n";
+    summary << "mg_accel " << args_.mg_accel << "\n";
     summary << "nl_max_iter " << args_.nl_max_iter << "\n";
     summary << "nl_inner_iter " << args_.nl_inner_iter << "\n";
     summary << "nl_stagnation " << args_.nl_stagnation << "\n";
@@ -303,6 +310,7 @@ void AnalyzerImpl::finalize(std::fstream &log) {
     summary << "frames_total " << frames_total_ << "\n";
     summary << "frames_converged " << frames_converged_ << "\n";
     summary << "frames_failed " << frames_failed_ << "\n";
+    summary << "energy_frames " << energy_frames_ << "\n";
     summary << "energy_kJmol_mean " << format_fixed(energy_mean_) << "\n";
     summary << "energy_kJmol_std " << format_fixed(std::sqrt(variance)) << "\n";
     summary << "energy_kJmol_min " << format_fixed(energy_min_) << "\n";
@@ -687,5 +695,19 @@ void AnalyzerImpl::finalize(std::fstream &log) {
   }
 }
 
+// A BIE frame that did not succeed (status other than ok: a refused operator,
+// GMRES out of iterations, a non-finite energy, a Born fallback) used to leave
+// the run exiting 0, so a driver that read only the energy column took the
+// frame as a result. The grid backend keeps its existing behaviour.
+std::string AnalyzerImpl::failure_summary() const {
+  if (args_.backend != "tabi" || frames_failed_ == 0)
+    return {};
+  return "PBE (BIE): " + std::to_string(frames_failed_) + " of " +
+         std::to_string(frames_total_) +
+         " frame(s) did not succeed (status other than ok in pbe_energy.csv; "
+         "convergence_reason in pbe_tabi_profile.csv). Their reaction "
+         "energies are written as NaN. The other outputs were written, but "
+         "the run did not succeed.";
+}
 
 } // namespace TitanPBE

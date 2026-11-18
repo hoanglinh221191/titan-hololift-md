@@ -200,6 +200,13 @@ private:
   AlignedDoubleVector o_x_, o_y_, o_z_;
   AlignedDoubleVector kappa_deg_;
 
+  // Chain breaks of the current frame as in mkdssp: residues i and i + 1 are
+  // linked when both are in the same chain and |C(i) - N(i + 1)| <= 2.5 A.
+  // break_prefix_[k] = number of breaks between residues m and m + 1, m < k,
+  // so no break lies between a and b > a iff the two entries are equal.
+  std::vector<std::uint32_t> break_prefix_;
+  bool reported_gap_{false};
+
   std::vector<std::uint8_t> has_n_;
   std::vector<std::uint8_t> has_h_;
   std::vector<std::uint8_t> has_ca_;

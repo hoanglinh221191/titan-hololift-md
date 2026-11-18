@@ -1165,6 +1165,10 @@ struct FrameResult {
   std::string tabi_surface_generator{"off"};
   std::string tabi_discretization{"off"};
   std::string tabi_node_patch_representation{"n/a"};
+  std::string tabi_node_patch_normal_source{"n/a"};
+  std::string tabi_node_patch_certificate{"n/a"};
+  std::string tabi_receptor_node_patch_certificate{"n/a"};
+  std::string tabi_ligand_node_patch_certificate{"n/a"};
   double tabi_rhs_scale{1.0};
   double tabi_dielectric_contrast{0.0};
   double tabi_operator_contrast{0.0};

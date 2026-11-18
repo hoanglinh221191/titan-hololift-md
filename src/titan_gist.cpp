@@ -2,6 +2,7 @@
 // Grid Inhomogeneous Solvation Theory — density, enthalpy, entropy maps
 // Overhaul: merged solute arrays, AVX2 E_sw kernel, jthread parallelism
 #include "titan_gist.h"
+#include "titan_executor.h"
 #include "titan_thread_compat.h"
 #include "titan_ui.h"
 
@@ -493,7 +494,8 @@ void TitanGIST::process_frame(const MOL &pro, const MOL &lig, const MOL &water,
                               const std::vector<mol_info> &pro_info,
                               const Eigen::MatrixXd &ref_ca_centered,
                               const Eigen::Matrix3d &R, bool /*is_frame_zero*/,
-                              bool tica_available) {
+                              bool tica_available,
+                              TitanExecutor *executor) {
   if (grid_.empty())
     return;
 
@@ -710,9 +712,9 @@ void TitanGIST::process_frame(const MOL &pro, const MOL &lig, const MOL &water,
                                          H2[0], H2[1], H2[2]);
     }
   } else {
-    // Multi-threaded path: each thread accumulates into a sparse local buffer.
-    std::vector<titan::jthread> threads;
-    threads.reserve(nt_);
+    // Multi-threaded path: each partition accumulates into a sparse local
+    // buffer. CORE-05: the partitions run on the shared executor (no threads
+    // created per frame); the reduction below keeps the partition order.
     std::vector<LocalGistAccum> local_accums(nt_);
 
     std::vector<std::exception_ptr> worker_errors(nt_);
@@ -753,16 +755,15 @@ void TitanGIST::process_frame(const MOL &pro, const MOL &lig, const MOL &water,
       } catch (...) { worker_errors[tid]=std::current_exception(); }
     };
 
-    for (size_t t = 0; t < nt_; ++t) {
-      threads.emplace_back(worker, t);
-    }
-
-    // jthread auto-joins at destruction, but we must wait here before reducing
-    // thread-local grids.
-    for (auto &th : threads) {
-      if (th.joinable()) {
-        th.join();
-      }
+    if (executor == nullptr) {
+      for (size_t t = 0; t < nt_; ++t)
+        worker(t);
+    } else {
+      executor->parallel_for(nt_, nt_, 1,
+                             [&](size_t, size_t begin, size_t end) {
+                               for (size_t t = begin; t < end; ++t)
+                                 worker(t);
+                             });
     }
 
     for(const auto& error:worker_errors)if(error)std::rethrow_exception(error);

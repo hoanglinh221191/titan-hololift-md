@@ -250,7 +250,8 @@ int find_h_bonds(MOL &pro_in, MOL &pro_in_ref, MOL &lig, MOL &lig_ref,
                  h_groups &groups_1, h_groups &groups_2,
                  const arguments &Arguments, size_t num_snap,
                  vector<mol_info> &info_rec, vector<mol_info> &info_lg,
-                 vector<vector<size_t>> &Hbonds_vector);
+                 vector<vector<size_t>> &Hbonds_vector,
+                 TitanExecutor *executor = nullptr);
 int init_hbond_output_files(const arguments &Arguments);
 int finalize_hbond_output_files();
 int add_atom_to_MOL(Multi_MOL &MOL_source, Multi_MOL &protein_des,
@@ -278,7 +279,8 @@ void take_coordinate(Multi_MOL &pro_in, Multi_MOL &lig, Multi_MOL &water_traj,
 void reduce_h_form(matrix &A, int I, int K, size_t nt);
 int cal_entropy(const Multi_MOL &mol1, const Multi_MOL &mol2,
                 groups_cal &groups, arguments &Arguments, const folders &paths,
-                size_t file_pos, const info &info_output);
+                size_t file_pos, const info &info_output,
+                TitanExecutor *executor = nullptr);
 double non_gaussian_entropy(matrix &matrix_in, int k_neighbor, int II);
 double non_gaussian_entropy_2nd(matrix &matrix_in, int k_neighbor, int II,
                                 int JJ);
@@ -287,14 +289,14 @@ int impl_entropy_duan_zhang(folders &paths, vector<vector<double>> &E_e_vector,
                             vector<vector<double>> &E_v_vector,
                             vector<double> &time_of_snap, arguments &Arguments,
                             vector<double> &E_e, vector<double> &E_v);
-int find_d_rescom_com(vector<com> &cen_cas, Multi_MOL &lig, d_min &dmin,
-                      size_t begin, size_t end, size_t begin2, size_t end2,
-                      string force_f, int flag, double d_standard);
+// -cscd. num_snap indexes the loaded chunk, frame counts the trajectory's
+// analysed frames. Each returns 1 after printing an error.
 int impl_cscd(Multi_MOL &pro_in, Multi_MOL &lig, const arguments &Arguments,
-              fstream &log, TitanExecutor &executor, size_t num_snap,
-              int sc_flag, int input_name, vector<string> &list_output_name,
-              all_cscd &out_dis, const folders &paths,
-              vector<fstream> &out_files);
+              TitanExecutor &executor, size_t threads, size_t num_snap,
+              size_t frame, int sc_flag, all_cscd &out_dis);
+int end_cscd_trajectory(const arguments &Arguments, all_cscd &out_dis,
+                        const folders &paths, int input_name);
+int print_cscd(const arguments &Arguments, all_cscd &out_dis, fstream &log);
 int impl_add_coms_2_mols(Multi_MOL &mol1, Multi_MOL &mol2, arguments &Arguments,
                          size_t snap_index);
 int wrap_cal_force_map(TitanExecutor &executor, Multi_MOL &mol1,
@@ -304,7 +306,6 @@ int wrap_cal_force_map(TitanExecutor &executor, Multi_MOL &mol1,
                        vector<energy_res> &Energy_res_mol1,
                        vector<energy_res> &Energy_res_mol2, info &info_output);
 istream &safeGetline(istream &is, string &t);
-int post_proc_cscd(vector<string> &list_input_name);
 bool check_end_cal(arguments &Arguments, vector<string> &input_line,
                    int &input_name);
 int print_force_res(vector<energy_res> &Energy_res, string name, folders &paths,
@@ -314,8 +315,6 @@ int find_maxforce_res(vector<energy_res> &Energy_res, string name,
                       vector<energy_res> &Energy_res_out);
 int stat_maxforce_res(vector<energy_res> &Force_res_stat, string name,
                       const info &infos, arguments &Arguments);
-int print_cscd(arguments &Arguments, all_cscd &out_dis,
-               vector<string> &list_file_name);
 int stat_hbonds(vector<vector<size_t>> &Hbonds_vector, const info &infos,
                 arguments &Arguments, vector<double> &time_of_snaps,
                 vector<string> &list_name);
@@ -331,7 +330,7 @@ int add_hb_res(MOL &pro_in, MOL &lig, vector<mol_info> &info_rec,
 int stat_hb_res(vector<traj_hb> &hb_reslist, string output_filename);
 int set_chainnum(Multi_MOL &pro_in, Multi_MOL &lig, arguments const &Arguments);
 int process_time_of_infiles(Multi_MOL &pro_in, arguments &Arguments,
-                            info &info_output, vector<double> &time_of_snap);
+                            info &info_output);
 int process_adding_energies_forces(
     arguments &Arguments, int input_name, vector<double> &E_v,
     vector<double> &E_e, double &E_E_, double &E_V_, force &f_e_, force &f_v_,
@@ -350,12 +349,6 @@ int Energy_force_subgroups(groups_cal &groups, const Multi_MOL &rec,
                            vector<energy_groups> &Energy_groups_out,
                            size_t num_snap, size_t MAX_NUM,
                            arguments &Arguments, TitanExecutor &executor);
-int impl_nocal(Multi_MOL &pro_in, Multi_MOL &lig, fstream &log,
-               arguments &Arguments, info &info_output, TitanExecutor &executor,
-               amino_acid &amine, para &parameter, folders &paths,
-               vector<string> &input_line, h_groups &groups_1,
-               h_groups &groups_2, vector<vector<size_t>> &Hbonds_vector,
-               int &input_name, vector<vector<double>> &Volumes);
 int process_moleculetype(fstream &input_topo_protein, string &lig_name,
                          string &protein_1);
 int process_atomtypes(fstream &input_topo_protein, string &protein_1,

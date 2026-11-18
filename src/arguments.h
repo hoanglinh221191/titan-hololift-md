@@ -1,6 +1,7 @@
 #ifndef ARGUMENTS_H
 #define ARGUMENTS_H
 #include <cmath>
+#include <initializer_list>
 #include <limits>
 #include <string>
 #include <vector>
@@ -37,6 +38,8 @@ struct PbcArgs {
   double pbctopo_temporal_penalty{2.0};
   bool pbctopo_evidence_export{false};
   double pbctopo_vdw_clash_scale{0.55};
+  // report (default) or filter; see RuntimeCutoffs::steric_filter.
+  string pbctopo_steric{"report"};
   double pbctopo_bond_cutoff{0.0};
   bool pbctopo_bond_cutoff_set{false};
   double pbctopo_clash_cutoff{0.0};
@@ -177,6 +180,8 @@ struct PbeArgs {
   int mg_pre{2};
   int mg_post{2};
   int mg_coarse_iter{200};
+  // GRID-03: CG preconditioned by the Galerkin V-cycle, or plain V-cycles
+  std::string mg_accel{"cg"};
   int nl_max_iter{80};
   int nl_inner_iter{40};
   int nl_stagnation{8};
@@ -188,7 +193,9 @@ struct PbeArgs {
   std::string nl_continuation{"auto"};
   std::string nl_line_search{"auto"};
   double nl_residual{1.0e-5};
-  std::string nl_solver{"picard"};
+  // GRID-04: auto = damped Newton. The DelPhi NWT parity path stays tied to an
+  // explicit -pbe-nl-solver=newton.
+  std::string nl_solver{"auto"};
   std::string nl_inner{"auto"};
   std::string nl_multigrid{"off"};
   std::string nwt_kernel{"auto"};
@@ -218,7 +225,9 @@ struct PbeArgs {
   std::string pbsa_residue_frames{"off"};
   std::string pbsa_ie_block{"auto"};
   int pbsa_ie_min_samples{10};
-  double pbsa_ie_filter_sigma{2.0};
+  // KIN-24 (23/10/2026): 3 sigma, the cutoff of Sun et al., J. Chem. Phys.
+  // 146, 124124 (2017); it was 2.0. 0 gives the untruncated estimator.
+  double pbsa_ie_filter_sigma{3.0};
   std::string pbsa_perf{"summary"};
   std::string pbsa_grid_reuse{"auto"};
   int pbsa_sasa_points{96};
@@ -240,6 +249,10 @@ struct PbeArgs {
   double tabi_ses_grid_spacing{0.75};
   std::size_t tabi_ses_max_grid_vertices{4000000};
   std::string tabi_sphere_mesh{"auto"};
+  // Sphere-patch vdW surfaces clip each atom's triangles at its neighbours'
+  // caps; off keeps whole triangles whose centroid or all three corners are
+  // exposed, the rule before the clipping (titan-bie-pb-v0.5).
+  bool tabi_sphere_patch_clip{true};
   int tabi_tree_leaf_size{32};
   // Budget for the curved node-patch pair cache.  256 MiB holds the dense
   // all-pairs table up to about 2896 nodes; past that a bounded sparse
@@ -248,6 +261,14 @@ struct PbeArgs {
   bool tabi_tree_leaf_size_explicit{false};
   double tabi_tree_opening_theta{0.45};
   bool tabi_tree_opening_theta_explicit{false};
+  double tabi_energy_far_eta{32.0};
+  double tabi_ses_remesh_edge{0.0};
+  int tabi_ses_remesh_iterations{6};
+  double tabi_ses_charge_refine{0.0};
+  double tabi_ses_charge_refine_min_edge{0.2};
+  double tabi_ses_charge_refine_min_charge{0.1};
+  int tabi_curved_sample_order{2};
+  double tabi_curved_near_zone_radii{8.0};
   int tabi_taylor_order{3};
   std::string tabi_derivatives{"analytic"};
   std::string tabi_formulation{"jcp2013"};
@@ -340,6 +361,9 @@ struct PbeArgs {
   std::string tabi_fmm_local_geometry_guard{"off"};
   double tabi_fmm_local_geometry_theta{0.0};
   bool tabi_fmm_local_ilu_cap_sweep{false};
+  // Diagnostic only: lets gmres-p4 run without the strict geometry guard or
+  // with a guard theta other than 0.5, to measure what the guard buys.
+  bool tabi_fmm_local_geometry_sweep{false};
   std::string tabi_interaction_mode{"auto"};
   std::string tabi_node_bounds{"moment"};
   std::string tabi_tree_builder{"grouped-morton"};
@@ -468,6 +492,12 @@ struct DeArgs {
   double path_graph_edge_cutoff{4.0};
   double path_recovery_enter_radius{4.0};
   double path_recovery_exit_radius{3.0};
+  // PATH-01: -de-pathway-radius is shorthand for the three values above;
+  // explicit options win whatever their order on the command line.
+  bool path_radius_alias{false};
+  bool path_edge_cutoff_explicit{false};
+  bool path_recovery_enter_explicit{false};
+  bool path_recovery_exit_explicit{false};
   double path_recovery_max_turn_angle{60.0};
   double path_corridor_spacing{0.5};
   size_t path_corridor_radial_samples{16};
@@ -503,10 +533,23 @@ struct LlpsArgs {
   float llps_voxel_size{0.5f};
   bool llps_dynamics{false};
   bool llps_dynamics_detailed{false};
-  double llps_lineage_overlap{0.30};
+  double llps_lineage_overlap{0.50}; // lineage containment share (STR-09)
   float llps_prna_rcut{0.0f};
   double llps_msd_fit_start_ns{-1.0};
   double llps_msd_fit_end_ns{-1.0};
+  // --- Liquidity v2: dense-phase transport / FRAP-comparable exchange. ---
+  // Backbone beads per RNA membership+MSD segment. Martini 2.1 nucleic acids
+  // contribute 3 backbone beads (BB1,BB2,BB3) per nucleotide, so 150 beads is
+  // a 50-nucleotide segment. 0 disables segmentation (legacy whole-molecule).
+  int llps_rna_segment_beads{150};
+  // Subtract the cumulative translation of the dense phase before computing
+  // single-chain MSD inside the dense phase.
+  bool llps_msd_drift_correct{true};
+  // Displacement threshold (nm) for the FRAP-comparable mobile fraction.
+  double llps_mobile_displacement_nm{2.0};
+  // Lag (ns) at which the displacement mobile fraction is reported.
+  // Negative means auto = 0.25 x analysed window.
+  double llps_mobile_lag_ns{-1.0};
   std::string llps_density{"auto"};
   std::string llps_phase_geometry{"none"};
   bool llps_dbscan{true};
@@ -557,7 +600,7 @@ struct AwhArgs {
   std::string output_prefix{};
 };
 struct DhamArgs {
-  std::string segment_map_file{};  // audited segment/exchange input; counts audit only
+  std::string segment_map_file{};  // audited segment/exchange input (TRAM samples and transitions)
   bool flag_dham{false};
   std::string temps_file{};         // file with replica temperatures (K)
   std::string ener_list_file{};     // file listing paths to .xvg energy files
@@ -678,6 +721,9 @@ struct MsdArgs {
   std::string pbc{"auto"};
   bool rot{false};
   std::string rot_fit_window{"auto"};
+  // STR-13: MB of frame storage before the run stops; auto = half the free
+  // RAM at start, at least 1024 MB
+  std::string memory_limit{"auto"};
 };
 
 struct MembraneArgs {
@@ -967,6 +1013,90 @@ private:
                         std::vector<std::string> &tokens);
   bool parsing_arg_file_tokens{false};
 
+  // --- arguments::parse_arguments() internals (src/cli/parse_*.cpp) ---
+  // What one option family did with argv[i]: not one of its options (the
+  // next family is tried), consumed (next token), or parsing stops with
+  // `code` as the return value of parse_arguments().
+  struct OptionStep {
+    enum Kind { not_matched, consumed, stop } kind = not_matched;
+    int code = 0;
+  };
+  static OptionStep option_consumed() { return {OptionStep::consumed, 0}; }
+  static OptionStep option_exit(int code) { return {OptionStep::stop, code}; }
+  OptionStep parse_options_general(int argc, char **argv, int &i,
+                                   const std::string &arg,
+                                   std::string &common_value);
+  OptionStep parse_options_pbe(int argc, char **argv, int &i,
+                               const std::string &arg,
+                               std::string &common_value);
+  OptionStep parse_options_bie(int argc, char **argv, int &i,
+                               const std::string &arg,
+                               std::string &common_value);
+  OptionStep parse_options_pbe_solver(int argc, char **argv, int &i,
+                                      const std::string &arg,
+                                      std::string &common_value);
+  OptionStep parse_options_analysis(int argc, char **argv, int &i,
+                                    const std::string &arg,
+                                    std::string &common_value);
+  OptionStep parse_options_llps_topology(int argc, char **argv, int &i,
+                                         const std::string &arg,
+                                         std::string &common_value);
+  OptionStep parse_options_inputs(int argc, char **argv, int &i,
+                                  const std::string &arg,
+                                  std::string &common_value);
+  OptionStep parse_options_kinetics(int argc, char **argv, int &i,
+                                    const std::string &arg,
+                                    std::string &common_value);
+  // former local lambdas of parse_arguments()
+  std::string normalize_mol_type(std::string value);
+  bool assign_mol_type(const std::string &value, bool mol1);
+  void parse_allostery_prune_window(std::string raw_mode);
+  void parse_allostery_knn_prior(std::string raw_mode);
+  void parse_corr_knn_prune_window(std::string raw_mode);
+  void parse_corr_knn_pair_prior(std::string raw_mode);
+  void parse_validation_int_list(const std::string &raw_list,
+                                 std::vector<int> &out_values,
+                                 const char *flag_name);
+  void enable_validation();
+  void parse_allostery_estimator(std::string raw_mode);
+  void parse_msm_its_solver(std::string raw_mode);
+  void parse_pca_solver(std::string raw_mode);
+  void parse_sq_auto_or_value(const std::string &raw_value, double &out,
+                              bool &auto_flag, const char *label);
+  void parse_hbk_domain(std::string raw_mode);
+  bool parse_bool_equals(std::string raw_value, const char *flag_name);
+  bool consume_option_value(const std::string &arg,
+                            std::initializer_list<const char *> flags,
+                            std::string &value_out, int &arg_index);
+  bool consume_required_option_value(const std::string &arg,
+                                     std::initializer_list<const char *> flags,
+                                     std::string &value_out, int &arg_index);
+  bool consume_bool_option(const std::string &arg,
+                           std::initializer_list<const char *> flags,
+                           bool &value_out, int &arg_index);
+  void parse_path_probe_lengths(const std::string &raw_list);
+  bool consume_compound_option_value(const std::string &arg,
+                                     std::initializer_list<const char *> flags,
+                                     std::string &value_out, int &arg_index);
+  std::string lowercase_copy(std::string value);
+  std::string require_choice(std::string value,
+                             std::initializer_list<const char *> choices,
+                             const char *flag_name);
+  double parse_double_range(const std::string &value, const char *flag_name,
+                            double min_value, double max_value);
+  double parse_numeric_option(const std::string &value, const char *flag_name);
+  int parse_integer_option(const std::string &value, const char *flag_name);
+  std::string normalize_pbe_cli_alias(std::string arg);
+  void apply_tabi_tree_preset(const std::string &preset);
+  void parse_pbe_test_center(std::string value);
+  void parse_pbe_focus_center(std::string value);
+  void parse_memory_budget(std::string value);
+  void parse_sg_memory_budget(std::string value);
+  void parse_sg_cutoff(std::string value);
+  // tokens of the parse_arguments() call in progress
+  int cli_argc_ = 0;
+  char **cli_argv_ = nullptr;
+
 public:
   // Domain sub-structs
   PbcArgs pbc;
@@ -1075,6 +1205,10 @@ public:
   std::string gbsa_ie_block{"auto"};
   int gbsa_ie_min_samples{10};
   double gbsa_ie_filter_sigma{0.0};
+  // KIN-22: -entropy (Duan-Zhang) sample trimming in units of the sample
+  // standard deviation; 0 = no trimming (the exponential average needs the
+  // tail that a 2-sigma cut removes).
+  double entropy_filter_sigma{0.0};
   std::string network_mode{"auto"};
   double network_sparse_cut{30.0};
   int network_sparse_k{24};
@@ -1196,11 +1330,21 @@ public:
   int parse_arg_file();
   bool check_topo(string NameofTopoFile, int Topo);
   int help_print();
+  // Short VIBE reference: the options a reconstruction needs and the labels
+  // of the frame report (-vibe-help).
+  static void vibe_help_print();
+  // Short HoloLift reference: one run from a trajectory to HoloLift
+  // coordinates, the output files and how to read them (-hololift-help).
+  static void hololift_help_print();
   void set_number_of_files(size_t num) { number_of_files = num; }
   void setPdbname(string name) { pdb_name = name; }
   string get_pdbOutput() const;
   int recheck_and_change_pdb_input();
   string get_input_file_type() const { return input_file_type; }
+  // A frame time (ps, as read) in the -tu output unit.
+  double output_time(double time_ps) const {
+    return tu == "ns" ? time_ps / 1000.0 : time_ps;
+  }
   int add_input_file_type() {
     if (pdb_name.length() <= 4 ||
         pdb_name.substr(pdb_name.length() - 4) != get_input_file_type()) {

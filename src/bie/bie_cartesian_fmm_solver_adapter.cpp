@@ -387,6 +387,13 @@ CartesianFullFmmSolverOperator::CartesianFullFmmSolverOperator(
   packed_direct_enabled_ =
       options_.near_integration == "analytic_singular" &&
       options_.quad_buffer == "off" &&
+      // Spherical triangle self/one-ring coefficients include curvature,
+      // which the centroid packed kernel cannot represent; such panels take
+      // the geometry-aware scalar kernel.
+      std::none_of(panels.begin(), panels.end(),
+                   [](const auto &p) {
+                     return static_cast<bool>(p.sphere_patch_quadrature);
+                   }) &&
       packed_fallback::packed_jcp_fallback_avx2_available();
 #if defined(TITAN_CARTESIAN_FMM_TESTING)
   if (options_.force_scalar_direct_for_testing)

@@ -1682,6 +1682,131 @@ reconstruct_selected_coordinates(
   return reconstructed;
 }
 
+// The transitions of one DP layer, grouped by the candidates' per-component
+// image differences.  phase1_transition_cost without the component audit
+// reads the two candidates only through these differences, as exact integers
+// (checked_image_delta), so pairs with equal differences have bit-identical
+// transitions, and each group is computed once.  A pair whose inputs fail one
+// of the function's checks is left to its own evaluation, which reports the
+// same error.
+class Phase1LayerTransitionMemo {
+public:
+  static constexpr std::uint32_t kDirect =
+      std::numeric_limits<std::uint32_t>::max();
+
+  void build(const HoloLiftObservationStore &store,
+             const Phase1TransitionContext &context,
+             std::span<const Phase1CandidateState> previous,
+             std::span<const Phase1CandidateState> current) {
+    previous_count_ = previous.size();
+    current_count_ = current.size();
+    const std::size_t components = context.base_component_delta.size();
+    key_length_ = 3 * components;
+    pair_slot_.assign(previous_count_ * current_count_, kDirect);
+    keys_.clear();
+    representatives_.clear();
+    results.clear();
+    std::size_t table_size = 16;
+    while (table_size < 2 * pair_slot_.size())
+      table_size *= 2;
+    table_.assign(table_size, kDirect);
+    key_.resize(key_length_);
+    if (!context.previous || !context.current ||
+        context.component_weights.size() != components || components == 0)
+      return;
+    for (std::size_t q = 0; q < current_count_; ++q) {
+      const std::size_t current_index = current[q].candidate_index;
+      if (current_index >= store.candidates().size())
+        continue;
+      const auto current_images =
+          transported_candidate_images(*context.current, current_index);
+      if (current_images.size() != components)
+        continue;
+      for (std::size_t p = 0; p < previous_count_; ++p) {
+        const std::size_t previous_index = previous[p].candidate_index;
+        if (previous_index >= store.candidates().size())
+          continue;
+        const auto previous_images =
+            transported_candidate_images(*context.previous, previous_index);
+        if (previous_images.size() != components)
+          continue;
+        bool exact = true;
+        for (std::size_t c = 0; c < components && exact; ++c) {
+          exact = exact_image_delta(current_images[c].x, previous_images[c].x,
+                                    key_[3 * c]) &&
+                  exact_image_delta(current_images[c].y, previous_images[c].y,
+                                    key_[3 * c + 1]) &&
+                  exact_image_delta(current_images[c].z, previous_images[c].z,
+                                    key_[3 * c + 2]);
+        }
+        if (!exact)
+          continue;
+        pair_slot_[p * current_count_ + q] = find_or_insert(p, q);
+      }
+    }
+  }
+
+  [[nodiscard]] std::uint32_t slot(std::size_t previous_state,
+                                   std::size_t current_state) const noexcept {
+    return pair_slot_[previous_state * current_count_ + current_state];
+  }
+  [[nodiscard]] std::size_t distinct() const noexcept {
+    return representatives_.size();
+  }
+  [[nodiscard]] std::pair<std::size_t, std::size_t>
+  representative(std::size_t slot) const noexcept {
+    return representatives_[slot];
+  }
+
+  std::vector<std::expected<Phase1Transition, std::string>> results;
+
+private:
+  // checked_image_delta's checks; the difference as an integer.
+  static bool exact_image_delta(std::int64_t current, std::int64_t previous,
+                                std::int64_t &delta) noexcept {
+    constexpr auto minimum = std::numeric_limits<std::int64_t>::min();
+    constexpr auto maximum = std::numeric_limits<std::int64_t>::max();
+    if ((previous > 0 && current < minimum + previous) ||
+        (previous < 0 && current > maximum + previous))
+      return false;
+    delta = current - previous;
+    constexpr std::int64_t maximum_exact_integer = 9007199254740991LL;
+    return delta >= -maximum_exact_integer && delta <= maximum_exact_integer;
+  }
+
+  std::uint32_t find_or_insert(std::size_t p, std::size_t q) {
+    std::uint64_t hash = 0x9E3779B97F4A7C15ull;
+    for (const std::int64_t value : key_) {
+      hash ^= static_cast<std::uint64_t>(value) + 0x9E3779B97F4A7C15ull +
+              (hash << 6) + (hash >> 2);
+    }
+    const std::size_t mask = table_.size() - 1;
+    for (std::size_t position = hash & mask;; position = (position + 1) & mask) {
+      const std::uint32_t entry = table_[position];
+      if (entry == kDirect) {
+        const auto slot = static_cast<std::uint32_t>(representatives_.size());
+        table_[position] = slot;
+        keys_.insert(keys_.end(), key_.begin(), key_.end());
+        representatives_.push_back({p, q});
+        return slot;
+      }
+      if (std::equal(key_.begin(), key_.end(),
+                     keys_.begin() + static_cast<std::ptrdiff_t>(
+                                         entry * key_length_)))
+        return entry;
+    }
+  }
+
+  std::size_t previous_count_ = 0;
+  std::size_t current_count_ = 0;
+  std::size_t key_length_ = 0;
+  std::vector<std::uint32_t> pair_slot_;
+  std::vector<std::uint32_t> table_;
+  std::vector<std::int64_t> keys_;
+  std::vector<std::int64_t> key_;
+  std::vector<std::pair<std::size_t, std::size_t>> representatives_;
+};
+
 std::expected<HoloLiftPhase1Segment, std::string> solve_phase1_segment(
     const HoloLiftObservationStore &store,
     std::span<const HoloLiftPhase1PreparedFrame> prepared_frames,
@@ -1718,6 +1843,7 @@ std::expected<HoloLiftPhase1Segment, std::string> solve_phase1_segment(
       std::min(config.dp_worker_count, hardware_worker_limit);
   std::unique_ptr<Phase1DpExecutor> dp_executor;
   bool dp_pool_creation_disabled = false;
+  Phase1LayerTransitionMemo transition_memo;
 
   for (std::size_t frame_index = frame_begin; frame_index < frame_end;
        ++frame_index) {
@@ -1782,6 +1908,17 @@ std::expected<HoloLiftPhase1Segment, std::string> solve_phase1_segment(
         store, epoch, *previous_layer, *current_layer, config);
     if (!transition_context)
       return std::unexpected(transition_context.error());
+    transition_memo.build(store, *transition_context, *previous_states,
+                          *current_states);
+    transition_memo.results.resize(transition_memo.distinct());
+    const auto compute_distinct_transition = [&](std::size_t slot) {
+      const auto [previous_state, current_state] =
+          transition_memo.representative(slot);
+      transition_memo.results[slot] = phase1_transition_cost(
+          store, *transition_context,
+          (*previous_states)[previous_state].candidate_index,
+          (*current_states)[current_state].candidate_index, config, false);
+    };
     std::vector<std::array<Phase1PathSlot, 2>> current_paths(
         current_states->size());
     const auto evaluate_current_state = [&](std::size_t current_state)
@@ -1792,9 +1929,17 @@ std::expected<HoloLiftPhase1Segment, std::string> solve_phase1_segment(
            previous_state < previous_states->size(); ++previous_state) {
         const std::size_t previous_candidate_index =
             (*previous_states)[previous_state].candidate_index;
-        const auto transition = phase1_transition_cost(
-            store, *transition_context, previous_candidate_index,
-            current_candidate_index, config, false);
+        const std::uint32_t memo_slot =
+            transition_memo.slot(previous_state, current_state);
+        std::expected<Phase1Transition, std::string> direct_transition;
+        if (memo_slot == Phase1LayerTransitionMemo::kDirect) {
+          direct_transition = phase1_transition_cost(
+              store, *transition_context, previous_candidate_index,
+              current_candidate_index, config, false);
+        }
+        const auto &transition = memo_slot == Phase1LayerTransitionMemo::kDirect
+                                     ? direct_transition
+                                     : transition_memo.results[memo_slot];
         if (!transition)
           return transition.error();
         for (std::size_t previous_slot = 0; previous_slot < 2;
@@ -1839,13 +1984,34 @@ std::expected<HoloLiftPhase1Segment, std::string> solve_phase1_segment(
         dp_pool_creation_disabled = true;
       }
     }
+    const auto executor_failure =
+        [](const Phase1DpExecutor::Failure &failure) -> std::string {
+      const char *failure_prefix =
+          failure.kind == Phase1DpExecutor::Failure::Kind::Setup
+              ? "Phase 1 DP executor setup failed: "
+              : "Phase 1 DP worker task failed: ";
+      try {
+        std::rethrow_exception(failure.exception);
+      } catch (const std::exception &error) {
+        return std::string(failure_prefix) + error.what();
+      } catch (...) {
+        return std::string(failure_prefix) + "non-standard exception";
+      }
+    };
     if (!parallel_layer || !dp_executor) {
       ++dp_serial_layers;
+      for (std::size_t slot = 0; slot < transition_memo.distinct(); ++slot)
+        compute_distinct_transition(slot);
       for (std::size_t current_state = 0;
            current_state < current_states->size(); ++current_state) {
         state_errors[current_state] = evaluate_current_state(current_state);
       }
     } else {
+      const auto distinct_execution = dp_executor->run(
+          std::min(dp_executor->capacity(), transition_memo.distinct()),
+          transition_memo.distinct(), compute_distinct_transition);
+      if (!distinct_execution)
+        return std::unexpected(executor_failure(distinct_execution.error()));
       const std::size_t active_workers = std::min(
           dp_executor->capacity(), current_states->size());
       const auto execution = dp_executor->run(
@@ -1854,20 +2020,8 @@ std::expected<HoloLiftPhase1Segment, std::string> solve_phase1_segment(
             state_errors[current_state] =
                 evaluate_current_state(current_state);
           });
-      if (!execution) {
-        const char *failure_prefix =
-            execution.error().kind == Phase1DpExecutor::Failure::Kind::Setup
-                ? "Phase 1 DP executor setup failed: "
-                : "Phase 1 DP worker task failed: ";
-        try {
-          std::rethrow_exception(execution.error().exception);
-        } catch (const std::exception &error) {
-          return std::unexpected(std::string(failure_prefix) + error.what());
-        } catch (...) {
-          return std::unexpected(std::string(failure_prefix) +
-                                 "non-standard exception");
-        }
-      }
+      if (!execution)
+        return std::unexpected(executor_failure(execution.error()));
       ++dp_parallel_layers;
       dp_max_active_workers =
           std::max(dp_max_active_workers, active_workers);

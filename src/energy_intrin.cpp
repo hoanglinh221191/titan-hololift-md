@@ -1,5 +1,6 @@
 #include "titan_topology_energy.h"
 #include "gromos_nonbonded.h"
+#include "titan_lj_pair_override.h"
 #include "cache_sigma_epsilon.h"
 #include "charmm_nonbonded.h"
 #include "force.h"
@@ -7,6 +8,8 @@
 #include "martini_nonbonded.h"
 #include "miscellaneous.h"
 #include "titan_energy_validation.h"
+#include "titan_avx2_math.h"
+#include "energy/cutoff_blocks.h"
 #include "titan_electrostatics.h"
 #include "titan_simd_dispatch.h"
 #include "uti_func.h"
@@ -93,8 +96,13 @@ int cal_energy_amber_intrin(const MOL &rec, const MOL &lg,
   const double epsilon_in = Arguments.epsilon_in;
   const bool write_cache = !CachedData.elec_ener.empty();
   const bool has_cutoff = Arguments.distance_energy_cutoff > 0.;
+  const titan_cutoff::CutoffBlocks cutoff_blocks(
+      rec, (rec.size() / 4) * 4, Arguments.distance_energy_cutoff); // ENE-03
   const bool check_self = Arguments.self_int;
   const bool check_interchain = Arguments.flag_interchain_energy;
+  const bool has_overrides = !is_charmm && CachedData.has_charmm_pair_overrides();
+  const __m256d avx_all_lanes = _mm256_castsi256_pd(_mm256_set1_epi64x(-1));
+  const __m256d avx_cutoff = _mm256_set1_pd(Arguments.distance_energy_cutoff);
 
   for (size_t j{begin}; j < end; ++j) {
     const double pos_x{lg.pos.x[j]}, pos_y{lg.pos.y[j]}, pos_z{lg.pos.z[j]};
@@ -112,6 +120,12 @@ int cal_energy_amber_intrin(const MOL &rec, const MOL &lg,
     const __m256d v_pos_z = _mm256_set1_pd(pos_z);
 
     for (size_t i = 0; i < size_vector_rec * 4; i += 4) {
+      if (const size_t culled = cutoff_blocks.skip(i, pos_x, pos_y, pos_z);
+          culled > 0) {
+        titan_cutoff::CutoffBlocks::zero_cache(CachedData, rec_size * j + i, culled);
+        i += culled - 4;
+        continue;
+      }
       const __m256d v_x = _mm256_loadu_pd(&rec.pos.x[i]);
       const __m256d v_y = _mm256_loadu_pd(&rec.pos.y[i]);
       const __m256d v_z = _mm256_loadu_pd(&rec.pos.z[i]);
@@ -158,27 +172,38 @@ int cal_energy_amber_intrin(const MOL &rec, const MOL &lg,
         _mm256_storeu_pd(mixed_epsilon_arr, mixed_epsilon_vec);
         titan_simd_dispatch::lj_mixed_sigma_epsilon_distance_fourlanes(
             sigma_self_arr, mixed_epsilon_arr, d_arr, vdw_temp_d);
+        if (has_overrides)
+          titan_lj::override_lj_lanes(CachedData, rec_parameters,
+                                      lg_parameters, i, 4, j, d_arr,
+                                      vdw_temp_d);
         vdw_temp3 = _mm256_loadu_pd(vdw_temp_d);
       }
 
-      _mm256_storeu_pd(d_arr, avx_array_d_rec);
-      _mm256_storeu_pd(sigma_self_arr, sigma_self_vec);
-      for (int k = 0; k < 4; ++k) {
-        bool keep = true;
-        if (has_cutoff && d_arr[k] > Arguments.distance_energy_cutoff)
-          keep = false;
-        if (keep && check_self) {
-          if (i + static_cast<size_t>(k) == j ||
-              d_arr[k] < sigma_self_arr[k]) {
+      __m256d final_mask = avx_all_lanes;
+      if (check_self) {
+        _mm256_storeu_pd(d_arr, avx_array_d_rec);
+        _mm256_storeu_pd(sigma_self_arr, sigma_self_vec);
+        for (int k = 0; k < 4; ++k) {
+          bool keep = true;
+          if (has_cutoff && d_arr[k] > Arguments.distance_energy_cutoff)
             keep = false;
-          } else if (check_interchain) {
-            keep = info_lg[j].get_chain() != info_rec[i + k].get_chain();
+          if (keep) {
+            if (i + static_cast<size_t>(k) == j ||
+                d_arr[k] < sigma_self_arr[k]) {
+              keep = false;
+            } else if (check_interchain) {
+              keep = info_lg[j].get_chain() != info_rec[i + k].get_chain();
+            }
           }
+          lane_mask_vals[k] = keep ? -1.0 : 0.0;
         }
-        lane_mask_vals[k] = keep ? -1.0 : 0.0;
+        final_mask = load_lane_mask_pd(lane_mask_vals);
+      } else if (has_cutoff) {
+        // ENE-04 (22/10/2026): the cutoff mask as one compare instead of a
+        // store, a scalar lane loop and a reload; "not greater" keeps NaN
+        // lanes exactly as the scalar test did.
+        final_mask = _mm256_cmp_pd(avx_array_d_rec, avx_cutoff, _CMP_NGT_UQ);
       }
-
-      const __m256d final_mask = load_lane_mask_pd(lane_mask_vals);
       avx_elec_result = _mm256_and_pd(avx_elec_result, final_mask);
       vdw_temp3 = _mm256_and_pd(vdw_temp3, final_mask);
 
@@ -229,6 +254,9 @@ int cal_energy_amber_intrin(const MOL &rec, const MOL &lg,
                          rec_parameters.epsilon[i]) *
                     (square(c_6) - c_6);
         }
+        if (has_overrides)
+          titan_lj::override_lj_energy(CachedData, rec_parameters,
+                                       lg_parameters, i, j, d, vdw_val);
 
         if (check_self &&
             ((sigma_self > 0.0 && d < sigma_self) ||
@@ -328,13 +356,16 @@ int cal_energy_amber_screening_intrin(
       titan_energy_validation::kMinimumPairDistanceNm;
   const double epsilon_in{Arguments.epsilon_in};
   const double lambda_debye{
-      titan_electrostatics::debye_length_nm(Arguments.salt_concentration)};
+      titan_electrostatics::debye_length_nm(Arguments.salt_concentration, Arguments.gbsa_temperature)};
   const bool is_charmm =
       Arguments.force_f.find("CHARMM") != std::string::npos;
   const bool write_cache = !CachedData.elec_ener.empty();
   const bool has_cutoff = Arguments.distance_energy_cutoff > 0.;
+  const titan_cutoff::CutoffBlocks cutoff_blocks(
+      rec, (rec.size() / 4) * 4, Arguments.distance_energy_cutoff); // ENE-03
   const bool check_self = Arguments.self_int;
   const bool check_interchain = Arguments.flag_interchain_energy;
+  const bool has_overrides = !is_charmm && CachedData.has_charmm_pair_overrides();
 
   const __m256d avx_epsilon_in = _mm256_set1_pd(epsilon_in);
   const __m256d avx_neg_inv_lambda = _mm256_set1_pd(-1.0 / lambda_debye);
@@ -360,6 +391,12 @@ int cal_energy_amber_screening_intrin(
     const __m256d v_scale = _mm256_set1_pd(0.01);
 
     for (size_t i = 0; i < size_vector_rec * 4; i += 4) {
+      if (const size_t culled = cutoff_blocks.skip(i, pos_x, pos_y, pos_z);
+          culled > 0) {
+        titan_cutoff::CutoffBlocks::zero_cache(CachedData, rec_size * j + i, culled);
+        i += culled - 4;
+        continue;
+      }
       const __m256d v_x = _mm256_loadu_pd(&rec.pos.x[i]);
       const __m256d v_y = _mm256_loadu_pd(&rec.pos.y[i]);
       const __m256d v_z = _mm256_loadu_pd(&rec.pos.z[i]);
@@ -382,7 +419,8 @@ int cal_energy_amber_screening_intrin(
       const __m256d avx_inv_d = _mm256_div_pd(avx_one, avx_safe_d);
 
       const __m256d avx_exp_arg = _mm256_mul_pd(avx_safe_d, avx_neg_inv_lambda);
-      const __m256d avx_exp_val = f_exp_avx(avx_exp_arg);
+      // ENE-14 (22/10/2026): exp_pd (3e-16) instead of f_exp_avx (3.2e-6).
+      const __m256d avx_exp_val = titan_avx2::exp_pd(avx_exp_arg);
 
       const __m256d avx_array_charge_rec =
           _mm256_loadu_pd(&rec_parameters.charge[i]);
@@ -416,6 +454,10 @@ int cal_energy_amber_screening_intrin(
         _mm256_storeu_pd(mixed_epsilon_arr, mixed_epsilon_vec);
         titan_simd_dispatch::lj_mixed_sigma_epsilon_distance_fourlanes(
             sigma_self_arr, mixed_epsilon_arr, safe_d_arr, vdw_temp_d);
+        if (has_overrides)
+          titan_lj::override_lj_lanes(CachedData, rec_parameters,
+                                      lg_parameters, i, 4, j, safe_d_arr,
+                                      vdw_temp_d);
         vdw_temp3 = _mm256_loadu_pd(vdw_temp_d);
       }
 
@@ -485,6 +527,9 @@ int cal_energy_amber_screening_intrin(
                        rec_parameters[i].get_epsilon()) *
                   (square(c_6) - c_6);
         }
+        if (has_overrides)
+          titan_lj::override_lj_energy(CachedData, rec_parameters,
+                                       lg_parameters, i, j, d, v_val);
         if (check_self &&
             ((sigma_self > 0.0 && d < sigma_self) ||
              (check_interchain &&
@@ -529,6 +574,8 @@ int cal_energy_gromos_intrin(const MOL &rec, const MOL &lg,
   const __m256d avx_one = _mm256_set1_pd(1.0);
   const bool write_cache = !CachedData.elec_ener.empty();
   const bool has_cutoff = Arguments.distance_energy_cutoff > 0.;
+  const titan_cutoff::CutoffBlocks cutoff_blocks(
+      rec, (rec.size() / 4) * 4, Arguments.distance_energy_cutoff); // ENE-03
   const bool check_self = Arguments.self_int;
   const bool check_interchain = Arguments.flag_interchain_energy;
 
@@ -551,6 +598,12 @@ int cal_energy_gromos_intrin(const MOL &rec, const MOL &lg,
     const __m256d v_scale = _mm256_set1_pd(0.01);
 
     for (size_t i = 0; i < size_vector_rec * 4; i += 4) {
+      if (const size_t culled = cutoff_blocks.skip(i, pos_x, pos_y, pos_z);
+          culled > 0) {
+        titan_cutoff::CutoffBlocks::zero_cache(CachedData, rec_size * j + i, culled);
+        i += culled - 4;
+        continue;
+      }
       const __m256d v_x = _mm256_loadu_pd(&rec.pos.x[i]);
       const __m256d v_y = _mm256_loadu_pd(&rec.pos.y[i]);
       const __m256d v_z = _mm256_loadu_pd(&rec.pos.z[i]);
@@ -689,8 +742,11 @@ void cal_energy_opls_intrin(const MOL &rec, const MOL &lg,
   const __m256d avx_one = _mm256_set1_pd(1.0);
   const bool write_cache = !CachedData.elec_ener.empty();
   const bool has_cutoff = Arguments.distance_energy_cutoff > 0.;
+  const titan_cutoff::CutoffBlocks cutoff_blocks(
+      rec, (rec.size() / 4) * 4, Arguments.distance_energy_cutoff); // ENE-03
   const bool check_self = Arguments.self_int;
   const bool check_interchain = Arguments.flag_interchain_energy;
+  const bool has_overrides = CachedData.has_charmm_pair_overrides();
 
   for (size_t j{begin}; j < end; ++j) {
     const double pos_x{lg.pos.x[j]}, pos_y{lg.pos.y[j]}, pos_z{lg.pos.z[j]};
@@ -710,6 +766,12 @@ void cal_energy_opls_intrin(const MOL &rec, const MOL &lg,
     const __m256d v_scale = _mm256_set1_pd(0.01);
 
     for (size_t i = 0; i < size_vector_rec * 4; i += 4) {
+      if (const size_t culled = cutoff_blocks.skip(i, pos_x, pos_y, pos_z);
+          culled > 0) {
+        titan_cutoff::CutoffBlocks::zero_cache(CachedData, rec_size * j + i, culled);
+        i += culled - 4;
+        continue;
+      }
       const __m256d v_x = _mm256_loadu_pd(&rec.pos.x[i]);
       const __m256d v_y = _mm256_loadu_pd(&rec.pos.y[i]);
       const __m256d v_z = _mm256_loadu_pd(&rec.pos.z[i]);
@@ -754,6 +816,12 @@ void cal_energy_opls_intrin(const MOL &rec, const MOL &lg,
 
       _mm256_storeu_pd(d, avx_array_d_rec);
       _mm256_storeu_pd(c6_arr, vdw_temp2);
+      if (has_overrides) {
+        _mm256_storeu_pd(vdw_temp_d, vdw_temp3);
+        titan_lj::override_lj_lanes(CachedData, rec_parameters, lg_parameters,
+                                    i, 4, j, d, vdw_temp_d);
+        vdw_temp3 = _mm256_loadu_pd(vdw_temp_d);
+      }
       for (int k = 0; k < 4; ++k) {
         bool keep = true;
         if (check_self &&
@@ -814,6 +882,9 @@ void cal_energy_opls_intrin(const MOL &rec, const MOL &lg,
         double v_val = sqrt(lg_parameters[j].get_epsilon() * 16. *
                             rec_parameters[i].get_epsilon()) *
                        (square(c_6) - c_6);
+        if (has_overrides)
+          titan_lj::override_lj_energy(CachedData, rec_parameters,
+                                       lg_parameters, i, j, d, v_val);
 
         if (write_cache) {
           CachedData.set_elec_vdw(pos, e_val, v_val);
@@ -905,12 +976,14 @@ int cal_energy_martini_intrin(const MOL &rec, const MOL &lg,
 
       __m256d sigma_vec = avx_neg_one;
       __m256d epsilon_vec = avx_neg_one;
-      if (has_pair_table && lg_type >= 0) {
+      // ENE-17(h): ids outside the MARTINI table (an id from another type
+      // space) take the per-atom fallback instead of gathering out of bounds.
+      if (has_pair_table && lg_type >= 0 && lg_type < martini_types) {
         alignas(16) int pair_idx[4];
         alignas(32) double lookup_mask_vals[4];
         for (int k = 0; k < 4; ++k) {
           const int rec_type_lane = rec_type ? rec_type[i + k] : -1;
-          if (rec_type_lane >= 0) {
+          if (rec_type_lane >= 0 && rec_type_lane < martini_types) {
             pair_idx[k] = lg_row_offset + rec_type_lane;
             lookup_mask_vals[k] = -1.0;
           } else {

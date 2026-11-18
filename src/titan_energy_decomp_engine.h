@@ -220,21 +220,33 @@ private:
   std::size_t trajectories_{0};
 };
 
+// Energies are accumulated in kJ/mol. Exports divide every energy column by
+// kj_per_unit (TITAN's eu_par: 1 for kJ/mol, 4.184 for kcal/mol) and name the
+// unit in edecomp_summary.dat; counts, indices and ranks are not scaled.
+struct OutputUnit {
+  std::string name{"kJ/mol"};
+  double kj_per_unit{1.0};
+};
+
 void export_result(const ResultCore &result,
                    const std::filesystem::path &base_dir,
-                   std::string_view suffix = {});
+                   std::string_view suffix = {},
+                   const OutputUnit &unit = {});
 void export_all_results(const AllTrajectoryResult &result,
                         const std::filesystem::path &base_dir,
-                        std::string_view suffix = "_average");
+                        std::string_view suffix = "_average",
+                        const OutputUnit &unit = {});
 void export_endpoint_result(const EndpointEntityResult &result,
                             const std::filesystem::path &base_dir,
                             std::string_view source,
-                            std::string_view suffix = {});
+                            std::string_view suffix = {},
+                            const OutputUnit &unit = {});
 void export_endpoint_all_results(const EndpointEntityResult &trajectory_equal,
                                  const EndpointEntityResult &pooled_frames,
                                  const std::filesystem::path &base_dir,
                                  std::string_view source,
-                                 std::string_view suffix = "_average");
+                                 std::string_view suffix = "_average",
+                                 const OutputUnit &unit = {});
 
 } // namespace titan_energy_decomp
 

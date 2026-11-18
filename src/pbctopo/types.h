@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -16,6 +17,8 @@
 namespace titan_pbctopo {
 
 using pbctopo_hull::Vec3;
+
+class PbctopoLatticeMetric;
 
 struct PbctopoHash128 {
   std::uint64_t lo = 0;
@@ -32,7 +35,19 @@ enum class PbctopoEvidenceState : std::uint8_t {
   WeakDisconnected,
   Contradicted,
   WeakAmbiguous,
+  // The contact network has a nonzero cycle (a pair seen at two images, a
+  // part touching its own image, or a longer ring): no finite placement
+  // keeps every observed contact.  The rank of the cycle lattice is reported.
+  ExtendedPeriodic,
 };
+
+// States whose relative images the contacts do not fix: weak_ambiguous and
+// extended_periodic frames share status and warm-state handling.
+constexpr bool pbctopo_evidence_state_underdetermined(
+    PbctopoEvidenceState state) noexcept {
+  return state == PbctopoEvidenceState::WeakAmbiguous ||
+         state == PbctopoEvidenceState::ExtendedPeriodic;
+}
 
 struct PbctopoAnchorGraphScore {
   double order_max_d2 = std::numeric_limits<double>::infinity();
@@ -1165,7 +1180,24 @@ struct PbctopoContactShiftHypothesis {
   std::vector<PbctopoContactHypothesisEdge> edges;
 };
 
+// Cycle lattice of the periodic contact network (periodic_contact_audit.h):
+// rank 0 when every cycle of observed relations sums to zero.
+struct PbctopoContactCycleSummary {
+  bool evaluated = false;
+  std::size_t rank = 0;
+  std::array<Int3, 3> basis{};
+  std::size_t graph_components = 0;
+  std::size_t periodic_graph_components = 0;
+  std::size_t max_component_rank = 0;
+  std::size_t nonzero_cycle_relations = 0;
+  std::size_t self_image_units = 0;
+  std::size_t self_image_atom_pairs = 0;
+  double self_image_min_distance_A = std::numeric_limits<double>::quiet_NaN();
+};
+
 struct PbctopoContactHypothesisSet {
+  // Filled by the frame's periodic contact audit; not part of the hashes.
+  PbctopoContactCycleSummary contact_cycle;
   std::vector<PbctopoContactShiftHypothesis> hypotheses;
   PbctopoHash128 all_hypotheses_hash;
   PbctopoHash128 raw_observed_pair_hash;
@@ -1197,6 +1229,9 @@ struct PbctopoAnchorGraphContext {
   double box_m[3][3]{};
   double box_inv[3][3]{};
   bool has_box = false;
+  // The lattice metric of box_m/box_inv, built once with the context instead
+  // of once per endpoint edge and score (anchor_endpoint_image_gap).
+  std::shared_ptr<const PbctopoLatticeMetric> box_lattice;
 };
 
 } // namespace titan_pbctopo

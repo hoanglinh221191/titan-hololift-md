@@ -5,7 +5,33 @@
 #include <stdexcept>
 #include<iostream>
 namespace fs = std::filesystem;
+namespace {
+// Result folder of one input (named without .pdb): beside a relative input,
+// as always; an absolute input (C:/data/md.pdb, /data/md.pdb) gets ./md in
+// the working directory, since "./" + an absolute path names nothing.
+fs::path result_folder(const string& input)
+{
+	const fs::path path{ input };
+	if (path.has_root_path())
+		return fs::path{ "." } / path.filename();
+	return fs::path{ "./" + input };
+}
+}
 int folders::add_paths(const arguments& Arguments, vector<string>& input_lines)
+{
+	const size_t first_new{ paths.size() };
+	const int status{ add_input_paths(Arguments, input_lines) };
+	// Two inputs with the same name in different folders must not share one
+	// result folder: the later ones get _2, _3, ...
+	for (size_t i{ first_new }; i < paths.size(); ++i)
+	{
+		const fs::path base{ paths[i] };
+		for (size_t n{ 2 }; std::find(paths.begin() + first_new, paths.begin() + i, paths[i]) != paths.begin() + i; ++n)
+			paths[i] = fs::path{ base.string() + "_" + to_string(n) };
+	}
+	return status;
+}
+int folders::add_input_paths(const arguments& Arguments, vector<string>& input_lines)
 {
 	if (Arguments.flag_separation_results == false && Arguments.flag_all_folders == false)
 	{
@@ -56,7 +82,7 @@ int folders::add_paths(const arguments& Arguments, vector<string>& input_lines)
 				if (line_temp.length()>4 && line_temp.substr(line_temp.length() - 4) == ".pdb")
 					line_temp = line_temp.substr(0, line_temp.length() - 4);
 				input_lines.emplace_back(line_temp);
-				paths.emplace_back("./" + line_temp); 
+				paths.emplace_back(result_folder(line_temp));
 			}
 		}
 		input.close();
@@ -71,7 +97,7 @@ int folders::add_paths(const arguments& Arguments, vector<string>& input_lines)
 			if (name.length() > 4 && name.substr(name.length() - 4) == ".pdb")
 				name = name.substr(0, name.length() - 4);
 
-			paths.emplace_back("./"+name);
+			paths.emplace_back(result_folder(name));
 		}
 	}
 	else if (Arguments.flag_pattern_input == true && Arguments.flag_range_input == false)
@@ -90,7 +116,7 @@ int folders::add_paths(const arguments& Arguments, vector<string>& input_lines)
 				open_name += ".pdb";
 			fstream test{ open_name,ios::in };
 			if (test.is_open())
-				paths.emplace_back("./" + test_name);
+				paths.emplace_back(result_folder(test_name));
 			else
 				break;
 		}
@@ -100,17 +126,23 @@ int folders::add_paths(const arguments& Arguments, vector<string>& input_lines)
 		string name{ Arguments.pdb_name };
 		if (Arguments.pdb_name.length() > 4 && Arguments.pdb_name.substr(Arguments.pdb_name.length() - 4) == ".pdb")
 			name = Arguments.pdb_name.substr(0, Arguments.pdb_name.length() - 4);
-		paths.emplace_back("./"+name);
+		paths.emplace_back(result_folder(name));
 	}
 	return 0;
 }
 
 int folders::create_folders(arguments& Arguments)
 {
-	if (Arguments.flag_separation_results == false) return 1;
+	if (Arguments.flag_separation_results == false) return 0;
 	for (auto& p : paths)
 	{
-		fs::create_directory(p);
+		std::error_code error;
+		fs::create_directory(p, error);
+		if (error)
+		{
+			std::cerr << "[ERROR] Cannot create the result folder " << p.string() << ": " << error.message() << '\n';
+			return 1;
+		}
 	}
 	return 0;
 }

@@ -1,4 +1,5 @@
 #include "titan_topology_energy.h"
+#include "topology/nonbonded_row_kernel.h"
 #include "martini_nonbonded.h"
 #include "titan_electrostatics.h"
 #include "titan_energy_validation.h"
@@ -50,7 +51,7 @@ PairEnergy evaluate_pair(const cache_sigma_epsilon &cache,const arguments &args,
       out.force_elec_prefactor=k*terms.normal_charge*(inv*inv2-2*krf);
     } else {
       const double kappa=args.flag_elec_screening && args.salt_concentration>0
-        ? 1/titan_electrostatics::debye_length_nm(args.salt_concentration) : 0;
+        ? 1/titan_electrostatics::debye_length_nm(args.salt_concentration,args.gbsa_temperature) : 0;
       const double screening=std::exp(-kappa*r);
       out.elec=k*terms.normal_charge*screening*inv;
       out.force_elec_prefactor=k*terms.normal_charge*screening*(inv*inv2+kappa*inv2);
@@ -71,9 +72,89 @@ void calculate(const MOL &rec,const MOL &lig,const std::vector<mol_info> &rec_in
   if(!cache.nonbonded_topology || end>lig.size() || rec_info.size()!=rec.size() || lig_info.size()!=lig.size())
     throw std::runtime_error("invalid topology energy dimensions");
   energy.set_energy(0,0);if(force_out)force_out->set_force(0,0,0,0,0,0);
-  for(std::size_t j=begin;j<end;++j)for(std::size_t i=0;i<rec.size();++i) {
+  const Topology &top=*cache.nonbonded_topology;
+  // ENE-10 (22/10/2026). A pair of atoms from two molecule instances has no
+  // exclusion and no listed pair, so it needs only the type matrix and the
+  // charges: no hash lookups, and the per-call constants below are computed
+  // once instead of per pair. Same expressions as evaluate_pair, so the
+  // energies and forces are unchanged; same-instance pairs still go there.
+  const bool fast=top.instance.size()==top.atoms.size();
+  const double k=138.935457839/std::max(1e-12,args.epsilon_in);
+  const bool is_martini=args.force_f.find("MARTINI")!=std::string::npos;
+  const auto cfg=martini::electrostatic_config(args);
+  double cutoff=args.distance_energy_cutoff;
+  if(is_martini && cutoff<=0)cutoff=cfg.cutoff_nm;
+  const double kappa=!is_martini && args.flag_elec_screening && args.salt_concentration>0
+    ? 1/titan_electrostatics::debye_length_nm(args.salt_concentration,args.gbsa_temperature) : 0;
+  const double krf=is_martini?0.5/(cutoff*cutoff*cutoff):0,crf=is_martini?1.5/cutoff:0;
+  const bool skip_same_chain=args.self_int && args.flag_interchain_energy;
+  auto source_id=[&](const mol_info &atom) {
+    if(!atom.has_original_atom_id() || atom.get_original_atom_id()>=top.atoms.size())
+      throw std::runtime_error("unsupported_topology_self_energy: missing topology/atom identity");
+    return atom.get_original_atom_id();
+  };
+  std::vector<std::size_t> rec_id;
+  if(fast) {rec_id.resize(rec.size());for(std::size_t i=0;i<rec.size();++i)rec_id[i]=source_id(rec_info[i]);}
+  // Energy-only rows whose receptor atoms all lie in other instances than
+  // the ligand atom go through the AVX2 row kernel (topology/
+  // nonbonded_row_kernel.h); forces, MARTINI and -self keep the scalar loop.
+  const bool rows=fast && !is_martini && !skip_same_chain && force_out==nullptr && !rec_id.empty();
+  std::vector<std::uint32_t> rec_type_offset,rec_instances;std::vector<double> rec_charge;
+  if(rows) {
+    rec_type_offset.resize(rec.size());rec_charge.resize(rec.size());rec_instances.reserve(rec.size());
+    for(std::size_t i=0;i<rec.size();++i) {
+      const Atom &atom=top.atoms[rec_id[i]];
+      rec_type_offset[i]=atom.type*top.type_count;rec_charge[i]=atom.charge;
+      rec_instances.push_back(top.instance[rec_id[i]]);
+    }
+    std::sort(rec_instances.begin(),rec_instances.end());
+    rec_instances.erase(std::unique(rec_instances.begin(),rec_instances.end()),rec_instances.end());
+  }
+  for(std::size_t j=begin;j<end;++j) {
+    const std::size_t b=fast?source_id(lig_info[j]):0;
+    if(rows && !std::binary_search(rec_instances.begin(),rec_instances.end(),top.instance[b])) {
+      RowInput in;
+      in.x=&rec.pos.x[0];in.y=&rec.pos.y[0];in.z=&rec.pos.z[0];
+      in.type_offset=rec_type_offset.data();in.charge=rec_charge.data();in.count=rec.size();
+      in.lx=lig.pos.x[j];in.ly=lig.pos.y[j];in.lz=lig.pos.z[j];
+      in.lig_type=top.atoms[b].type;in.lig_charge=top.atoms[b].charge;
+      in.matrix=top.nonbond_matrix.data();in.coulomb=k;in.kappa=kappa;in.cutoff=cutoff;
+      if(!cache.elec_ener.empty()) {
+        in.elec_out=cache.elec_ener.data()+rec.size()*j;in.vdw_out=cache.vdw_ener.data()+rec.size()*j;
+      }
+      double elec_sum=0,vdw_sum=0;
+      if(row_energy(in,elec_sum,vdw_sum)) {energy+=cache_energy(elec_sum,vdw_sum);continue;}
+    }
+    for(std::size_t i=0;i<rec.size();++i) {
     const double dx=0.1*(rec.pos.x[i]-lig.pos.x[j]),dy=0.1*(rec.pos.y[i]-lig.pos.y[j]),dz=0.1*(rec.pos.z[i]-lig.pos.z[j]);
-    const auto pair=evaluate_pair(cache,args,rec_info[i],lig_info[j],std::sqrt(dx*dx+dy*dy+dz*dz),args.distance_energy_cutoff);
+    const double r=std::sqrt(dx*dx+dy*dy+dz*dz);
+    PairEnergy pair;
+    if(fast && top.instance[rec_id[i]]!=top.instance[b]) {
+      const Atom &atom_a=top.atoms[rec_id[i]],&atom_b=top.atoms[b];
+      const Coefficients &c=top.nonbond_matrix[std::size_t(atom_a.type)*top.type_count+atom_b.type];
+      const double charge=atom_a.charge*atom_b.charge;
+      const bool silent=(skip_same_chain && rec_info[i].get_chain()==lig_info[j].get_chain()) ||
+                        (c.c6==0 && c.c12==0 && charge==0);
+      if(!silent) {
+        if(!std::isfinite(r) || r<=titan_energy_validation::kMinimumPairDistanceNm)
+          throw std::runtime_error("invalid_overlapping_atoms: topology pair requires a positive finite distance");
+        const double inv=1/r, inv2=inv*inv, inv6=inv2*inv2*inv2;
+        if(cutoff<=0 || r<=cutoff) {
+          pair.vdw=c.c12*inv6*inv6-c.c6*inv6;
+          pair.force_vdw_prefactor=(12*c.c12*inv6*inv6-6*c.c6*inv6)*inv2;
+          if(is_martini) {
+            pair.elec=k*charge*(inv+krf*r*r-crf);
+            pair.force_elec_prefactor=k*charge*(inv*inv2-2*krf);
+          } else {
+            const double screening=kappa>0?std::exp(-kappa*r):1.0;
+            pair.elec=k*charge*screening*inv;
+            pair.force_elec_prefactor=k*charge*screening*(inv*inv2+kappa*inv2);
+          }
+        }
+      }
+    } else {
+      pair=evaluate_pair(cache,args,rec_info[i],lig_info[j],r,args.distance_energy_cutoff);
+    }
     energy+=cache_energy(pair.elec,pair.vdw);
     const std::size_t pos=rec.size()*j+i;
     if(!cache.elec_ener.empty())cache.set_elec_vdw(pos,pair.elec,pair.vdw);
@@ -83,6 +164,7 @@ void calculate(const MOL &rec,const MOL &lig,const std::vector<mol_info> &rec_in
       *force_out+=force;
       if(cache.has_forces())cache.set_force(pos,force.forces[0].Fx,force.forces[0].Fy,force.forces[0].Fz,
                                            force.forces[1].Fx,force.forces[1].Fy,force.forces[1].Fz);
+    }
     }
   }
 }

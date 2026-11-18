@@ -207,6 +207,12 @@ public:
   }
   [[nodiscard]] std::vector<OrderParameterRow>
   compute_order_parameters(TitanExecutor &executor) const;
+  // The same, also handing back the correlation functions it computed, so
+  // that the correlation file does not compute them a second time (MDA-10).
+  [[nodiscard]] std::vector<OrderParameterRow> compute_order_parameters(
+      TitanExecutor &executor,
+      std::vector<std::vector<titan_s2_kernel::CorrelationRow>> &correlations)
+      const;
 
 private:
   struct Residue {
@@ -234,6 +240,8 @@ private:
   struct AggregateResult {
     AggregateCell raw_plateau;
     AggregateCell s2;
+    // replicates whose S2 is the tail-mean fallback, not a fitted plateau
+    std::size_t tail_fallback{0};
   };
 
   void reset_trajectory_state();
@@ -255,8 +263,10 @@ private:
   [[nodiscard]] std::string aggregate_key(const VectorPlan &plan) const;
   void export_order_csv(const std::string &filename,
                         const std::vector<OrderParameterRow> &rows) const;
-  void export_correlation_dat(const std::string &filename,
-                              TitanExecutor &executor) const;
+  void export_correlation_dat(
+      const std::string &filename,
+      const std::vector<std::vector<titan_s2_kernel::CorrelationRow>>
+          &correlations) const;
   void export_summary(const std::string &filename,
                       const std::vector<OrderParameterRow> &rows) const;
   void export_pdb(const std::string &filename,
@@ -285,6 +295,7 @@ private:
   AlignedDoubleVector scratch_to_z_;
   titan_s2_kernel::BondVectorsSoA scratch_frame_vectors_;
   std::array<double, 9> scratch_rotation_{};
+  std::vector<bool> alignment_chain_start_; // first CA of a chain in the trace
   titan::algebra::Matrix3Buffer alignment_reference_matrix_;
   titan::algebra::Matrix3Buffer alignment_mobile_matrix_;
   titan::algebra::Mat3 alignment_rotation_{

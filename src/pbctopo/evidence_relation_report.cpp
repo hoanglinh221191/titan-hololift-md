@@ -157,6 +157,8 @@ std::string evidence_state_name(PbctopoEvidenceState state) {
     return "contradicted";
   case PbctopoEvidenceState::WeakAmbiguous:
     return "weak_ambiguous";
+  case PbctopoEvidenceState::ExtendedPeriodic:
+    return "extended_periodic";
   }
   return "unknown";
 }

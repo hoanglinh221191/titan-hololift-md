@@ -187,18 +187,20 @@ void StreamingKinetics::finalize() {
 
 } // namespace titan_hbond_kinetics
 
+// An H-bond is the donor-acceptor pair, formed when any hydrogen of the
+// donor satisfies the criteria (gmx hbond -merge, the GROMACS default): a
+// rotating NH3+ or NH2 does not break and re-form the bond. hydrogen_idx is
+// the first hydrogen that satisfied them and is not part of the identity.
 bool TitanHBondKineticsAnalyzer::HBondEvent::operator<(
     const HBondEvent &rhs) const noexcept {
-  return std::tie(donor_mol, donor_idx, hydrogen_idx, acceptor_mol,
-                  acceptor_idx) <
-         std::tie(rhs.donor_mol, rhs.donor_idx, rhs.hydrogen_idx,
-                  rhs.acceptor_mol, rhs.acceptor_idx);
+  return std::tie(donor_mol, donor_idx, acceptor_mol, acceptor_idx) <
+         std::tie(rhs.donor_mol, rhs.donor_idx, rhs.acceptor_mol,
+                  rhs.acceptor_idx);
 }
 
 bool TitanHBondKineticsAnalyzer::HBondEvent::operator==(
     const HBondEvent &rhs) const noexcept {
   return donor_mol == rhs.donor_mol && donor_idx == rhs.donor_idx &&
-         hydrogen_idx == rhs.hydrogen_idx &&
          acceptor_mol == rhs.acceptor_mol &&
          acceptor_idx == rhs.acceptor_idx;
 }
@@ -312,6 +314,10 @@ void TitanHBondKineticsAnalyzer::prepare_molecule_cache(const Multi_MOL &mol,
   cache.heavy_atoms.reserve(atom_count);
 
   const MOL &frame0 = mol.m_mol.front();
+  std::optional<titan_interaction::PeriodicImage> frame0_image;
+  if (BoxMatrix::valid_box(frame0.Box))
+    frame0_image.emplace(frame0.Box);
+  std::vector<std::size_t> hydrogens;
   for (std::size_t atom_idx = 0; atom_idx < atom_count; ++atom_idx) {
     const auto &atom_info = mol.info[atom_idx];
     AtomLabel label_info;
@@ -337,11 +343,16 @@ void TitanHBondKineticsAnalyzer::prepare_molecule_cache(const Multi_MOL &mol,
     if (titan_interaction::is_hbond_donor(atom_name, res_name)) {
       const auto span =
           titan_interaction::find_residue_span_by_atom(mol.info, atom_idx);
-      const std::size_t hydrogen_idx = titan_interaction::find_bonded_hydrogen(
-          frame0, mol.info, atom_idx, span.first, span.second);
-      if (hydrogen_idx != SIZE_MAX && hydrogen_idx < atom_count) {
+      titan_interaction::find_bonded_hydrogens(
+          frame0, mol.info, atom_idx, span.first, span.second,
+          frame0_image ? &*frame0_image : nullptr, hydrogens);
+      std::erase_if(hydrogens,
+                    [&](std::size_t h) { return h >= atom_count; });
+      if (!hydrogens.empty()) {
         cache.donors.push_back(
-            {atom_idx, static_cast<std::size_t>(hydrogen_idx)});
+            {atom_idx, cache.donor_hydrogens.size(), hydrogens.size()});
+        cache.donor_hydrogens.insert(cache.donor_hydrogens.end(),
+                                     hydrogens.begin(), hydrogens.end());
       }
     }
   }
@@ -529,17 +540,78 @@ void TitanHBondKineticsAnalyzer::detect_hbonds_between(
         const double *zs = acceptor_frame.pos.z.data();
         const auto &targets = acceptor_cache.acceptors;
 
+        const titan_interaction::PeriodicImage *image =
+            frame_image_ ? &*frame_image_ : nullptr;
+
         for (std::size_t donor_pos = begin; donor_pos < end; ++donor_pos) {
           const DonorSite &donor_site = donor_cache.donors[donor_pos];
           if (donor_site.donor_index >= donor_frame.size() ||
-              donor_site.hydrogen_index >= donor_frame.size() ||
-              donor_site.donor_index >= donor_cache.atoms.size()) {
+              donor_site.donor_index >= donor_cache.atoms.size() ||
+              donor_site.hydrogen_begin + donor_site.hydrogen_count >
+                  donor_cache.donor_hydrogens.size()) {
             continue;
           }
+          const std::size_t *hydrogens =
+              donor_cache.donor_hydrogens.data() + donor_site.hydrogen_begin;
 
           const double px = donor_frame.pos.x[donor_site.donor_index];
           const double py = donor_frame.pos.y[donor_site.donor_index];
           const double pz = donor_frame.pos.z[donor_site.donor_index];
+
+          // Distance passed: the pair is an H-bond when any hydrogen of the
+          // donor satisfies the angle; the first such hydrogen is recorded.
+          auto consider = [&](std::size_t acceptor_idx) {
+            if (acceptor_idx >= acceptor_frame.size() ||
+                acceptor_idx >= acceptor_cache.atoms.size())
+              return;
+            if (donor_mol == acceptor_mol &&
+                acceptor_idx == donor_site.donor_index)
+              return;
+            if (exclude_same_residue && donor_mol == acceptor_mol &&
+                donor_cache.atoms[donor_site.donor_index].chain_id ==
+                    acceptor_cache.atoms[acceptor_idx].chain_id &&
+                donor_cache.atoms[donor_site.donor_index].resnr ==
+                    acceptor_cache.atoms[acceptor_idx].resnr) {
+              return;
+            }
+            for (std::size_t k = 0; k < donor_site.hydrogen_count; ++k) {
+              const std::size_t hydrogen_idx = hydrogens[k];
+              if (hydrogen_idx >= donor_frame.size())
+                continue;
+              double angle_deg = 0.0;
+              const bool formed =
+                  image != nullptr
+                      ? titan_interaction::try_calculate_angle_deg(
+                            donor_frame, donor_site.donor_index, hydrogen_idx,
+                            acceptor_frame, acceptor_idx, angle_cos_cutoff_,
+                            *image, angle_deg)
+                      : titan_interaction::try_calculate_angle_deg(
+                            donor_frame, donor_site.donor_index, hydrogen_idx,
+                            acceptor_frame, acceptor_idx, angle_cos_cutoff_,
+                            angle_deg);
+              if (!formed)
+                continue;
+              local.push_back({donor_mol,
+                               static_cast<int>(donor_site.donor_index),
+                               static_cast<int>(hydrogen_idx), acceptor_mol,
+                               static_cast<int>(acceptor_idx)});
+              return;
+            }
+          };
+
+          if (image != nullptr) {
+            for (const std::size_t acceptor_idx : targets) {
+              if (acceptor_idx >= acceptor_frame.size())
+                continue;
+              double dx = px - xs[acceptor_idx];
+              double dy = py - ys[acceptor_idx];
+              double dz = pz - zs[acceptor_idx];
+              image->apply(dx, dy, dz);
+              if (dx * dx + dy * dy + dz * dz < hbond_cutoff_sq_)
+                consider(acceptor_idx);
+            }
+            continue;
+          }
 
           std::size_t target_pos = 0;
           for (; target_pos + 3 < targets.size(); target_pos += 4) {
@@ -552,72 +624,22 @@ void TitanHBondKineticsAnalyzer::detect_hbonds_between(
                 px, py, pz, xs, ys, zs, gather_idx, hbond_cutoff_sq_, 0.0, false);
             while (mask != 0U) {
               const unsigned lane = static_cast<unsigned>(std::countr_zero(mask));
-              const std::size_t acceptor_idx =
-                  targets[target_pos + static_cast<std::size_t>(lane)];
               mask &= (mask - 1U);
-              if (acceptor_idx >= acceptor_frame.size() ||
-                  acceptor_idx >= acceptor_cache.atoms.size())
-                continue;
-              if (donor_mol == acceptor_mol &&
-                  acceptor_idx == donor_site.donor_index)
-                continue;
-              if (exclude_same_residue && donor_mol == acceptor_mol &&
-                  donor_cache.atoms[donor_site.donor_index].chain_id ==
-                      acceptor_cache.atoms[acceptor_idx].chain_id &&
-                  donor_cache.atoms[donor_site.donor_index].resnr ==
-                      acceptor_cache.atoms[acceptor_idx].resnr) {
-                continue;
-              }
-
-              double angle_deg = 0.0;
-              if (!titan_interaction::try_calculate_angle_deg(
-                      donor_frame, donor_site.donor_index,
-                      donor_site.hydrogen_index, acceptor_frame, acceptor_idx,
-                      angle_cos_cutoff_, angle_deg)) {
-                continue;
-              }
-              local.push_back({donor_mol,
-                               static_cast<int>(donor_site.donor_index),
-                               static_cast<int>(donor_site.hydrogen_index),
-                               acceptor_mol,
-                               static_cast<int>(acceptor_idx)});
+              consider(targets[target_pos + static_cast<std::size_t>(lane)]);
             }
           }
 
           for (; target_pos < targets.size(); ++target_pos) {
             const std::size_t acceptor_idx = targets[target_pos];
-            if (acceptor_idx >= acceptor_frame.size() ||
-                acceptor_idx >= acceptor_cache.atoms.size())
+            if (acceptor_idx >= acceptor_frame.size())
               continue;
-            if (donor_mol == acceptor_mol &&
-                acceptor_idx == donor_site.donor_index)
-              continue;
-            if (exclude_same_residue && donor_mol == acceptor_mol &&
-                donor_cache.atoms[donor_site.donor_index].chain_id ==
-                    acceptor_cache.atoms[acceptor_idx].chain_id &&
-                donor_cache.atoms[donor_site.donor_index].resnr ==
-                    acceptor_cache.atoms[acceptor_idx].resnr) {
-              continue;
-            }
-
             const double dx = px - acceptor_frame.pos.x[acceptor_idx];
             const double dy = py - acceptor_frame.pos.y[acceptor_idx];
             const double dz = pz - acceptor_frame.pos.z[acceptor_idx];
             const double dist_sq = dx * dx + dy * dy + dz * dz;
             if (!(dist_sq < hbond_cutoff_sq_))
               continue;
-
-            double angle_deg = 0.0;
-            if (!titan_interaction::try_calculate_angle_deg(
-                    donor_frame, donor_site.donor_index,
-                    donor_site.hydrogen_index, acceptor_frame, acceptor_idx,
-                    angle_cos_cutoff_, angle_deg)) {
-              continue;
-            }
-            local.push_back({donor_mol,
-                             static_cast<int>(donor_site.donor_index),
-                             static_cast<int>(donor_site.hydrogen_index),
-                             acceptor_mol, static_cast<int>(acceptor_idx)});
+            consider(acceptor_idx);
           }
         }
       });
@@ -657,6 +679,30 @@ void TitanHBondKineticsAnalyzer::detect_salts_between(
           const double px = acid_frame.pos.x[acid_idx];
           const double py = acid_frame.pos.y[acid_idx];
           const double pz = acid_frame.pos.z[acid_idx];
+
+          if (frame_image_) {
+            for (const std::size_t base_idx : targets) {
+              if (base_idx >= base_frame.size() ||
+                  base_idx >= base_cache.atoms.size())
+                continue;
+              if (acid_mol == base_mol && base_idx == acid_idx)
+                continue;
+              if (exclude_same_residue && acid_mol == base_mol &&
+                  acid_cache.atoms[acid_idx].chain_id ==
+                      base_cache.atoms[base_idx].chain_id &&
+                  acid_cache.atoms[acid_idx].resnr ==
+                      base_cache.atoms[base_idx].resnr)
+                continue;
+              double dx = px - xs[base_idx];
+              double dy = py - ys[base_idx];
+              double dz = pz - zs[base_idx];
+              frame_image_->apply(dx, dy, dz);
+              if (dx * dx + dy * dy + dz * dz < salt_cutoff_sq_)
+                local.push_back({acid_mol, static_cast<int>(acid_idx),
+                                 base_mol, static_cast<int>(base_idx)});
+            }
+            continue;
+          }
 
           std::size_t target_pos = 0;
           for (; target_pos + 3 < targets.size(); target_pos += 4) {
@@ -731,6 +777,20 @@ void TitanHBondKineticsAnalyzer::collect_nearby_heavy_atoms(
   const double *xs = frame.pos.x.data();
   const double *ys = frame.pos.y.data();
   const double *zs = frame.pos.z.data();
+
+  if (frame_image_) {
+    for (const std::size_t atom_idx : cache.heavy_atoms) {
+      if (atom_idx >= frame.size())
+        continue;
+      double dx = px - xs[atom_idx];
+      double dy = py - ys[atom_idx];
+      double dz = pz - zs[atom_idx];
+      frame_image_->apply(dx, dy, dz);
+      if ((dx * dx + dy * dy + dz * dz) <= cutoff_sq)
+        hits.push_back(atom_idx);
+    }
+    return;
+  }
 
   std::size_t pos = 0;
   for (; pos + 3 < cache.heavy_atoms.size(); pos += 4) {
@@ -854,11 +914,8 @@ void TitanHBondKineticsAnalyzer::detect_water_intra(
 int TitanHBondKineticsAnalyzer::intern_hbond_event(ScopeKind scope,
                                                    const HBondEvent &event) {
   auto &series = hbond_series_[scope_index(scope)];
-  const std::string key =
-      std::to_string(event.donor_mol) + "|" + std::to_string(event.donor_idx) +
-      "|" + std::to_string(event.hydrogen_idx) + "|" +
-      std::to_string(event.acceptor_mol) + "|" +
-      std::to_string(event.acceptor_idx);
+  const EventKey key{event.donor_mol, event.donor_idx, event.acceptor_mol,
+                     event.acceptor_idx, 0};
   const auto it = series.id_by_key.find(key);
   if (it != series.id_by_key.end())
     return it->second;
@@ -886,11 +943,8 @@ int TitanHBondKineticsAnalyzer::intern_hbond_event(ScopeKind scope,
 int TitanHBondKineticsAnalyzer::intern_salt_event(ScopeKind scope,
                                                   const SaltEvent &event) {
   auto &series = salt_series_[scope_index(scope)];
-  const std::string key =
-      std::to_string(event.acidic_mol) + "|" +
-      std::to_string(event.acidic_idx) + "|" +
-      std::to_string(event.basic_mol) + "|" +
-      std::to_string(event.basic_idx);
+  const EventKey key{event.acidic_mol, event.acidic_idx, event.basic_mol,
+                     event.basic_idx, 0};
   const auto it = series.id_by_key.find(key);
   if (it != series.id_by_key.end())
     return it->second;
@@ -915,12 +969,8 @@ int TitanHBondKineticsAnalyzer::intern_salt_event(ScopeKind scope,
 int TitanHBondKineticsAnalyzer::intern_water_event(ScopeKind scope,
                                                    const WaterEvent &event) {
   auto &series = water_series_[scope_index(scope)];
-  const std::string key =
-      std::to_string(event.water_index) + "|" +
-      std::to_string(event.atom_a_mol) + "|" +
-      std::to_string(event.atom_a_idx) + "|" +
-      std::to_string(event.atom_b_mol) + "|" +
-      std::to_string(event.atom_b_idx);
+  const EventKey key{event.water_index, event.atom_a_mol, event.atom_a_idx,
+                     event.atom_b_mol, event.atom_b_idx};
   const auto it = series.id_by_key.find(key);
   if (it != series.id_by_key.end())
     return it->second;
@@ -990,6 +1040,9 @@ void TitanHBondKineticsAnalyzer::process_frame(const MOL &mol1_frame,
 
   ++frames_seen_;
   update_frame_timing(mol1_frame.time_of_snap);
+  frame_image_.reset();
+  if (BoxMatrix::valid_box(mol1_frame.Box))
+    frame_image_.emplace(mol1_frame.Box);
 
   if (hbond_series_[scope_index(ScopeKind::Inter)].enabled) {
     std::vector<HBondEvent> events;

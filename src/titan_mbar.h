@@ -43,8 +43,14 @@ struct WindowAuditRow {
   double overlap_start_ps{0.0};
   double overlap_end_ps{0.0};
   double inferred_dt_energy_ps{0.0};
+  // KIN-21: energy grid coarser than the trajectory grid; one frame (the
+  // nearest) per energy row is used, duplicate_energy_matches frames are not
+  bool energy_coarser_than_traj{false};
+  std::size_t duplicate_energy_matches{0};
+  double inferred_dt_traj_ps{0.0};
   std::string status{"uninitialized"};
 };
+#define TITAN_MBAR_AUDIT_ENERGY_COARSER_FLAG 1
 
 struct FrameWeightRow {
   int replica_id{-1};
@@ -70,10 +76,17 @@ struct CoreResult {
   bool used_demux_map{false};
   bool used_per_frame_temperature{false};
   bool box_volume_metadata_available{false};
+  // KIN-18: NPT reduced potential beta (U + p V). Included only for
+  // -mbar-ensemble npt with a positive pressure and a box volume for every
+  // sample; pv_term_note says why it is not.
+  bool pv_term_included{false};
+  double pv_pressure_bar{0.0};
+  std::string pv_term_note{"not included (ensemble nvt)"};
   std::string abort_reason{};
   std::string solver_method{"n/a"};
   std::string convergence_note{"n/a"};
   std::string temperature_ladder_source{"file"};
+  std::string demux_time_source{"n/a"}; // time column | energy-file rows
   std::vector<double> sampled_temperatures_k{};
   std::vector<int> sampled_counts{};
   std::vector<WindowAuditRow> window_audit{};
@@ -100,6 +113,17 @@ struct CoreResult {
   double target_effective_sample_size{0.0};
   double min_state_effective_sample_size{0.0};
   double min_adjacent_overlap{0.0};
+  // KIN-20: moving-block bootstrap, block length ceil(4 g) per replica series
+  // (g = statistical inefficiency 1 + 2 tau_int of its observable series);
+  // replicates whose MBAR solve does not converge are dropped and counted.
+  std::vector<int> bootstrap_replica_ids{};
+  std::vector<double> bootstrap_inefficiency{};
+  std::vector<std::size_t> bootstrap_block_lengths{};
+  std::size_t bootstrap_used{0};
+  std::size_t bootstrap_dropped{0};
+  std::size_t bootstrap_capped_blocks{0};
+  // KIN-21: replicas whose energy grid is coarser than the trajectory grid
+  std::size_t energy_coarser_replicas{0};
 };
 
 CoreResult run_temperature_ladder_reweighting(const arguments &args,

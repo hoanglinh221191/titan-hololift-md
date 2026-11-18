@@ -3,6 +3,7 @@
 #include "algebra/symmetric_eigen.h"
 #include "titan_alignment.h"
 #include "titan_corr_knn_shared.h"
+#include "titan_info_entropy.h"
 #include "titan_executor.h"
 #include "titan_graph_community.h"
 #include "memory_utils.h"
@@ -1155,21 +1156,6 @@ bool has_complete_anchor_rows(const DCCMNetwork::TrajectoryRows &x_rows,
 }
 
 
-double normalized_l1_distance(const std::vector<double> &lhs,
-                              const std::vector<double> &rhs) {
-  if (lhs.size() != rhs.size() || lhs.empty())
-    return 0.0;
-  double diff_sum = 0.0;
-  double mass = 0.0;
-  for (size_t i = 0; i < lhs.size(); ++i) {
-    diff_sum += std::abs(lhs[i] - rhs[i]);
-    mass += lhs[i] + rhs[i];
-  }
-  if (mass <= 0.0)
-    return 0.0;
-  return 0.5 * diff_sum / mass;
-}
-
 void smooth_histogram_kde_2d(std::vector<double> &hist, size_t bins,
                              double sigma) {
   if (hist.empty() || bins == 0 || sigma <= 1e-9)
@@ -1251,7 +1237,9 @@ size_t calculate_allostery_information_flat_impl(
                  });
   if (estimator_mode == "histogram")
     estimator_mode = "hist";
-  const bool estimator_knn = (estimator_mode == "knn");
+  // KIN-14: the former "knn" branch here scaled MI by 1 + 0.15 L1(joint,
+  // joint) = 1 and was unreachable (knn runs through titan_corr_knn_core); it
+  // is removed. kde smooths the MI joint histogram; anything else is hist.
   const bool estimator_kde = (estimator_mode == "kde");
   if (B_sz > static_cast<size_t>(std::numeric_limits<BinType>::max())) {
     TitanUI::print_warning(
@@ -1306,65 +1294,44 @@ size_t calculate_allostery_information_flat_impl(
 
   FlatAlignedMatrixT<BinType> proj_bins(num_ca, total_frames,
                                         static_cast<BinType>(0));
-  std::vector<double> H1(num_ca, 0.0);
   std::vector<double> H_past;
   std::vector<double> H_auto;
   if (cfg.compute_te) {
     H_past.assign(num_ca, 0.0);
     H_auto.assign(num_ca, 0.0);
   }
-  const double norm1_full =
-      0.5 * static_cast<double>(B) + static_cast<double>(total_frames);
-  const double norm1_tau =
-      0.5 * static_cast<double>(B) +
-      static_cast<double>(total_frames - tau);
-  const double norm2_full =
-      0.5 * static_cast<double>(B_sz * B_sz) +
-      static_cast<double>(total_frames);
-  const double norm2_tau =
-      0.5 * static_cast<double>(B_sz * B_sz) +
-      static_cast<double>(total_frames - tau);
-  const double norm3_tau =
-      0.5 * static_cast<double>(B_sz * B_sz * B_sz) +
-      static_cast<double>(total_frames - tau);
-
-  auto entropy_from_hist = [](const std::vector<double> &hist,
-                              double norm) -> double {
-    double H = 0.0;
-    for (double count : hist) {
-      const double p = count / norm;
-      if (p > 0.0)
-        H -= p * std::log(p);
-    }
-    return H;
+  // KIN-14: plug-in probabilities with the Miller-Madow correction for every
+  // entropy term (titan_info_entropy.h) instead of a 0.5 pseudocount per cell.
+  auto entropy_from_hist = [](const std::vector<double> &hist) -> double {
+    return titan_info::miller_madow_entropy(hist);
   };
 
   auto estimate_mi = [&](const std::vector<double> &joint_hist,
                          const BinType *bins_i,
                          const BinType *bins_j) -> double {
-    std::vector<double> hist_i(B_sz, 0.5);
-    std::vector<double> hist_j(B_sz, 0.5);
+    std::vector<double> hist_i(B_sz, 0.0);
+    std::vector<double> hist_j(B_sz, 0.0);
     for (size_t f = 0; f < total_frames; ++f) {
       hist_i[static_cast<size_t>(bins_i[f])] += 1.0;
       hist_j[static_cast<size_t>(bins_j[f])] += 1.0;
     }
 
-    std::vector<double> joint_est = joint_hist;
+    double mi = 0.0;
     if (estimator_kde) {
+      // the smoothed joint is not a count histogram: plug-in entropies of
+      // the normalised histograms, no count correction
+      std::vector<double> joint_est = joint_hist;
       double sigma = cfg.kde_bandwidth;
       if (sigma <= 0.0) {
         sigma = std::max(0.75, static_cast<double>(B) / 24.0);
       }
       smooth_histogram_kde_2d(joint_est, B_sz, sigma);
-    }
-
-    const double H_i = entropy_from_hist(hist_i, norm1_full);
-    const double H_j = entropy_from_hist(hist_j, norm1_full);
-    const double H_ij = entropy_from_hist(joint_est, norm2_full);
-    double mi = H_i + H_j - H_ij;
-    if (estimator_knn) {
-      const double l1 = normalized_l1_distance(joint_est, joint_hist);
-      mi *= (1.0 + 0.15 * l1);
+      mi = titan_info::plugin_entropy(hist_i) +
+           titan_info::plugin_entropy(hist_j) -
+           titan_info::plugin_entropy(joint_est);
+    } else {
+      mi = entropy_from_hist(hist_i) + entropy_from_hist(hist_j) -
+           entropy_from_hist(joint_hist);
     }
     return std::max(0.0, mi);
   };
@@ -1431,7 +1398,6 @@ size_t calculate_allostery_information_flat_impl(
           p_range = 1e-15;
 
         BinType *bins = proj_bins.row_data(a);
-        std::fill(hist1.begin(), hist1.end(), 0.5);
         for (size_t f = 0; f < total_frames; ++f) {
           const double scaled = (atom_proj[f] - p_min) / p_range;
           int bin = static_cast<int>(scaled * static_cast<double>(B));
@@ -1440,23 +1406,21 @@ size_t calculate_allostery_information_flat_impl(
           else if (bin >= B)
             bin = B - 1;
           bins[f] = static_cast<BinType>(bin);
-          hist1[static_cast<size_t>(bins[f])] += 1.0;
         }
-        H1[a] = entropy_from_hist(hist1, norm1_full);
 
         if (cfg.compute_te) {
-          std::fill(hist1.begin(), hist1.end(), 0.5);
+          std::fill(hist1.begin(), hist1.end(), 0.0);
           for (size_t f = tau; f < total_frames; ++f)
             hist1[static_cast<size_t>(bins[f - tau])] += 1.0;
-          H_past[a] = entropy_from_hist(hist1, norm1_tau);
+          H_past[a] = entropy_from_hist(hist1);
 
-          std::fill(hist2.begin(), hist2.end(), 0.5);
+          std::fill(hist2.begin(), hist2.end(), 0.0);
           for (size_t f = tau; f < total_frames; ++f) {
             const size_t b_now = static_cast<size_t>(bins[f]);
             const size_t b_past = static_cast<size_t>(bins[f - tau]);
             hist2[b_now * B_sz + b_past] += 1.0;
           }
-          H_auto[a] = entropy_from_hist(hist2, norm2_tau);
+          H_auto[a] = entropy_from_hist(hist2);
         }
       }
     });
@@ -1477,9 +1441,9 @@ size_t calculate_allostery_information_flat_impl(
       const BinType *bins_i = proj_bins.row_data(i);
       const BinType *bins_j = proj_bins.row_data(j);
 
-      std::fill(hist2d.begin(), hist2d.end(), 0.5);
+      std::fill(hist2d.begin(), hist2d.end(), 0.0);
       if (cfg.compute_te)
-        std::fill(hist2d_b.begin(), hist2d_b.end(), 0.5);
+        std::fill(hist2d_b.begin(), hist2d_b.end(), 0.0);
       for (size_t f = 0; f < total_frames; ++f) {
         const size_t bi = static_cast<size_t>(bins_i[f]);
         const size_t bj = static_cast<size_t>(bins_j[f]);
@@ -1500,17 +1464,17 @@ size_t calculate_allostery_information_flat_impl(
       if (!cfg.compute_te)
         continue;
 
-      const double H_past_ij = entropy_from_hist(hist2d_b, norm2_tau);
+      const double H_past_ij = entropy_from_hist(hist2d_b);
       auto calc_h3 = [&](const BinType *src_bins,
                          const BinType *dst_bins) -> double {
-        std::fill(hist3d.begin(), hist3d.end(), 0.5);
+        std::fill(hist3d.begin(), hist3d.end(), 0.0);
         for (size_t f = tau; f < total_frames; ++f) {
           const size_t b1 = static_cast<size_t>(dst_bins[f]);
           const size_t b2 = static_cast<size_t>(dst_bins[f - tau]);
           const size_t b3 = static_cast<size_t>(src_bins[f - tau]);
           hist3d[(b1 * B_sz + b2) * B_sz + b3] += 1.0;
         }
-        return entropy_from_hist(hist3d, norm3_tau);
+        return entropy_from_hist(hist3d);
       };
 
       const double H3_j_from_i = calc_h3(bins_i, bins_j);

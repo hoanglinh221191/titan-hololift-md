@@ -51,7 +51,8 @@ inline void pair_params(const cache_sigma_epsilon &CachedData,
   if (CachedData.has_martini_pair_table()) {
     const int rec_type = rec_parameters.get_type_id(rec_pos);
     const int lg_type = lg_parameters.get_type_id(lg_pos);
-    if (rec_type >= 0 && lg_type >= 0) {
+    const int types = CachedData.martini_types();
+    if (rec_type >= 0 && lg_type >= 0 && rec_type < types && lg_type < types) { // ENE-17(h)
       const size_t idx = static_cast<size_t>(lg_type) *
                              static_cast<size_t>(CachedData.martini_types()) +
                          static_cast<size_t>(rec_type);

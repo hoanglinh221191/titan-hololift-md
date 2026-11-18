@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 namespace titan::tabi::fmm_m2l {
@@ -19,8 +20,12 @@ struct MultiIndex {
   int z{0};
 };
 
+// A truncated Taylor jet.  Coefficients are computed through total degree
+// `order` only; a coefficient never depends on higher-degree ones, so a jet
+// truncated at a lower order has exactly the same leading coefficients.
 struct Jet8 {
   std::array<double, kJetSize> coeff{};
+  int order{kCartesianCompressedGreenOrder};
 };
 
 std::size_t cube_index(int x, int y, int z) noexcept {
@@ -69,14 +74,17 @@ double power(double value, int exponent) noexcept {
   return result;
 }
 
-Jet8 constant(double value) noexcept {
+Jet8 constant(double value,
+              int order = kCartesianCompressedGreenOrder) noexcept {
   Jet8 result;
+  result.order = order;
   result.coeff[cube_index(0, 0, 0)] = value;
   return result;
 }
 
-Jet8 variable(double value, int axis) noexcept {
-  Jet8 result = constant(value);
+Jet8 variable(double value, int axis,
+              int order = kCartesianCompressedGreenOrder) noexcept {
+  Jet8 result = constant(value, order);
   result.coeff[cube_index(axis == 0 ? 1 : 0, axis == 1 ? 1 : 0,
                            axis == 2 ? 1 : 0)] = 1.0;
   return result;
@@ -84,7 +92,8 @@ Jet8 variable(double value, int axis) noexcept {
 
 Jet8 add(const Jet8 &a, const Jet8 &b) noexcept {
   Jet8 result;
-  for (const MultiIndex &index : indices_through(kCartesianCompressedGreenOrder)) {
+  result.order = std::min(a.order, b.order);
+  for (const MultiIndex &index : indices_through(result.order)) {
     const std::size_t i = cube_index(index.x, index.y, index.z);
     result.coeff[i] = a.coeff[i] + b.coeff[i];
   }
@@ -93,7 +102,8 @@ Jet8 add(const Jet8 &a, const Jet8 &b) noexcept {
 
 Jet8 subtract(const Jet8 &a, const Jet8 &b) noexcept {
   Jet8 result;
-  for (const MultiIndex &index : indices_through(kCartesianCompressedGreenOrder)) {
+  result.order = std::min(a.order, b.order);
+  for (const MultiIndex &index : indices_through(result.order)) {
     const std::size_t i = cube_index(index.x, index.y, index.z);
     result.coeff[i] = a.coeff[i] - b.coeff[i];
   }
@@ -102,38 +112,68 @@ Jet8 subtract(const Jet8 &a, const Jet8 &b) noexcept {
 
 Jet8 scale(const Jet8 &a, double factor) noexcept {
   Jet8 result;
-  for (const MultiIndex &index : indices_through(kCartesianCompressedGreenOrder)) {
+  result.order = a.order;
+  for (const MultiIndex &index : indices_through(result.order)) {
     const std::size_t i = cube_index(index.x, index.y, index.z);
     result.coeff[i] = factor * a.coeff[i];
   }
   return result;
 }
 
+// The (a, b) coefficient pairs of every product coefficient, in the order of
+// the x, y, z loops that used to enumerate them, for the graded index list of
+// the highest order; a lower order is a prefix.
+struct ConvolutionTable {
+  std::vector<std::uint32_t> start;    // per graded index, into a/b
+  std::vector<std::uint16_t> a, b;     // cube indices
+  std::vector<std::uint16_t> out;      // cube index of each graded index
+};
+
+const ConvolutionTable &convolution_table() {
+  static const ConvolutionTable table = [] {
+    ConvolutionTable t;
+    const std::vector<MultiIndex> &indices =
+        indices_through(kCartesianCompressedGreenOrder);
+    for (const MultiIndex &index : indices) {
+      t.start.push_back(static_cast<std::uint32_t>(t.a.size()));
+      t.out.push_back(static_cast<std::uint16_t>(
+          cube_index(index.x, index.y, index.z)));
+      for (int x = 0; x <= index.x; ++x)
+        for (int y = 0; y <= index.y; ++y)
+          for (int z = 0; z <= index.z; ++z) {
+            t.a.push_back(static_cast<std::uint16_t>(cube_index(x, y, z)));
+            t.b.push_back(static_cast<std::uint16_t>(
+                cube_index(index.x - x, index.y - y, index.z - z)));
+          }
+    }
+    t.start.push_back(static_cast<std::uint32_t>(t.a.size()));
+    return t;
+  }();
+  return table;
+}
+
 Jet8 multiply(const Jet8 &a, const Jet8 &b) noexcept {
   Jet8 result;
-  for (const MultiIndex &index : indices_through(kCartesianCompressedGreenOrder)) {
+  result.order = std::min(a.order, b.order);
+  const ConvolutionTable &table = convolution_table();
+  const std::size_t count = indices_through(result.order).size();
+  for (std::size_t i = 0; i < count; ++i) {
     double value = 0.0;
-    for (int x = 0; x <= index.x; ++x) {
-      for (int y = 0; y <= index.y; ++y) {
-        for (int z = 0; z <= index.z; ++z) {
-          value += a.coeff[cube_index(x, y, z)] *
-                   b.coeff[cube_index(index.x - x, index.y - y,
-                                      index.z - z)];
-        }
-      }
-    }
-    result.coeff[cube_index(index.x, index.y, index.z)] = value;
+    for (std::uint32_t p = table.start[i]; p < table.start[i + 1]; ++p)
+      value += a.coeff[table.a[p]] * b.coeff[table.b[p]];
+    result.coeff[table.out[i]] = value;
   }
   return result;
 }
 
 Jet8 reciprocal(const Jet8 &a) noexcept {
   Jet8 result;
+  result.order = a.order;
   const double a0 = a.coeff[cube_index(0, 0, 0)];
   if (!std::isfinite(a0) || std::abs(a0) <= 1.0e-30)
     return result;
   result.coeff[cube_index(0, 0, 0)] = 1.0 / a0;
-  for (const MultiIndex &index : indices_through(kCartesianCompressedGreenOrder)) {
+  for (const MultiIndex &index : indices_through(result.order)) {
     if (index.x == 0 && index.y == 0 && index.z == 0)
       continue;
     double sum = 0.0;
@@ -155,12 +195,13 @@ Jet8 reciprocal(const Jet8 &a) noexcept {
 
 Jet8 square_root(const Jet8 &a) noexcept {
   Jet8 result;
+  result.order = a.order;
   const double a0 = a.coeff[cube_index(0, 0, 0)];
   if (!std::isfinite(a0) || a0 <= 0.0)
     return result;
   const double root = std::sqrt(a0);
   result.coeff[cube_index(0, 0, 0)] = root;
-  for (const MultiIndex &index : indices_through(kCartesianCompressedGreenOrder)) {
+  for (const MultiIndex &index : indices_through(result.order)) {
     if (index.x == 0 && index.y == 0 && index.z == 0)
       continue;
     double sum = 0.0;
@@ -184,9 +225,10 @@ Jet8 square_root(const Jet8 &a) noexcept {
 
 Jet8 exponential(const Jet8 &a) noexcept {
   Jet8 result;
+  result.order = a.order;
   result.coeff[cube_index(0, 0, 0)] =
       std::exp(a.coeff[cube_index(0, 0, 0)]);
-  for (const MultiIndex &index : indices_through(kCartesianCompressedGreenOrder)) {
+  for (const MultiIndex &index : indices_through(result.order)) {
     if (index.x == 0 && index.y == 0 && index.z == 0)
       continue;
     int axis = index.x > 0 ? 0 : (index.y > 0 ? 1 : 2);
@@ -223,48 +265,74 @@ struct KernelBase {
   Jet8 inv_r2;
   Jet8 inv_r3;
   Jet8 screened;
+  bool separated{false};  // false: coincident centres, every jet left zero
 };
 
+// need_inv_r3 = false skips 1/r^2 and 1/r^3, which only the source-normal
+// jets use; every other member is computed exactly as with it.
 KernelBase kernel_base(double tx, double ty, double tz, double sx, double sy,
-                       double sz, double kappa) noexcept {
+                       double sz, double kappa,
+                       int order = kCartesianCompressedGreenOrder,
+                       bool need_inv_r3 = true) noexcept {
   KernelBase base;
-  const Jet8 source_x = variable(sx, 0);
-  const Jet8 source_y = variable(sy, 1);
-  const Jet8 source_z = variable(sz, 2);
-  base.ux = subtract(constant(tx), source_x);
-  base.uy = subtract(constant(ty), source_y);
-  base.uz = subtract(constant(tz), source_z);
+  const Jet8 source_x = variable(sx, 0, order);
+  const Jet8 source_y = variable(sy, 1, order);
+  const Jet8 source_z = variable(sz, 2, order);
+  base.ux = subtract(constant(tx, order), source_x);
+  base.uy = subtract(constant(ty, order), source_y);
+  base.uz = subtract(constant(tz, order), source_z);
   const Jet8 r2 = add(add(multiply(base.ux, base.ux),
                           multiply(base.uy, base.uy)),
                       multiply(base.uz, base.uz));
   if (r2.coeff[cube_index(0, 0, 0)] <= 1.0e-28)
     return base;
+  base.separated = true;
   base.r = square_root(r2);
   base.inv_r = reciprocal(base.r);
-  base.inv_r2 = multiply(base.inv_r, base.inv_r);
-  base.inv_r3 = multiply(base.inv_r2, base.inv_r);
+  if (need_inv_r3) {
+    base.inv_r2 = multiply(base.inv_r, base.inv_r);
+    base.inv_r3 = multiply(base.inv_r2, base.inv_r);
+  }
   base.screened = exponential(scale(base.r, -std::max(0.0, kappa)));
   return base;
 }
 
-Jet8 green_jet(double tx, double ty, double tz, double sx, double sy,
-               double sz, double kappa) noexcept {
-  const KernelBase base = kernel_base(tx, ty, tz, sx, sy, sz, kappa);
+// The base of the same geometry at another kappa: only the screening depends
+// on kappa, so this equals kernel_base(..., kappa, ...) member for member.
+KernelBase with_screening(const KernelBase &base, double kappa) noexcept {
+  KernelBase result = base;
+  if (base.separated)
+    result.screened = exponential(scale(base.r, -std::max(0.0, kappa)));
+  return result;
+}
+
+// kernel_base() uses kappa only through max(0, kappa) in the screening, so one
+// base per kappa serves the Green jet and all three source-normal components.
+Jet8 green_jet_from(const KernelBase &base) noexcept {
   return scale(multiply(base.screened, base.inv_r), 1.0 / (4.0 * kPi));
 }
 
-Jet8 source_normal_component_jet(double tx, double ty, double tz, double sx,
-                                 double sy, double sz, int component,
-                                 double kappa) noexcept {
-  const double safe_kappa = std::max(0.0, kappa);
-  const KernelBase base =
-      kernel_base(tx, ty, tz, sx, sy, sz, safe_kappa);
+Jet8 green_jet(double tx, double ty, double tz, double sx, double sy,
+               double sz, double kappa) noexcept {
+  return green_jet_from(kernel_base(tx, ty, tz, sx, sy, sz, kappa));
+}
+
+// exp(-kappa r) (1 + kappa r), shared by the three components.
+Jet8 screened_one_plus_kr(const KernelBase &base, double safe_kappa) noexcept {
   const Jet8 one_plus_kr =
-      add(constant(1.0), scale(base.r, safe_kappa));
+      add(constant(1.0, base.r.order), scale(base.r, safe_kappa));
+  return multiply(base.screened, one_plus_kr);
+}
+
+// u_c / r^3 does not depend on kappa: the caller forms it once per component.
+Jet8 source_normal_u_inv_r3(const KernelBase &base, int component) noexcept {
   const Jet8 &u = component == 0 ? base.ux : (component == 1 ? base.uy : base.uz);
-  return scale(multiply(multiply(base.screened, one_plus_kr),
-                        multiply(u, base.inv_r3)),
-               1.0 / (4.0 * kPi));
+  return multiply(u, base.inv_r3);
+}
+
+Jet8 source_normal_component_from(const Jet8 &screened_one_plus,
+                                  const Jet8 &u_inv_r3) noexcept {
+  return scale(multiply(screened_one_plus, u_inv_r3), 1.0 / (4.0 * kPi));
 }
 
 std::array<double, kCartesianKernelJetTermCount>
@@ -384,30 +452,67 @@ bool valid_local_order(int order) noexcept {
   return order >= 1 && order <= kCartesianLocalSourceOrder;
 }
 
+// For each (source order, target order): the kernel index and the factor
+// sign * C(gx, ax) * C(gy, ay) * C(gz, az) of every (beta, alpha) pair, row by
+// row in beta, computed by the same expression the loop used to evaluate.
+struct TranslationTable {
+  std::size_t sources{0};
+  std::size_t targets{0};
+  std::vector<std::uint16_t> kernel_index;
+  std::vector<double> factor;
+};
+
+const TranslationTable &translation_table(int source_order, int target_order) {
+  static const std::array<TranslationTable, (kCartesianLocalSourceOrder + 1) *
+                                                (kCartesianLocalTargetOrder + 1)>
+      tables = [] {
+        std::array<TranslationTable, (kCartesianLocalSourceOrder + 1) *
+                                         (kCartesianLocalTargetOrder + 1)>
+            result{};
+        for (int so = 0; so <= kCartesianLocalSourceOrder; ++so)
+          for (int to = 0; to <= kCartesianLocalTargetOrder; ++to) {
+            TranslationTable &t = result[static_cast<std::size_t>(
+                so * (kCartesianLocalTargetOrder + 1) + to)];
+            const std::vector<MultiIndex> &source = indices_through(so);
+            const std::vector<MultiIndex> &target = indices_through(to);
+            t.sources = source.size();
+            t.targets = target.size();
+            for (const MultiIndex &beta : target) {
+              const double sign =
+                  ((beta.x + beta.y + beta.z) % 2) == 0 ? 1.0 : -1.0;
+              for (const MultiIndex &alpha : source) {
+                const int gx = alpha.x + beta.x;
+                const int gy = alpha.y + beta.y;
+                const int gz = alpha.z + beta.z;
+                t.kernel_index.push_back(
+                    static_cast<std::uint16_t>(compact_index(gx, gy, gz)));
+                t.factor.push_back(sign * binomial(gx, alpha.x) *
+                                   binomial(gy, alpha.y) *
+                                   binomial(gz, alpha.z));
+              }
+            }
+          }
+        return result;
+      }();
+  return tables[static_cast<std::size_t>(
+      source_order * (kCartesianLocalTargetOrder + 1) + target_order)];
+}
+
 void translate_moments_compact(
     const std::array<double, kCartesianJcpMomentMax> &moments,
     const std::array<double, kCartesianKernelJetTermCount> &kernel,
     std::array<double, kCartesianLocalTermMax> &local, int source_order,
     int target_order) {
-  const std::vector<MultiIndex> &source =
-      indices_through(std::clamp(source_order, 0, kCartesianLocalSourceOrder));
-  const std::vector<MultiIndex> &target =
-      indices_through(std::clamp(target_order, 0, kCartesianLocalTargetOrder));
-  for (std::size_t b = 0; b < target.size(); ++b) {
-    const MultiIndex &beta = target[b];
-    const double sign = ((beta.x + beta.y + beta.z) % 2) == 0 ? 1.0 : -1.0;
+  const TranslationTable &table = translation_table(
+      std::clamp(source_order, 0, kCartesianLocalSourceOrder),
+      std::clamp(target_order, 0, kCartesianLocalTargetOrder));
+  const std::size_t sources = table.sources;
+  for (std::size_t b = 0; b < table.targets; ++b) {
+    const std::size_t row = b * sources;
     double value = 0.0;
-    for (std::size_t a = 0; a < source.size(); ++a) {
-      const MultiIndex &alpha = source[a];
-      const int gx = alpha.x + beta.x;
-      const int gy = alpha.y + beta.y;
-      const int gz = alpha.z + beta.z;
-      const std::size_t kernel_index = compact_index(gx, gy, gz);
-      const double factor =
-          sign * binomial(gx, alpha.x) * binomial(gy, alpha.y) *
-          binomial(gz, alpha.z);
-      value += moments[a] * factor * kernel[kernel_index];
-    }
+    for (std::size_t a = 0; a < sources; ++a)
+      value += moments[a] * table.factor[row + a] *
+               kernel[table.kernel_index[row + a]];
     local[b] += value;
   }
 }
@@ -496,22 +601,25 @@ CartesianJcpM2lOperatorP4 build_cartesian_jcp_m2l_operator_p4(
     double eps_ratio, double kappa) {
   CartesianJcpM2lOperatorP4 result;
   const double safe_eps = std::max(1.0e-12, eps_ratio);
-  const Jet8 green0 = green_jet(target_center_x, target_center_y,
-                                target_center_z, source_center_x,
-                                source_center_y, source_center_z, 0.0);
-  const Jet8 greenk = green_jet(target_center_x, target_center_y,
-                                target_center_z, source_center_x,
-                                source_center_y, source_center_z, kappa);
+  const double safe_kappa = std::max(0.0, kappa);
+  // Two kernel bases (kappa = 0 and kappa) instead of one per jet: the same
+  // operations, so the operator is unchanged bit for bit.
+  // The operator keeps the jets through kCartesianLocalKernelOrder only.
+  const KernelBase base0 = kernel_base(
+      target_center_x, target_center_y, target_center_z, source_center_x,
+      source_center_y, source_center_z, 0.0, kCartesianLocalKernelOrder);
+  const KernelBase basek = with_screening(base0, kappa);
+  const Jet8 green0 = green_jet_from(base0);
+  const Jet8 greenk = green_jet_from(basek);
   result.jets[0] = compact_jet(subtract(green0, greenk));
   result.jets[1] =
       compact_jet(subtract(green0, scale(greenk, 1.0 / safe_eps)));
+  const Jet8 screened0 = screened_one_plus_kr(base0, 0.0);
+  const Jet8 screenedk = screened_one_plus_kr(basek, safe_kappa);
   for (int component = 0; component < 3; ++component) {
-    const Jet8 source0 = source_normal_component_jet(
-        target_center_x, target_center_y, target_center_z, source_center_x,
-        source_center_y, source_center_z, component, 0.0);
-    const Jet8 sourcek = source_normal_component_jet(
-        target_center_x, target_center_y, target_center_z, source_center_x,
-        source_center_y, source_center_z, component, kappa);
+    const Jet8 u_inv_r3 = source_normal_u_inv_r3(base0, component);
+    const Jet8 source0 = source_normal_component_from(screened0, u_inv_r3);
+    const Jet8 sourcek = source_normal_component_from(screenedk, u_inv_r3);
     result.jets[2 + static_cast<std::size_t>(component)] =
         compact_jet(subtract(scale(sourcek, safe_eps), source0));
     result.jets[5 + static_cast<std::size_t>(component)] =
@@ -589,14 +697,17 @@ void build_cartesian_jcp_compressed_green_operator_p4_order(
     double target_center_x, double target_center_y, double target_center_z,
     double kappa, int local_order, std::span<double> coulomb,
     std::span<double> yukawa) {
-  compact_green_jet_order(
-      green_jet(target_center_x, target_center_y, target_center_z,
-                source_center_x, source_center_y, source_center_z, 0.0),
-      local_order, coulomb);
-  compact_green_jet_order(
-      green_jet(target_center_x, target_center_y, target_center_z,
-                source_center_x, source_center_y, source_center_z, kappa),
-      local_order, yukawa);
+  // Jets through the order compact_green_jet_order() keeps, one geometry for
+  // both screenings, no 1/r^3: the kept coefficients are unchanged.
+  const int order =
+      std::clamp(2 * local_order + 1, 0, kCartesianCompressedGreenOrder);
+  const KernelBase base0 =
+      kernel_base(target_center_x, target_center_y, target_center_z,
+                  source_center_x, source_center_y, source_center_z, 0.0,
+                  order, false);
+  compact_green_jet_order(green_jet_from(base0), local_order, coulomb);
+  compact_green_jet_order(green_jet_from(with_screening(base0, kappa)),
+                          local_order, yukawa);
 }
 
 CartesianJcpLocalP4 apply_cartesian_jcp_compressed_green_operator_p4(
@@ -757,6 +868,70 @@ std::array<double, 4> evaluate_cartesian_jcp_l2p_order(
   channels[3] = target.nx * k4_gradient[0] + target.ny * k4_gradient[1] +
                 target.nz * k4_gradient[2];
   return channels;
+}
+
+std::array<std::array<double, 4>, 2> evaluate_cartesian_jcp_l2p_two_orders(
+    const PrototypePanel &target, double target_center_x,
+    double target_center_y, double target_center_z,
+    const CartesianJcpLocalP4 &local, int high_order, int low_order) noexcept {
+  // One pass over the graded terms of the high order: the terms of the low
+  // order are its leading terms, so the partial sums at that point are the
+  // low-order values.  Powers come from tables built by the same repeated
+  // products as power(), so both results equal two separate calls of
+  // evaluate_cartesian_jcp_l2p_order() bit for bit.
+  const int high = std::clamp(high_order, 0, kCartesianLocalTargetOrder);
+  const int low = std::clamp(std::min(low_order, high), 0, kCartesianLocalTargetOrder);
+  const std::vector<MultiIndex> &indices = indices_through(high);
+  const std::size_t low_count = indices_through(low).size();
+  const double dx = target.x - target_center_x;
+  const double dy = target.y - target_center_y;
+  const double dz = target.z - target_center_z;
+  std::array<double, kCartesianLocalTargetOrder + 1> px{}, py{}, pz{};
+  px[0] = py[0] = pz[0] = 1.0;
+  for (int k = 1; k <= high; ++k) {
+    px[static_cast<std::size_t>(k)] = px[static_cast<std::size_t>(k - 1)] * dx;
+    py[static_cast<std::size_t>(k)] = py[static_cast<std::size_t>(k - 1)] * dy;
+    pz[static_cast<std::size_t>(k)] = pz[static_cast<std::size_t>(k - 1)] * dz;
+  }
+  const auto &k1 = local.fields[static_cast<std::size_t>(JcpLocalField::K1)];
+  const auto &k2 = local.fields[static_cast<std::size_t>(JcpLocalField::K2)];
+  const auto &k3 = local.fields[static_cast<std::size_t>(JcpLocalField::K3Potential)];
+  const auto &k4 = local.fields[static_cast<std::size_t>(JcpLocalField::K4Potential)];
+  double s1 = 0.0, s2 = 0.0;
+  std::array<double, 3> g3{}, g4{};
+  std::array<std::array<double, 4>, 2> out{};
+  const auto finish = [&](std::array<double, 4> &channels) {
+    channels[0] = s1;
+    channels[1] = s2;
+    channels[2] = target.nx * g3[0] + target.ny * g3[1] + target.nz * g3[2];
+    channels[3] = target.nx * g4[0] + target.ny * g4[1] + target.nz * g4[2];
+  };
+  for (std::size_t i = 0; i < indices.size(); ++i) {
+    if (i == low_count)
+      finish(out[1]);
+    const MultiIndex &index = indices[i];
+    const std::size_t ix = static_cast<std::size_t>(index.x);
+    const std::size_t iy = static_cast<std::size_t>(index.y);
+    const std::size_t iz = static_cast<std::size_t>(index.z);
+    s1 += k1[i] * px[ix] * py[iy] * pz[iz];
+    s2 += k2[i] * px[ix] * py[iy] * pz[iz];
+    if (index.x > 0) {
+      g3[0] += static_cast<double>(index.x) * k3[i] * px[ix - 1] * py[iy] * pz[iz];
+      g4[0] += static_cast<double>(index.x) * k4[i] * px[ix - 1] * py[iy] * pz[iz];
+    }
+    if (index.y > 0) {
+      g3[1] += static_cast<double>(index.y) * k3[i] * px[ix] * py[iy - 1] * pz[iz];
+      g4[1] += static_cast<double>(index.y) * k4[i] * px[ix] * py[iy - 1] * pz[iz];
+    }
+    if (index.z > 0) {
+      g3[2] += static_cast<double>(index.z) * k3[i] * px[ix] * py[iy] * pz[iz - 1];
+      g4[2] += static_cast<double>(index.z) * k4[i] * px[ix] * py[iy] * pz[iz - 1];
+    }
+  }
+  if (low_count >= indices.size())
+    finish(out[1]);
+  finish(out[0]);
+  return out;
 }
 
 } // namespace titan::tabi::fmm_m2l

@@ -14,6 +14,7 @@
 #include "analyzer_impl.h"
 
 #include "file_sha256.h"
+#include "pbe/grid/galerkin_mg.h"
 
 #include "tabi_types.h"
 #include "titan_energy_decomposition.h"
@@ -543,375 +544,117 @@ AnalyzerImpl::NewtonCorrectionStats AnalyzerImpl::solve_newton_correction_sor(
   return stats;
 }
 
-void AnalyzerImpl::prepare_newton_correction_hierarchy(
-    const GridShape &shape, const AlignedDoubleVector &residual, double alpha,
-    double clip, double screen_scale,
-    std::vector<NewtonCorrectionLevel> &levels) const {
-  const int level_count = effective_vcycle_levels(shape);
-  levels.clear();
-  levels.resize(static_cast<std::size_t>(level_count));
-
-  auto allocate_level = [](NewtonCorrectionLevel &level,
-                           const GridShape &level_shape,
-                           double max_correction) {
-    level.shape = level_shape;
-    level.delta.assign(level_shape.n, 0.0);
-    level.rhs.assign(level_shape.n, 0.0);
-    level.eps_x.assign(level_shape.n, 0.0);
-    level.eps_y.assign(level_shape.n, 0.0);
-    level.eps_z.assign(level_shape.n, 0.0);
-    level.diag.assign(level_shape.n, 1.0);
-    level.screen.assign(level_shape.n, 0.0);
-    level.base_phi.assign(level_shape.n, 0.0);
-    level.max_correction = max_correction;
-  };
-
-  auto fill_diag = [&](NewtonCorrectionLevel &level) {
-    const GridShape &s = level.shape;
-    const std::size_t xy = s.nx * s.ny;
-    std::fill(level.diag.begin(), level.diag.end(), 1.0);
-    if (s.nx < 3 || s.ny < 3 || s.nz < 3)
-      return;
-    for (std::size_t k = 1; k + 1 < s.nz; ++k) {
-      for (std::size_t j = 1; j + 1 < s.ny; ++j) {
-        for (std::size_t i = 1; i + 1 < s.nx; ++i) {
-          const std::size_t id = idx3(i, j, k, s.nx, s.ny);
-          const double eps_sum = level.eps_x[id] + level.eps_x[id - 1] +
-                                 level.eps_y[id] + level.eps_y[id - s.nx] +
-                                 level.eps_z[id] + level.eps_z[id - xy];
-          level.diag[id] = std::max(
-              1.0e-12, eps_sum + (level.screen[id] * screen_scale) *
-                                     nonlinear_source_derivative(
-                                         level.base_phi[id], alpha, clip));
-        }
-      }
-    }
-  };
-
-  const double correction_limit = 20.0 * std::max(1.0e-12, shape.h);
-  allocate_level(levels.front(), shape, correction_limit);
-  levels.front().rhs = residual;
-  levels.front().eps_x = grid_.eps_x;
-  levels.front().eps_y = grid_.eps_y;
-  levels.front().eps_z = grid_.eps_z;
-  levels.front().screen = grid_.screen;
-  levels.front().base_phi = grid_.phi;
-  for (std::size_t k = 0; k < shape.nz; ++k) {
-    for (std::size_t j = 0; j < shape.ny; ++j) {
-      for (std::size_t i = 0; i < shape.nx; ++i) {
-        if (i == 0 || j == 0 || k == 0 || i + 1 == shape.nx ||
-            j + 1 == shape.ny || k + 1 == shape.nz) {
-          levels.front().rhs[idx3(i, j, k, shape.nx, shape.ny)] = 0.0;
-        }
-      }
-    }
-  }
-  fill_diag(levels.front());
-
-  for (std::size_t level_index = 1; level_index < levels.size();
-       ++level_index) {
-    const NewtonCorrectionLevel &fine = levels[level_index - 1];
-    NewtonCorrectionLevel &coarse = levels[level_index];
-    allocate_level(coarse, coarsen_shape(fine.shape), correction_limit);
-    for (std::size_t k = 0; k < coarse.shape.nz; ++k) {
-      const double z =
-          coarse.shape.oz + static_cast<double>(k) * coarse.shape.h;
-      for (std::size_t j = 0; j < coarse.shape.ny; ++j) {
-        const double y =
-            coarse.shape.oy + static_cast<double>(j) * coarse.shape.h;
-        for (std::size_t i = 0; i < coarse.shape.nx; ++i) {
-          const double x =
-              coarse.shape.ox + static_cast<double>(i) * coarse.shape.h;
-          const std::size_t id =
-              idx3(i, j, k, coarse.shape.nx, coarse.shape.ny);
-          double value = 0.0;
-          if (interpolate_field_value(fine.shape, fine.eps_x, x, y, z, value))
-            coarse.eps_x[id] = value;
-          if (interpolate_field_value(fine.shape, fine.eps_y, x, y, z, value))
-            coarse.eps_y[id] = value;
-          if (interpolate_field_value(fine.shape, fine.eps_z, x, y, z, value))
-            coarse.eps_z[id] = value;
-          if (interpolate_field_value(fine.shape, fine.screen, x, y, z, value))
-            coarse.screen[id] = 4.0 * value;
-          if (interpolate_field_value(fine.shape, fine.base_phi, x, y, z,
-                                      value))
-            coarse.base_phi[id] = value;
-        }
-      }
-    }
-    fill_diag(coarse);
-  }
-}
-
-AnalyzerImpl::SolveStats
-AnalyzerImpl::smooth_newton_correction_level(NewtonCorrectionLevel &level,
-                                             int iterations,
-                                             bool stop_on_convergence) const {
-  SolveStats stats;
-  if (iterations <= 0)
+// GRID-03: the Newton correction J delta = r, with J = A + diag(screen *
+// f'(phi)) in the h^2-scaled 7-point form of the grid operator, is solved by
+// CG preconditioned with the Galerkin V-cycle of the linear -pbe-multigrid
+// path, to 5 % of the starting residual (or -pbe-nl-residual), and the step
+// is then limited to |delta| <= 20 h like the relaxation solver's.
+AnalyzerImpl::NewtonCorrectionStats
+AnalyzerImpl::solve_newton_correction_vcycle(
+    const GridShape &shape, const AlignedDoubleVector &residual,
+    double residual_rms, double alpha, double clip, double screen_scale,
+    AlignedDoubleVector &delta, int max_cycles,
+    TitanExecutor &executor) const {
+  NewtonCorrectionStats stats;
+  delta.assign(shape.n, 0.0);
+  if (shape.n == 0 || residual.size() != shape.n || shape.nx < 3 ||
+      shape.ny < 3 || shape.nz < 3)
     return stats;
-  const GridShape &shape = level.shape;
-  const double omega =
-      args_.omega == "auto"
-          ? std::clamp(2.0 / (1.0 + std::sin(kPi / static_cast<double>(std::max(
-                                                       {shape.nx, shape.ny,
-                                                        shape.nz})))),
-                       1.0, 1.95)
-          : args_.omega_value;
-  const double max_correction = std::max(1.0e-12, level.max_correction);
-  for (int iter = 1; iter <= iterations; ++iter) {
-    double sumsq = 0.0;
-    double max_delta = 0.0;
-    std::size_t count = 0;
-    for (int color = 0; color < 2; ++color) {
-      for (std::size_t k = 1; k + 1 < shape.nz; ++k) {
-        for (std::size_t j = 1; j + 1 < shape.ny; ++j) {
-          const std::size_t first_i =
-              1 + (static_cast<int>((1 + j + k) & 1ULL) == color ? 0U : 1U);
-          for (std::size_t i = first_i; i + 1 < shape.nx; i += 2) {
-            const std::size_t id = idx3(i, j, k, shape.nx, shape.ny);
-            const double neighbor_sum =
-                level.eps_x[id] * level.delta[id + 1] +
-                level.eps_x[id - 1] * level.delta[id - 1] +
-                level.eps_y[id] * level.delta[id + shape.nx] +
-                level.eps_y[id - shape.nx] * level.delta[id - shape.nx] +
-                level.eps_z[id] * level.delta[id + shape.nx * shape.ny] +
-                level.eps_z[id - shape.nx * shape.ny] *
-                    level.delta[id - shape.nx * shape.ny];
-            const double target =
-                std::clamp((level.rhs[id] + neighbor_sum) /
-                               std::max(1.0e-12, level.diag[id]),
-                           -max_correction, max_correction);
-            const double updated =
-                std::clamp(level.delta[id] + omega * (target - level.delta[id]),
-                           -max_correction, max_correction);
-            const double d = updated - level.delta[id];
-            level.delta[id] = updated;
-            sumsq += d * d;
-            max_delta = std::max(max_delta, std::abs(d));
-            ++count;
-          }
-        }
-      }
-    }
-    stats.iterations = iter;
-    stats.rms = count > 0 ? std::sqrt(sumsq / static_cast<double>(count)) : 0.0;
-    stats.max_dphi = max_delta;
-    if (stop_on_convergence &&
-        (stats.rms <= args_.nl_residual || stats.max_dphi <= args_.nl_dphi)) {
-      stats.converged = true;
-      break;
-    }
-  }
-  return stats;
-}
 
-double AnalyzerImpl::compute_newton_correction_level_residual(
-    const NewtonCorrectionLevel &level, AlignedDoubleVector &residual) const {
-  const GridShape &shape = level.shape;
-  residual.assign(shape.n, 0.0);
+  const std::size_t xy = shape.nx * shape.ny;
+  AlignedDoubleVector diag(shape.n, 1.0);
+  AlignedDoubleVector rhs(shape.n, 0.0);
+  stats.residual_max = 0.0;
+  stats.jac_diag_min = std::numeric_limits<double>::max();
+  stats.jac_diag_max = 0.0;
+  stats.screen_points = 0;
+  stats.active_nonlinear_points = 0;
   double sumsq = 0.0;
   std::size_t count = 0;
   for (std::size_t k = 1; k + 1 < shape.nz; ++k) {
     for (std::size_t j = 1; j + 1 < shape.ny; ++j) {
       for (std::size_t i = 1; i + 1 < shape.nx; ++i) {
         const std::size_t id = idx3(i, j, k, shape.nx, shape.ny);
-        const double neighbor_sum =
-            level.eps_x[id] * level.delta[id + 1] +
-            level.eps_x[id - 1] * level.delta[id - 1] +
-            level.eps_y[id] * level.delta[id + shape.nx] +
-            level.eps_y[id - shape.nx] * level.delta[id - shape.nx] +
-            level.eps_z[id] * level.delta[id + shape.nx * shape.ny] +
-            level.eps_z[id - shape.nx * shape.ny] *
-                level.delta[id - shape.nx * shape.ny];
-        const double j_delta = level.diag[id] * level.delta[id] - neighbor_sum;
-        const double r = level.rhs[id] - j_delta;
-        residual[id] = r;
-        sumsq += r * r;
+        const double eps_sum = grid_.eps_x[id] + grid_.eps_x[id - 1] +
+                               grid_.eps_y[id] + grid_.eps_y[id - shape.nx] +
+                               grid_.eps_z[id] + grid_.eps_z[id - xy];
+        diag[id] = std::max(
+            1.0e-12, eps_sum + (grid_.screen[id] * screen_scale) *
+                                   nonlinear_source_derivative(grid_.phi[id],
+                                                               alpha, clip));
+        rhs[id] = residual[id];
+        sumsq += residual[id] * residual[id];
         ++count;
-      }
-    }
-  }
-  return count > 0 ? std::sqrt(sumsq / static_cast<double>(count)) : 0.0;
-}
-
-void AnalyzerImpl::restrict_newton_correction_residual(
-    const NewtonCorrectionLevel &fine, const AlignedDoubleVector &fine_residual,
-    NewtonCorrectionLevel &coarse) const {
-  std::fill(coarse.rhs.begin(), coarse.rhs.end(), 0.0);
-  std::fill(coarse.delta.begin(), coarse.delta.end(), 0.0);
-  const int weights[3] = {1, 2, 1};
-  for (std::size_t kc = 1; kc + 1 < coarse.shape.nz; ++kc) {
-    for (std::size_t jc = 1; jc + 1 < coarse.shape.ny; ++jc) {
-      for (std::size_t ic = 1; ic + 1 < coarse.shape.nx; ++ic) {
-        const std::size_t fi = std::min(fine.shape.nx - 2, 2 * ic);
-        const std::size_t fj = std::min(fine.shape.ny - 2, 2 * jc);
-        const std::size_t fk = std::min(fine.shape.nz - 2, 2 * kc);
-        double sum = 0.0;
-        int wsum = 0;
-        for (int dz = -1; dz <= 1; ++dz) {
-          const std::size_t iz = static_cast<std::size_t>(
-              std::clamp<int>(static_cast<int>(fk) + dz, 1,
-                              static_cast<int>(fine.shape.nz - 2)));
-          for (int dy = -1; dy <= 1; ++dy) {
-            const std::size_t iy = static_cast<std::size_t>(
-                std::clamp<int>(static_cast<int>(fj) + dy, 1,
-                                static_cast<int>(fine.shape.ny - 2)));
-            for (int dx = -1; dx <= 1; ++dx) {
-              const std::size_t ix = static_cast<std::size_t>(
-                  std::clamp<int>(static_cast<int>(fi) + dx, 1,
-                                  static_cast<int>(fine.shape.nx - 2)));
-              const int w = weights[dx + 1] * weights[dy + 1] * weights[dz + 1];
-              sum +=
-                  static_cast<double>(w) *
-                  fine_residual[idx3(ix, iy, iz, fine.shape.nx, fine.shape.ny)];
-              wsum += w;
-            }
-          }
-        }
-        coarse.rhs[idx3(ic, jc, kc, coarse.shape.nx, coarse.shape.ny)] =
-            wsum > 0 ? sum / static_cast<double>(wsum) : 0.0;
-      }
-    }
-  }
-}
-
-void AnalyzerImpl::prolongate_add_newton_correction(
-    const NewtonCorrectionLevel &coarse, NewtonCorrectionLevel &fine) const {
-  const double max_correction = std::max(1.0e-12, fine.max_correction);
-  const double correction_damping = 0.25;
-  for (std::size_t k = 1; k + 1 < fine.shape.nz; ++k) {
-    const double z = fine.shape.oz + static_cast<double>(k) * fine.shape.h;
-    for (std::size_t j = 1; j + 1 < fine.shape.ny; ++j) {
-      const double y = fine.shape.oy + static_cast<double>(j) * fine.shape.h;
-      for (std::size_t i = 1; i + 1 < fine.shape.nx; ++i) {
-        const double x = fine.shape.ox + static_cast<double>(i) * fine.shape.h;
-        double correction = 0.0;
-        if (interpolate_field_value(coarse.shape, coarse.delta, x, y, z,
-                                    correction)) {
-          const std::size_t id = idx3(i, j, k, fine.shape.nx, fine.shape.ny);
-          fine.delta[id] =
-              std::clamp(fine.delta[id] + correction_damping * correction,
-                         -max_correction, max_correction);
-        }
-      }
-    }
-  }
-}
-
-void AnalyzerImpl::run_newton_correction_vcycle(
-    std::vector<NewtonCorrectionLevel> &levels, std::size_t level_index) const {
-  NewtonCorrectionLevel &level = levels[level_index];
-  if (level_index + 1 >= levels.size()) {
-    smooth_newton_correction_level(level, args_.mg_coarse_iter, true);
-    return;
-  }
-
-  smooth_newton_correction_level(level, args_.mg_pre, false);
-  AlignedDoubleVector residual;
-  compute_newton_correction_level_residual(level, residual);
-  NewtonCorrectionLevel &coarse = levels[level_index + 1];
-  restrict_newton_correction_residual(level, residual, coarse);
-  run_newton_correction_vcycle(levels, level_index + 1);
-  prolongate_add_newton_correction(coarse, level);
-  smooth_newton_correction_level(level, args_.mg_post, false);
-}
-
-AnalyzerImpl::NewtonCorrectionStats
-AnalyzerImpl::solve_newton_correction_vcycle(
-    const GridShape &shape, const AlignedDoubleVector &residual,
-    double residual_rms, double alpha, double clip, double screen_scale,
-    AlignedDoubleVector &delta, int max_cycles) const {
-  NewtonCorrectionStats stats;
-  delta.assign(shape.n, 0.0);
-  if (shape.n == 0 || residual.size() != shape.n)
-    return stats;
-
-  std::vector<NewtonCorrectionLevel> levels;
-  prepare_newton_correction_hierarchy(shape, residual, alpha, clip,
-                                      screen_scale, levels);
-  stats.inner_effective = "vcycle";
-  stats.inner_levels = static_cast<int>(levels.size());
-
-  AlignedDoubleVector correction_residual;
-  stats.residual_rms = compute_newton_correction_level_residual(
-      levels.front(), correction_residual);
-  stats.residual_max = 0.0;
-  stats.jac_diag_min = std::numeric_limits<double>::max();
-  stats.jac_diag_max = 0.0;
-  stats.screen_points = 0;
-  stats.active_nonlinear_points = 0;
-  for (std::size_t k = 1; k + 1 < shape.nz; ++k) {
-    for (std::size_t j = 1; j + 1 < shape.ny; ++j) {
-      for (std::size_t i = 1; i + 1 < shape.nx; ++i) {
-        const std::size_t id = idx3(i, j, k, shape.nx, shape.ny);
-        stats.residual_max =
-            std::max(stats.residual_max, std::abs(correction_residual[id]));
-        stats.jac_diag_min =
-            std::min(stats.jac_diag_min, levels.front().diag[id]);
-        stats.jac_diag_max =
-            std::max(stats.jac_diag_max, levels.front().diag[id]);
-        if (levels.front().screen[id] > 0.0)
+        stats.residual_max = std::max(stats.residual_max, std::abs(residual[id]));
+        stats.jac_diag_min = std::min(stats.jac_diag_min, diag[id]);
+        stats.jac_diag_max = std::max(stats.jac_diag_max, diag[id]);
+        if (grid_.screen[id] > 0.0)
           ++stats.screen_points;
-        if (levels.front().screen[id] * screen_scale > 0.0)
+        if (grid_.screen[id] * screen_scale > 0.0)
           ++stats.active_nonlinear_points;
       }
     }
   }
   if (stats.jac_diag_min == std::numeric_limits<double>::max())
     stats.jac_diag_min = 0.0;
+  stats.residual_rms =
+      count > 0 ? std::sqrt(sumsq / static_cast<double>(count)) : 0.0;
+
+  galerkin_mg::Options options;
+  options.max_levels = vcycle_level_cap();
+  options.pre_sweeps = args_.mg_pre;
+  options.post_sweeps = args_.mg_post;
+  options.coarse_sweeps = args_.mg_coarse_iter;
+  options.workers = effective_workers(executor, shape.nz);
+  galerkin_mg::Hierarchy hierarchy;
+  hierarchy.build({shape.nx, shape.ny, shape.nz, grid_.eps_x.data(),
+                   grid_.eps_y.data(), grid_.eps_z.data(), diag.data()},
+                  options, executor);
+  stats.inner_effective = "vcycle";
+  stats.inner_levels = hierarchy.level_count();
 
   const double initial_correction_residual =
       std::isfinite(stats.residual_rms) ? stats.residual_rms : residual_rms;
   stats.inner_residual_before = initial_correction_residual;
-  double best_residual = stats.residual_rms;
-  int stale_cycles = 0;
+  const double correction_target =
+      std::max(args_.nl_residual, 0.05 * initial_correction_residual);
   const int cycles =
       max_cycles > 0 ? max_cycles : std::max(1, args_.nl_inner_iter);
+  const bool use_cg = args_.mg_accel == "cg" && args_.mg_pre == args_.mg_post;
+  const galerkin_mg::SolveResult solved = galerkin_mg::solve(
+      hierarchy, rhs.data(), delta.data(), cycles, use_cg,
+      [&](const galerkin_mg::IterationReport &report) {
+        stats.sweeps.iterations = report.iteration;
+        stats.sweeps.rms = report.update_rms;
+        stats.sweeps.max_dphi = report.update_max;
+        return report.residual_rms <= correction_target;
+      },
+      executor);
 
-  for (int cycle = 1; cycle <= cycles; ++cycle) {
-    const AlignedDoubleVector before = levels.front().delta;
-    run_newton_correction_vcycle(levels, 0);
-    double sumsq = 0.0;
-    double max_update = 0.0;
-    std::size_t count = 0;
-    for (std::size_t k = 1; k + 1 < shape.nz; ++k) {
-      for (std::size_t j = 1; j + 1 < shape.ny; ++j) {
-        for (std::size_t i = 1; i + 1 < shape.nx; ++i) {
-          const std::size_t id = idx3(i, j, k, shape.nx, shape.ny);
-          const double d = levels.front().delta[id] - before[id];
-          sumsq += d * d;
-          max_update = std::max(max_update, std::abs(d));
-          ++count;
-        }
+  const double max_correction = 20.0 * std::max(1.0e-12, shape.h);
+  for (double &value : delta)
+    value = std::clamp(value, -max_correction, max_correction);
+
+  // residual of the limited correction
+  AlignedDoubleVector j_delta(shape.n, 0.0);
+  hierarchy.apply_fine(delta.data(), j_delta.data(), executor);
+  sumsq = 0.0;
+  stats.residual_max = 0.0;
+  for (std::size_t k = 1; k + 1 < shape.nz; ++k) {
+    for (std::size_t j = 1; j + 1 < shape.ny; ++j) {
+      for (std::size_t i = 1; i + 1 < shape.nx; ++i) {
+        const std::size_t id = idx3(i, j, k, shape.nx, shape.ny);
+        const double r = rhs[id] - j_delta[id];
+        sumsq += r * r;
+        stats.residual_max = std::max(stats.residual_max, std::abs(r));
       }
     }
-    stats.sweeps.iterations = cycle;
-    stats.sweeps.rms =
-        count > 0 ? std::sqrt(sumsq / static_cast<double>(count)) : 0.0;
-    stats.sweeps.max_dphi = max_update;
-    stats.residual_rms = compute_newton_correction_level_residual(
-        levels.front(), correction_residual);
-    stats.residual_max = 0.0;
-    for (double r : correction_residual)
-      stats.residual_max = std::max(stats.residual_max, std::abs(r));
-    const double correction_target =
-        std::max(args_.nl_residual, 0.05 * initial_correction_residual);
-    if (stats.residual_rms <= correction_target) {
-      stats.sweeps.converged = true;
-      break;
-    }
-    if (std::isfinite(stats.residual_rms) &&
-        stats.residual_rms < best_residual * 0.999) {
-      best_residual = stats.residual_rms;
-      stale_cycles = 0;
-    } else if (++stale_cycles >= std::min(4, args_.nl_stagnation)) {
-      break;
-    }
   }
-
-  delta = levels.front().delta;
-  stats.inner_cycles = stats.sweeps.iterations;
+  stats.residual_rms =
+      count > 0 ? std::sqrt(sumsq / static_cast<double>(count)) : 0.0;
+  stats.sweeps.converged =
+      solved.converged && stats.residual_rms <= correction_target;
+  stats.inner_cycles = solved.iterations;
   stats.inner_residual_after = stats.residual_rms;
   stats.residual_decreased = std::isfinite(stats.residual_rms) &&
                              stats.residual_rms < initial_correction_residual;
@@ -926,7 +669,7 @@ AnalyzerImpl::NewtonCorrectionStats AnalyzerImpl::solve_newton_correction(
   if (inner_solver == "vcycle") {
     NewtonCorrectionStats vcycle = solve_newton_correction_vcycle(
         shape, residual, residual_rms, alpha, clip, screen_scale, delta,
-        max_iterations);
+        max_iterations, executor);
     if (vcycle.residual_decreased)
       return vcycle;
     NewtonCorrectionStats fallback = solve_newton_correction_sor(
@@ -2580,12 +2323,15 @@ AnalyzerImpl::FieldSolve AnalyzerImpl::solve_newton_nonlinear_field(
   field.pbe_model_effective = "nonlinear";
   field.nl_solver = "newton";
   if (args_.nl_inner == "auto") {
+    // GRID-04: the Galerkin V-cycle on every grid size. With default
+    // settings the SOR inner solve did not reach the residual tolerance on
+    // 1A63 at 2, 1.5 and 0.5 A (67k, 153k and 4.0M points) nor on one of the
+    // three H10 MM/PBSA frames (21k points); the V-cycle did on all of them,
+    // in fewer Newton steps. The DelPhi NWT fixture keeps SOR.
     const bool delphi_nwt_fixture =
         !args_.test_pqr.empty() && args_.surface == "delphi-vdw";
     field.nl_inner_solver =
-        delphi_nwt_fixture ? std::string("sor")
-                           : (field.shape.n > 250000 ? std::string("vcycle")
-                                                     : std::string("sor"));
+        delphi_nwt_fixture ? std::string("sor") : std::string("vcycle");
   } else {
     field.nl_inner_solver = args_.nl_inner;
   }
@@ -3122,6 +2868,16 @@ AnalyzerImpl::FieldSolve AnalyzerImpl::solve_newton_nonlinear_field(
 
   const double reported_nl_residual =
       delphi_nwt_parity_active() ? last_stats.rms : residual;
+  // GRID-04: outside the DelPhi NWT parity emulation (which keeps the
+  // DelPhi block stop), "ok" means the nonlinear residual reported below is
+  // within -pbe-nl-residual at full screening.
+  if (!delphi_nwt_parity_active() &&
+      !(final_screen_scale >= 1.0 && std::isfinite(reported_nl_residual) &&
+        reported_nl_residual <= args_.nl_residual)) {
+    if (converged)
+      stop_reason = "residual_above_tolerance";
+    converged = false;
+  }
   field.nl_iterations = total_iterations;
   field.nl_blocks = blocks;
   field.nl_max_dphi = max_step;
@@ -3198,7 +2954,8 @@ AnalyzerImpl::FieldSolve AnalyzerImpl::solve_newton_nonlinear_field(
 AnalyzerImpl::FieldSolve AnalyzerImpl::solve_nonlinear_field(
     const std::vector<Atom> &atoms, double eps_in, double eps_out, double kappa,
     TitanExecutor &executor, const FrameResult *map_result) {
-  if (args_.nl_solver == "newton" || args_.nl_multigrid == "fas")
+  // GRID-04: Newton unless Picard is asked for explicitly ("auto" = Newton)
+  if (args_.nl_solver != "picard" || args_.nl_multigrid == "fas")
     return solve_newton_nonlinear_field(atoms, eps_in, eps_out, kappa, executor,
                                         map_result);
 
@@ -3247,7 +3004,9 @@ AnalyzerImpl::FieldSolve AnalyzerImpl::solve_nonlinear_field(
     screen_scales = {1.0};
 
   AlignedDoubleVector picard_before;
+  double final_screen_scale = 0.0;
   for (double screen_scale : screen_scales) {
+    final_screen_scale = screen_scale;
     ++continuation_steps;
     double previous_residual = std::numeric_limits<double>::infinity();
     bool step_done = false;
@@ -3288,11 +3047,14 @@ AnalyzerImpl::FieldSolve AnalyzerImpl::solve_nonlinear_field(
       }
       previous_residual = residual;
 
+      // GRID-04: a small potential change ends the stage (Picard stalls well
+      // above the tolerance), but only the nonlinear residual certifies
+      // convergence: 1A63 at 0.5 A stopped here on dphi with the residual 43
+      // times -pbe-nl-residual and 9.3 kJ/mol from the converged dG_solv.
       if (last_stats.max_dphi <= args_.nl_dphi ||
           residual <= args_.nl_residual) {
-        if (screen_scale >= 1.0) {
-          last_stats.converged = true;
-        }
+        last_stats.converged =
+            screen_scale >= 1.0 && residual <= args_.nl_residual;
         step_done = true;
       }
     }
@@ -3307,6 +3069,11 @@ AnalyzerImpl::FieldSolve AnalyzerImpl::solve_nonlinear_field(
   field.nl_clipped_points = max_clipped;
   field.nl_continuation_steps = continuation_steps;
   field.nl_backtracks = backtracks;
+  // GRID-04: the final residual decides, whatever ended the iterations (a
+  // block that stopped on dphi before a backtrack included)
+  last_stats.converged = finite && final_screen_scale >= 1.0 &&
+                         std::isfinite(residual) &&
+                         residual <= args_.nl_residual;
   field.nl_status =
       finite ? (last_stats.converged ? "ok" : "nonlinear_not_converged")
              : "nonlinear_nonfinite";

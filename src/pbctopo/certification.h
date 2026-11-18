@@ -9,6 +9,7 @@
 #include <limits>
 #include <span>
 #include <unordered_set>
+#include <vector>
 
 namespace titan_pbctopo {
 
@@ -102,12 +103,43 @@ struct PbctopoStericAudit {
   bool input_valid = false;
 };
 
+// The nearest image of every topology and metadata edge of one frame.  It
+// depends on the wrapped atoms, the edges and the lattice only, not on the
+// placement being certified, so a frame computes it once
+// (build_pbctopo_edge_image_cache) instead of once per candidate.  Reading a
+// cached entry records the same lattice-query audit the query itself records,
+// so audit counts, and decisions taken on them, are those of the uncached
+// evaluation; building the cache leaves the calling thread's audit unchanged.
+struct PbctopoEdgeImageCache {
+  const PbctopoAtom *atoms = nullptr;
+  std::size_t atom_count = 0;
+  const PbctopoLocalEdge *edges = nullptr;
+  std::size_t edge_count = 0;
+  const PbctopoLatticeMetric *lattice = nullptr;
+  std::vector<PbctopoNearestImage> nearest;
+  std::vector<unsigned char> filled;
+
+  bool matches(std::span<const PbctopoAtom> wrapped_atoms,
+               std::span<const PbctopoLocalEdge> local_edges,
+               const PbctopoLatticeMetric &metric) const noexcept {
+    return atoms == wrapped_atoms.data() && atom_count == wrapped_atoms.size() &&
+           edges == local_edges.data() && edge_count == local_edges.size() &&
+           lattice == &metric && nearest.size() == local_edges.size();
+  }
+};
+
+PbctopoEdgeImageCache build_pbctopo_edge_image_cache(
+    std::span<const PbctopoAtom> wrapped_atoms,
+    std::span<const PbctopoLocalEdge> local_edges,
+    const PbctopoLatticeMetric &lattice);
+
 PbctopoImageEquationResiduals evaluate_pbctopo_image_equations(
     std::span<const PbctopoAtom> wrapped_atoms,
     std::span<const Vec3> placed_points,
     std::span<const PbctopoLocalEdge> local_edges,
     const PbctopoLatticeMetric &lattice,
-    double image_tolerance = 1.0e-6);
+    double image_tolerance = 1.0e-6,
+    const PbctopoEdgeImageCache *edge_image_cache = nullptr);
 
 PbctopoRequiredContactResiduals evaluate_pbctopo_required_contacts(
     std::span<const PbctopoAtom> atoms,

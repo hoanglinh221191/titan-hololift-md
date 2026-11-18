@@ -3066,6 +3066,23 @@ int run_pathway_pull_direction(Multi_MOL &rec, Multi_MOL &lg,
                                de_arg &DE_arguments, arguments &Arguments,
                                info &output_info, TitanExecutor &executor,
                                groups_cal &Groups_from_index_file) {
+  // Fixed/tangent controls request validated Cartesian inputs, not a native
+  // route candidate. In particular, an empty scan shell must not prevent their
+  // independent supervisor from evaluating the prescribed control direction.
+  if (const char *only = std::getenv("TITAN_PATH_CARTESIAN_ONLY"); only != nullptr) {
+    const char *audit = std::getenv("TITAN_PATH_GEOMETRY_AUDIT");
+    if (std::string_view(only) != "1" || audit == nullptr || *audit == '\0') {
+      TitanUI::print_error("Cartesian-only export requires explicit audit output");
+      return 1;
+    }
+    try {
+      titan_path::write_cartesian_audit(audit, rec, lg);
+    } catch (const std::exception &error) {
+      TitanUI::print_error(std::string("Pull-direction Cartesian audit: ") + error.what());
+      return 1;
+    }
+    return 0; // Observation export only; never authorizes MD or a direction.
+  }
   const auto built = build_path(rec, lg, Groups_from_index_file, Arguments);
   if (!built.ok) {
     TitanUI::print_error("Pull-direction pathway: " + built.error);
@@ -3094,14 +3111,6 @@ int run_pathway_pull_direction(Multi_MOL &rec, Multi_MOL &lg,
       TitanUI::print_error(std::string("Pull-direction Cartesian audit: ") + error.what());
       return 1;
     }
-  }
-  if (const char *only = std::getenv("TITAN_PATH_CARTESIAN_ONLY"); only != nullptr) {
-    const char *audit = std::getenv("TITAN_PATH_GEOMETRY_AUDIT");
-    if (std::string_view(only) != "1" || audit == nullptr || *audit == '\0') {
-      TitanUI::print_error("Cartesian-only export requires explicit audit output");
-      return 1;
-    }
-    return 0; // Observation export, never a new pulling decision.
   }
   auto previous_mode = read_previous_pathway_mode(
       output_info.get_pull_direction_status_filename());

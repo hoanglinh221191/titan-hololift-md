@@ -1,4 +1,5 @@
 #include "titan_kinetics.h"
+#include "titan_seeded_random.h"
 
 #include <Eigen/Eigenvalues>
 #include <Eigen/QR>
@@ -339,7 +340,9 @@ void TitanKinetics::solve_exact_dense_() {
   TitanUI::print_info("TICA: C0 trace = " + std::to_string(C0.trace()) +
                       ", regularization eps = " + std::to_string(epsilon));
 
+  const auto eigensolve_start = std::chrono::steady_clock::now();
   Eigen::GeneralizedSelfAdjointEigenSolver<Eigen::MatrixXd> solver(Ctau, C0);
+  timing_stats_.dense_eigensolve_seconds += seconds_since(eigensolve_start);
   if (solver.info() != Eigen::Success) {
     throw std::runtime_error(
         "TICA: GeneralizedSelfAdjointEigenSolver failed to converge.");
@@ -378,8 +381,12 @@ Eigen::MatrixXd TitanKinetics::build_exact_dual_basis_() {
   centered.rowwise() -= mean_.transpose();
   timing_stats_.exact_dual_center_seconds += seconds_since(center_start);
 
+  // KIN-03: divide-and-conquer SVD. Only the span of the retained right
+  // singular vectors enters the reduced solve, and BDCSVD returns the same
+  // span as the one-sided Jacobi SVD at a fraction of its cost on an
+  // n_frames x D matrix.
   const auto svd_start = std::chrono::steady_clock::now();
-  Eigen::JacobiSVD<Eigen::MatrixXd> svd(centered, Eigen::ComputeThinV);
+  Eigen::BDCSVD<Eigen::MatrixXd> svd(centered, Eigen::ComputeThinV);
   timing_stats_.exact_dual_svd_seconds += seconds_since(svd_start);
   ++timing_stats_.exact_dual_svd_calls;
   const int rank = singular_rank(svd.singularValues(), dim_);
@@ -405,11 +412,10 @@ Eigen::MatrixXd TitanKinetics::build_randomized_basis_() {
   const int sketch_rank =
       std::min({dim_, static_cast<int>(n_frames_), target_rank + oversample});
 
-  std::mt19937 rng(12345u);
-  std::normal_distribution<double> normal(0.0, 1.0);
-  Eigen::MatrixXd omega =
-      Eigen::MatrixXd::NullaryExpr(dim_, sketch_rank,
-                                   [&]() { return normal(rng); });
+  // KIN-08/X-06: Gaussian sketch from the -msm-seed (was a fixed 12345 with
+  // std::normal_distribution, whose values depend on the standard library)
+  const Eigen::MatrixXd omega =
+      titan_random::gaussian_block(dim_, sketch_rank, random_seed_);
 
   RowVectorXd mean_row = mean_.transpose();
   RowVectorXd centered(dim_);
@@ -716,6 +722,63 @@ void TitanKinetics::solve_exact_dual_() {
   solve_reduced_from_basis_(basis, "exact_dual");
 }
 
+// KIN-25: with fewer frames than features the centred data span at most
+// N - 1 directions, so exact_streaming solves in that span (the exact_dual
+// route on the spooled frames, O(N^2 D)) instead of the D x D generalized
+// eigenproblem (O(D^3)): same eigenvalues and eigenvectors (H10, 370 frames,
+// D = 3486: 0.3 s instead of 31-45 s).
+Eigen::MatrixXd TitanKinetics::build_spool_dual_basis_() {
+  const auto center_start = std::chrono::steady_clock::now();
+  std::ifstream in(spool_path_, std::ios::binary);
+  if (!in.is_open()) {
+    throw std::runtime_error(
+        "TICA exact_streaming: cannot open spool file for the data-span basis.");
+  }
+  Eigen::MatrixXd centered(n_frames_, dim_);
+  std::vector<double> row_buffer(static_cast<size_t>(dim_));
+  for (int64_t i = 0; i < n_frames_; ++i) {
+    in.read(reinterpret_cast<char *>(row_buffer.data()),
+            static_cast<std::streamsize>(dim_ * sizeof(double)));
+    if (!in) {
+      throw std::runtime_error(
+          "TICA exact_streaming: short read while building the data-span basis.");
+    }
+    centered.row(i) =
+        Eigen::Map<const RowVectorXd>(row_buffer.data(), dim_) - mean_.transpose();
+  }
+  timing_stats_.spool_read_bytes += static_cast<uint64_t>(n_frames_) *
+                                    static_cast<uint64_t>(dim_) * sizeof(double);
+  timing_stats_.exact_dual_center_seconds += seconds_since(center_start);
+
+  const auto svd_start = std::chrono::steady_clock::now();
+  Eigen::BDCSVD<Eigen::MatrixXd> svd(centered, Eigen::ComputeThinV);
+  timing_stats_.exact_dual_svd_seconds += seconds_since(svd_start);
+  ++timing_stats_.exact_dual_svd_calls;
+  const int rank = singular_rank(svd.singularValues(), dim_);
+  if (rank <= 0) {
+    throw std::runtime_error(
+        "TICA exact_streaming: centered feature matrix is rank-deficient.");
+  }
+  TitanUI::print_info("TICA exact_streaming: " + std::to_string(n_frames_) +
+                      " frames < D = " + std::to_string(dim_) +
+                      ", solved in the data span (rank " + std::to_string(rank) +
+                      ")");
+  return svd.matrixV().leftCols(rank);
+}
+
+// KIN-25: an eigenvector's sign is arbitrary, and different solvers return
+// different signs. The component of largest magnitude (first one on a tie)
+// is made positive so that every backend writes the same vectors and
+// projections.
+void TitanKinetics::apply_eigenvector_sign_convention_() {
+  for (int c = 0; c < retained_components_; ++c) {
+    Eigen::Index pivot = 0;
+    eigenvectors_.col(c).cwiseAbs().maxCoeff(&pivot);
+    if (eigenvectors_(pivot, c) < 0.0)
+      eigenvectors_.col(c) *= -1.0;
+  }
+}
+
 void TitanKinetics::solve_randomized_() {
   Eigen::MatrixXd basis = build_randomized_basis_();
   solve_reduced_from_basis_(basis, "randomized");
@@ -750,7 +813,11 @@ void TitanKinetics::solve_tica() {
       break;
     case TicaBackend::ExactStreaming:
       close_spool_writer_();
-      solve_exact_dense_();
+      if (n_frames_ < dim_)
+        solve_reduced_from_basis_(build_spool_dual_basis_(),
+                                  "exact_streaming, data span");
+      else
+        solve_exact_dense_();
       break;
     case TicaBackend::ExactDual:
       solve_exact_dual_();
@@ -774,6 +841,7 @@ void TitanKinetics::solve_tica() {
                            " components retained out of requested " +
                            std::to_string(n_comp_) + ".");
   }
+  apply_eigenvector_sign_convention_();
 
   TitanUI::print_info("TICA: solved successfully. Top " +
                       std::to_string(retained_components_) +

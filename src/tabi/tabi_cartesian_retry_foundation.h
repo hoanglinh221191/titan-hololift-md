@@ -138,6 +138,8 @@ fingerprint_cartesian_retry_geometry(std::span<const Panel> panels) noexcept {
     if (!detail::mix_xyz(hash, panel.x, panel.y, panel.z) ||
         !detail::mix_xyz(hash, source_x, source_y, source_z) ||
         !detail::mix_xyz(hash, panel.nx, panel.ny, panel.nz) ||
+        !detail::mix_xyz(hash, panel_source_nx(panel), panel_source_ny(panel),
+                         panel_source_nz(panel)) ||
         !detail::mix_double(hash, panel.area) || !(panel.area > 0.0) ||
         !detail::mix_double(hash, panel.diagonal) ||
         !detail::mix_double(hash, panel.solid_angle))

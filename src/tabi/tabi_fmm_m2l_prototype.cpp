@@ -3,6 +3,7 @@
 #include "tabi/tabi_fmm_m2l_fallback.h"
 #include "tabi/tabi_fmm_m2l_local.h"
 #include "tabi/tabi_near.h"
+#include "tabi/tabi_node_patch_curved.h"
 #include "tabi/tabi_types.h"
 
 #include "aligned_allocator.h"
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <iostream>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -581,6 +583,11 @@ bool finite_vector(const AlignedDoubleVector &values) {
                      [](double value) { return std::isfinite(value); });
 }
 
+// The degree-one (p1) moments of a source cell about its centre q: of the
+// single-layer density A dphi, the monopole and dipole; of the double-layer
+// density A phi n, the vector monopole and its first moment
+// phi_n_p[3 b + c] = sum A phi n_b (y_c - q_c), which K2 and K4 need for
+// degree one as the dipole serves K1 and K3.
 struct PanelSourceMoments {
   double q_phin = 0.0;
   double phin_px = 0.0;
@@ -589,6 +596,7 @@ struct PanelSourceMoments {
   double phi_nx = 0.0;
   double phi_ny = 0.0;
   double phi_nz = 0.0;
+  std::array<double, 9> phi_n_p{};
 };
 
 using JcpChannelValues = std::array<double, 4>;
@@ -640,6 +648,18 @@ double source_z(const PrototypePanel &panel) noexcept {
   return panel.has_source_quadrature_center ? panel.source_z : panel.z;
 }
 
+double source_nx(const PrototypePanel &panel) noexcept {
+  return panel.has_source_quadrature_center ? panel.source_nx : panel.nx;
+}
+
+double source_ny(const PrototypePanel &panel) noexcept {
+  return panel.has_source_quadrature_center ? panel.source_ny : panel.ny;
+}
+
+double source_nz(const PrototypePanel &panel) noexcept {
+  return panel.has_source_quadrature_center ? panel.source_nz : panel.nz;
+}
+
 PointSoA make_panel_source_points(const std::vector<PrototypePanel> &panels) {
   PointSoA points;
   points.x.reserve(panels.size());
@@ -662,25 +682,39 @@ void compute_panel_source_moments_into(
     const std::vector<double> &phin_values,
     std::vector<PanelSourceMoments> &moments) {
   moments.assign(tree.cells.size(), PanelSourceMoments{});
+  // The moments of a cell summed over its own sources.
+  const auto from_sources = [&](const Cell &cell) {
+    PanelSourceMoments acc;
+    for (std::size_t pos = cell.begin; pos < cell.end; ++pos) {
+      const std::size_t source_index = tree.order[pos];
+      const PrototypePanel &source = panels[source_index];
+      const std::array<double, 3> offset{source_x(source) - cell.qx,
+                                         source_y(source) - cell.qy,
+                                         source_z(source) - cell.qz};
+      const double q_phin = source.area * phin_values[source_index];
+      acc.q_phin += q_phin;
+      acc.phin_px += q_phin * offset[0];
+      acc.phin_py += q_phin * offset[1];
+      acc.phin_pz += q_phin * offset[2];
+      const double q_phi = source.area * phi_values[source_index];
+      const std::array<double, 3> qn{q_phi * source_nx(source),
+                                     q_phi * source_ny(source),
+                                     q_phi * source_nz(source)};
+      acc.phi_nx += qn[0];
+      acc.phi_ny += qn[1];
+      acc.phi_nz += qn[2];
+      for (int b = 0; b < 3; ++b)
+        for (int c = 0; c < 3; ++c)
+          acc.phi_n_p[3 * b + c] += qn[b] * offset[c];
+    }
+    return acc;
+  };
   for (std::size_t reverse = tree.cells.size(); reverse > 0; --reverse) {
     const std::size_t node_index = reverse - 1u;
     const Cell &cell = tree.cells[node_index];
     PanelSourceMoments acc;
     if (cell.is_leaf()) {
-      for (std::size_t pos = cell.begin; pos < cell.end; ++pos) {
-        const std::size_t source_index = tree.order[pos];
-        const PrototypePanel &source = panels[source_index];
-        const double phin = phin_values[source_index];
-        const double q_phin = source.area * phin;
-        acc.q_phin += q_phin;
-        acc.phin_px += q_phin * (source_x(source) - cell.qx);
-        acc.phin_py += q_phin * (source_y(source) - cell.qy);
-        acc.phin_pz += q_phin * (source_z(source) - cell.qz);
-        const double q_phi = source.area * phi_values[source_index];
-        acc.phi_nx += q_phi * source.nx;
-        acc.phi_ny += q_phi * source.ny;
-        acc.phi_nz += q_phi * source.nz;
-      }
+      acc = from_sources(cell);
     } else {
       const std::array<int, 2> children{cell.left, cell.right};
       bool valid_children = true;
@@ -703,23 +737,19 @@ void compute_panel_source_moments_into(
         acc.phi_nx += source.phi_nx;
         acc.phi_ny += source.phi_ny;
         acc.phi_nz += source.phi_nz;
+        // The first moment shifted from the child's centre to this one.
+        const std::array<double, 3> qn{source.phi_nx, source.phi_ny,
+                                       source.phi_nz};
+        const std::array<double, 3> shift{child_cell.qx - cell.qx,
+                                          child_cell.qy - cell.qy,
+                                          child_cell.qz - cell.qz};
+        for (int b = 0; b < 3; ++b)
+          for (int c = 0; c < 3; ++c)
+            acc.phi_n_p[3 * b + c] +=
+                source.phi_n_p[3 * b + c] + qn[b] * shift[c];
       }
-      if (!valid_children) {
-        acc = PanelSourceMoments{};
-        for (std::size_t pos = cell.begin; pos < cell.end; ++pos) {
-          const std::size_t source_index = tree.order[pos];
-          const PrototypePanel &source = panels[source_index];
-          const double q_phin = source.area * phin_values[source_index];
-          acc.q_phin += q_phin;
-          acc.phin_px += q_phin * (source_x(source) - cell.qx);
-          acc.phin_py += q_phin * (source_y(source) - cell.qy);
-          acc.phin_pz += q_phin * (source_z(source) - cell.qz);
-          const double q_phi = source.area * phi_values[source_index];
-          acc.phi_nx += q_phi * source.nx;
-          acc.phi_ny += q_phi * source.ny;
-          acc.phi_nz += q_phi * source.nz;
-        }
-      }
+      if (!valid_children)
+        acc = from_sources(cell);
     }
     moments[node_index] = acc;
   }
@@ -758,8 +788,9 @@ JcpChannelValues jcp_direct_pair_channels(const PrototypePanel &target,
   const double inv_r3 = inv_r2 * inv_r;
   const double expkr = std::exp(-kk * r);
   const double one_plus_kr = 1.0 + kk * r;
-  const double source_projection =
-      source.nx * ux + source.ny * uy + source.nz * uz;
+  const double snx = source_nx(source), sny = source_ny(source),
+               snz = source_nz(source);
+  const double source_projection = snx * ux + sny * uy + snz * uz;
   const double target_projection =
       target.nx * ux + target.ny * uy + target.nz * uz;
   const double phin = source_phin;
@@ -771,8 +802,7 @@ JcpChannelValues jcp_direct_pair_channels(const PrototypePanel &target,
   const double target_dk = expkr * one_plus_kr * target_d0;
   const double nxu = target_projection * inv_r;
   const double nyu = source_projection * inv_r;
-  const double nxny =
-      target.nx * source.nx + target.ny * source.ny + target.nz * source.nz;
+  const double nxny = target.nx * snx + target.ny * sny + target.nz * snz;
   const double nxu_nyu = nxu * nyu;
   const double tangent_metric = nxny - nxu_nyu;
   const double mixed0 = inv_four_pi * inv_r3 * (nxny - 3.0 * nxu_nyu);
@@ -877,14 +907,14 @@ JcpChannelValues jcp_far_cell_channels(const PrototypePanel &target,
       moments.phi_nx * ux + moments.phi_ny * uy + moments.phi_nz * uz;
   const double source_d0 = inv_four_pi * source_normal_projection * inv_r3;
   const double source_dk = expkr * one_plus_kr * source_d0;
-  const double k2 = safe_eps_ratio * source_dk - source_d0;
+  double k2 = safe_eps_ratio * source_dk - source_d0;
 
   const double target_projection =
       target.nx * ux + target.ny * uy + target.nz * uz;
   const double target_d0 =
       -inv_four_pi * target_projection * inv_r3 * moments.q_phin;
   const double target_dk = expkr * one_plus_kr * target_d0;
-  const double k3 = target_d0 - inv_eps_ratio * target_dk;
+  double k3 = target_d0 - inv_eps_ratio * target_dk;
 
   const double nxu = target_projection * inv_r;
   const double nyu = source_normal_projection * inv_r;
@@ -897,7 +927,59 @@ JcpChannelValues jcp_far_cell_channels(const PrototypePanel &target,
   const double fsecond_k = expkr * inv_four_pi *
                            (kk * kk * inv_r + 2.0 * kk * inv_r2 + 2.0 * inv_r3);
   const double mixedk = -fsecond_k * nxu_nyu - fprime_k_over_r * tangent_metric;
-  const double k4 = mixedk - mixed0;
+  double k4 = mixedk - mixed0;
+
+  // Degree one for K2, K3 and K4, as the dipole above gives K1.  With
+  // u = x - q, a source at q + d and a radial f, the Taylor term of
+  // f(|u - d|) is -d . grad f, and
+  //   d_a d_b f = f'' u_a u_b + (f'/r)(delta_ab - u_a u_b)          (u unit)
+  //   d_a d_b d_c f = A3 u_a u_b u_c + B3 (delta_ab u_c + delta_ac u_b
+  //                   + delta_bc u_a),  A3 = f''' - 3 f''/r + 3 f'/r^2,
+  //                   B3 = f''/r - f'/r^2.
+  // K2 = n_y . (-grad H), H = eps Gk - G0: term  M : grad grad H.
+  // K3 = n_x . grad P, P = G0 - Gk/eps: term  -n_x . grad grad P . p.
+  // K4 = n_x . grad grad (G0 - Gk) . n_y: term
+  //      -sum n_x,a M_bc d_a d_b d_c (G0 - Gk).
+  // M = phi_n_p (sum A phi n_b d_c), p = (phin_px, phin_py, phin_pz).
+  {
+    const double hx = ux * inv_r, hy = uy * inv_r, hz = uz * inv_r;
+    const std::array<double, 3> hat{hx, hy, hz};
+    const std::array<double, 3> nx{target.nx, target.ny, target.nz};
+    const auto &m = moments.phi_n_p;
+    double umu = 0.0, nmu = 0.0, umn = 0.0;
+    for (int b = 0; b < 3; ++b)
+      for (int c = 0; c < 3; ++c) {
+        umu += hat[b] * m[3 * b + c] * hat[c];
+        nmu += nx[b] * m[3 * b + c] * hat[c];
+        umn += hat[b] * m[3 * b + c] * nx[c];
+      }
+    const double trace = m[0] + m[4] + m[8];
+    const double hess0 = inv_four_pi * inv_r3; // G0: f'' = 2 h, f'/r = -h
+    k2 += safe_eps_ratio *
+              (fsecond_k * umu + fprime_k_over_r * (trace - umu)) -
+          hess0 * (3.0 * umu - trace);
+
+    const double np = target.nx * moments.phin_px +
+                      target.ny * moments.phin_py + target.nz * moments.phin_pz;
+    const double pu = (moments.phin_px * ux + moments.phin_py * uy +
+                       moments.phin_pz * uz) *
+                      inv_r;
+    const double hess_p0 = hess0 * (3.0 * nxu * pu - np);
+    const double hess_pk =
+        fsecond_k * nxu * pu + fprime_k_over_r * (np - nxu * pu);
+    k3 -= hess_p0 - inv_eps_ratio * hess_pk;
+
+    const double inv_r4 = inv_r2 * inv_r2;
+    const double kr = kk * r;
+    const double a3_0 = -15.0 * inv_four_pi * inv_r4;
+    const double b3_0 = 3.0 * inv_four_pi * inv_r4;
+    const double a3_k = -expkr * inv_four_pi * inv_r4 *
+                        (((kr + 6.0) * kr + 15.0) * kr + 15.0);
+    const double b3_k = expkr * inv_four_pi * inv_r4 * ((kr + 3.0) * kr + 3.0);
+    const double t_term = nxu * umu;
+    const double s_term = nmu + umn + nxu * trace;
+    k4 += (a3_k - a3_0) * t_term + (b3_k - b3_0) * s_term;
+  }
 
   channels[0] = k1;
   channels[1] = k2;
@@ -969,6 +1051,294 @@ std::uint64_t rademacher_hash(std::size_t panel_id,
   return value ^ (value >> 31);
 }
 
+// A packed near loop evaluates every listed non-self pair with the one-point
+// centroid kernel.  For node-patch sources the near kernel integrates some
+// pairs over the patch instead - the one-ring (7ba6ee23), and on the FMM route
+// the curved near zone (geometric_buffer) - so those pairs need K_patch -
+// K_centroid added back, or the accelerated operator is not the one the dense
+// audit rows and the ILU blocks apply: production and the Cartesian full
+// route once disagreed by 81% on barstar with zero far pairs
+// (docs/TITAN_NODE_PATCH_ROOT_CAUSE_2026-09-16.md).  A near worklist is
+// immutable across Krylov applies, so the deltas are built once with the
+// packed plan and only contracted with the densities afterwards.
+struct NodePatchNearCorrection {
+  std::uint32_t target{0};
+  std::uint32_t source{0};
+  double dk1{0.0};
+  double dk2{0.0};
+  double dk3{0.0};
+  double dk4{0.0};
+};
+
+// The curved values can take adaptive quadrature, so leaves are visited in
+// parallel and their corrections joined in leaf order: the list, and so every
+// apply, does not depend on the thread count.  Uncoupled runs carry only K2.
+// The pairs that can need a correction are known from the geometry: the
+// one-ring, and for a curved cell the near-zone targets stored with each
+// source cell.  Visiting only those, instead of every pair of a near list
+// (about 3,300 per row on a 21k-node protein), keeps the list and its order -
+// span by span, ascending position - exactly what the full scan produced.
+// Returns false when panels are not node patches in node order.
+bool node_patch_correction_candidates(
+    const std::vector<TitanPBE::Tabi::Panel> &np,
+    std::vector<std::size_t> &offsets, std::vector<std::size_t> &sources) {
+  if (np.empty() || np.front().node_patch_geometry == nullptr)
+    return false;
+  const auto &geometry = *np.front().node_patch_geometry;
+  const std::size_t n = np.size();
+  if (geometry.adjacent_offsets.size() != n + 1)
+    return false;
+  for (std::size_t k = 0; k < n; ++k)
+    if (np[k].node_patch_index != k ||
+        np[k].node_patch_geometry.get() != &geometry)
+      return false;
+  const auto *curved = geometry.curved.get();
+  if (curved != nullptr && curved->cells.size() != n)
+    return false;
+  offsets.assign(n + 1, 0);
+  // Symmetric one-ring, plus each curved source's near-zone targets.
+  for (std::size_t t = 0; t < n; ++t)
+    offsets[t + 1] += geometry.adjacent_offsets[t + 1] - geometry.adjacent_offsets[t];
+  if (curved != nullptr)
+    for (std::size_t j = 0; j < n; ++j)
+      for (const std::size_t t : curved->cells[j].near_targets)
+        if (t != j)
+          ++offsets[t + 1];
+  for (std::size_t t = 0; t < n; ++t)
+    offsets[t + 1] += offsets[t];
+  sources.assign(offsets[n], 0);
+  std::vector<std::size_t> fill(offsets.begin(), offsets.end() - 1);
+  for (std::size_t t = 0; t < n; ++t)
+    for (std::size_t p = geometry.adjacent_offsets[t];
+         p < geometry.adjacent_offsets[t + 1]; ++p)
+      sources[fill[t]++] = geometry.adjacent_nodes[p];
+  if (curved != nullptr)
+    for (std::size_t j = 0; j < n; ++j)
+      for (const std::size_t t : curved->cells[j].near_targets)
+        if (t != j)
+          sources[fill[t]++] = j;
+  // A one-ring neighbour of a curved cell is also among its near targets.
+  std::vector<std::size_t> unique_offsets(n + 1, 0), unique_sources;
+  unique_sources.reserve(sources.size());
+  for (std::size_t t = 0; t < n; ++t) {
+    auto first = sources.begin() + static_cast<std::ptrdiff_t>(offsets[t]);
+    auto last = sources.begin() + static_cast<std::ptrdiff_t>(offsets[t + 1]);
+    std::sort(first, last);
+    unique_sources.insert(unique_sources.end(), first, std::unique(first, last));
+    unique_offsets[t + 1] = unique_sources.size();
+  }
+  offsets.swap(unique_offsets);
+  sources.swap(unique_sources);
+  return true;
+}
+
+// Clipped sphere-patch triangles: the near-pair dispatcher integrates the self
+// pair and every pair sharing a vertex over the curved patches
+// (sphere_coupled_near), and every other pair with the one-point rule.  The
+// candidates are therefore the vertex-sharing pairs, as shared_vertex_count()
+// counts them.
+bool sphere_patch_correction_candidates(
+    const std::vector<TitanPBE::Tabi::Panel> &np,
+    std::vector<std::size_t> &offsets, std::vector<std::size_t> &sources) {
+  constexpr std::size_t none = static_cast<std::size_t>(-1);
+  if (np.empty() || np.front().sphere_patch_quadrature == nullptr)
+    return false;
+  const std::size_t n = np.size();
+  std::size_t vertex_count = 0;
+  for (const auto &p : np) {
+    if (!p.has_triangle_geometry || p.sphere_patch_quadrature == nullptr)
+      return false;
+    for (const std::size_t v : {p.v0_index, p.v1_index, p.v2_index})
+      if (v != none)
+        vertex_count = std::max(vertex_count, v + 1);
+  }
+  std::vector<std::size_t> vertex_offsets(vertex_count + 1, 0);
+  for (const auto &p : np)
+    for (const std::size_t v : {p.v0_index, p.v1_index, p.v2_index})
+      if (v != none)
+        ++vertex_offsets[v + 1];
+  for (std::size_t v = 0; v < vertex_count; ++v)
+    vertex_offsets[v + 1] += vertex_offsets[v];
+  std::vector<std::size_t> vertex_panels(vertex_offsets[vertex_count]);
+  std::vector<std::size_t> fill(vertex_offsets.begin(), vertex_offsets.end() - 1);
+  for (std::size_t k = 0; k < n; ++k)
+    for (const std::size_t v : {np[k].v0_index, np[k].v1_index, np[k].v2_index})
+      if (v != none)
+        vertex_panels[fill[v]++] = k;
+  offsets.assign(n + 1, 0);
+  sources.clear();
+  std::vector<std::size_t> row;
+  for (std::size_t t = 0; t < n; ++t) {
+    row.clear();
+    for (const std::size_t v : {np[t].v0_index, np[t].v1_index, np[t].v2_index}) {
+      if (v == none)
+        continue;
+      for (std::size_t q = vertex_offsets[v]; q < vertex_offsets[v + 1]; ++q)
+        if (vertex_panels[q] != t)
+          row.push_back(vertex_panels[q]);
+    }
+    std::sort(row.begin(), row.end());
+    row.erase(std::unique(row.begin(), row.end()), row.end());
+    sources.insert(sources.end(), row.begin(), row.end());
+    offsets[t + 1] = sources.size();
+  }
+  return true;
+}
+
+// near_spans_too: the packed near loop sums the one-point kernel over the
+// near lists too, so it needs the corrections of the near-list pairs as well
+// as of the far-classified ones; a scalar near loop evaluates near-list pairs
+// with their curved value and needs only the far-classified ones.
+std::vector<NodePatchNearCorrection> build_node_patch_near_corrections(
+    const std::vector<PackedFallbackLeafInput> &leaves,
+    const std::vector<std::size_t> &source_order,
+    const std::vector<TitanPBE::Tabi::Panel> &np, double eps_ratio,
+    double kappa, bool coupled, TitanExecutor &executor,
+    bool near_spans_too = true) {
+  const double pair_kappa = coupled ? kappa : 0.0;
+  std::vector<std::vector<NodePatchNearCorrection>> per_leaf(leaves.size());
+  const auto correct = [&](std::vector<NodePatchNearCorrection> &out,
+                           std::size_t target, std::size_t source) {
+    const auto analytic = TitanPBE::Tabi::evaluate_jcp_near_pair_kernel(
+        np[target], target, np[source], source, eps_ratio, pair_kappa, coupled,
+        "analytic_singular", "off", nullptr);
+    if (!analytic.valid || !(analytic.one_ring || analytic.geometric_buffer))
+      return;
+    const auto centroid = TitanPBE::Tabi::evaluate_jcp_centroid_monopole_kernel(
+        np[target], np[source], eps_ratio, pair_kappa);
+    if (!centroid.valid)
+      throw std::runtime_error("packed node-patch near correction is invalid");
+    out.push_back({static_cast<std::uint32_t>(target),
+                   static_cast<std::uint32_t>(source),
+                   coupled ? analytic.k1 - centroid.k1 : 0.0,
+                   analytic.k2 - centroid.k2,
+                   coupled ? analytic.k3 - centroid.k3 : 0.0,
+                   coupled ? analytic.k4 - centroid.k4 : 0.0});
+  };
+  std::vector<std::size_t> candidate_offsets, candidate_sources;
+  if (node_patch_correction_candidates(np, candidate_offsets,
+                                       candidate_sources) ||
+      sphere_patch_correction_candidates(np, candidate_offsets,
+                                         candidate_sources)) {
+    std::vector<std::size_t> position(source_order.size(), SIZE_MAX);
+    for (std::size_t p = 0; p < source_order.size(); ++p)
+      if (source_order[p] < position.size())
+        position[source_order[p]] = p;
+    // A candidate whose source the tree put in the far field still takes its
+    // correction: the far field then sums the one-point kernel through the
+    // expansions, and the correction (curved minus exact one-point) brings
+    // the pair to its curved value up to the expansion error, as the direct
+    // operator and the audit rows have it.  Such pairs follow the near-list
+    // ones, by source index, so the list does not depend on the threads.
+    std::atomic<std::size_t> far_classified{0};
+    executor.parallel_for(
+        leaves.size(), executor.capacity(), 1,
+        [&](std::size_t, std::size_t begin, std::size_t end) {
+          std::vector<std::array<std::size_t, 3>> ordered; // span, pos, source
+          std::vector<std::size_t> far;
+          for (std::size_t li = begin; li < end; ++li) {
+            const PackedFallbackLeafInput &leaf = leaves[li];
+            auto &out = per_leaf[li];
+            for (const std::size_t target : leaf.target_panels) {
+              ordered.clear();
+              far.clear();
+              for (std::size_t c = candidate_offsets[target];
+                   c < candidate_offsets[target + 1]; ++c) {
+                const std::size_t source = candidate_sources[c];
+                const std::size_t pos = position[source];
+                bool found = false;
+                for (std::size_t s = 0; s < leaf.source_spans.size(); ++s) {
+                  const auto &span = leaf.source_spans[s];
+                  if (pos >= span.first_panel &&
+                      pos < span.first_panel + span.panel_count) {
+                    ordered.push_back({s, pos, source});
+                    found = true;
+                    break;
+                  }
+                }
+                if (!found && source != target)
+                  far.push_back(source);
+              }
+              std::sort(ordered.begin(), ordered.end());
+              for (const auto &entry : ordered)
+                if (near_spans_too)
+                  correct(out, target, entry[2]);
+              std::sort(far.begin(), far.end());
+              const std::size_t before = out.size();
+              for (const std::size_t source : far)
+                correct(out, target, source);
+              far_classified.fetch_add(out.size() - before,
+                                       std::memory_order_relaxed);
+            }
+          }
+        });
+    if (far_classified.load() != 0)
+      std::cerr << "TABI node-patch: " << far_classified.load()
+                << " one-ring or curved near-zone pair(s) the tree puts in "
+                   "the far field take their correction as well\n";
+  } else if (near_spans_too)
+  // No candidate list (the panels do not index one node-patch geometry in
+  // order): only near-list pairs can be found here.  A scalar loop, which
+  // asks for the far-classified pairs alone, evaluates those itself.
+  executor.parallel_for(
+      leaves.size(), executor.capacity(), 1,
+      [&](std::size_t, std::size_t begin, std::size_t end) {
+        for (std::size_t li = begin; li < end; ++li) {
+          const PackedFallbackLeafInput &leaf = leaves[li];
+          auto &out = per_leaf[li];
+          for (const std::size_t target : leaf.target_panels) {
+            for (const auto &span : leaf.source_spans) {
+              for (std::size_t pos = span.first_panel;
+                   pos < span.first_panel + span.panel_count; ++pos) {
+                const std::size_t source = source_order[pos];
+                if (source == target)
+                  continue;
+                const auto analytic =
+                    TitanPBE::Tabi::evaluate_jcp_near_pair_kernel(
+                        np[target], target, np[source], source, eps_ratio,
+                        pair_kappa, coupled, "analytic_singular", "off",
+                        nullptr);
+                if (!analytic.valid ||
+                    !(analytic.one_ring || analytic.geometric_buffer))
+                  continue;
+                const auto centroid =
+                    TitanPBE::Tabi::evaluate_jcp_centroid_monopole_kernel(
+                        np[target], np[source], eps_ratio, pair_kappa);
+                if (!centroid.valid)
+                  throw std::runtime_error(
+                      "packed node-patch near correction is invalid");
+                out.push_back({static_cast<std::uint32_t>(target),
+                               static_cast<std::uint32_t>(source),
+                               coupled ? analytic.k1 - centroid.k1 : 0.0,
+                               analytic.k2 - centroid.k2,
+                               coupled ? analytic.k3 - centroid.k3 : 0.0,
+                               coupled ? analytic.k4 - centroid.k4 : 0.0});
+              }
+            }
+          }
+        }
+      });
+  std::vector<NodePatchNearCorrection> corrections;
+  for (auto &leaf_corrections : per_leaf)
+    corrections.insert(corrections.end(), leaf_corrections.begin(),
+                       leaf_corrections.end());
+  return corrections;
+}
+
+void apply_node_patch_near_corrections(
+    const std::vector<NodePatchNearCorrection> &corrections,
+    const std::vector<double> &phi_values,
+    const std::vector<double> &phin_values, double *phi_out,
+    double *phin_out) {
+  for (const auto &c : corrections) {
+    phi_out[c.target] +=
+        c.dk2 * phi_values[c.source] + c.dk1 * phin_values[c.source];
+    if (phin_out != nullptr)
+      phin_out[c.target] +=
+          c.dk3 * phin_values[c.source] + c.dk4 * phi_values[c.source];
+  }
+}
+
 struct StaticLocalP4Plan {
   int local_order{4};
   double tolerance{2.0e-3};
@@ -983,6 +1353,11 @@ struct StaticLocalP4Plan {
   std::size_t compressed_green_term_count{0};
   std::vector<std::vector<int>> refined_fallback_sources;
   std::unique_ptr<PackedJcpFallbackPlan> packed_fallback_plan;
+  // Node-patch corrections for the packed fallback's pairs, built with it.
+  std::vector<NodePatchNearCorrection> packed_node_patch_corrections;
+  // The scalar fallback's corrections: far-classified pairs only.
+  std::vector<NodePatchNearCorrection> scalar_far_node_patch_corrections;
+  bool scalar_far_built{false};
   std::uint64_t hash{0};
   std::string refine_mode{"operator-tail-static"};
   std::size_t probe_count{4};
@@ -1060,26 +1435,12 @@ struct FmmM2lAnalyticContext::Impl {
   // Krylov apply. Build its packed representation lazily once production
   // triangle geometry is available, then only refresh density SoA values.
   mutable std::unique_ptr<PackedJcpFallbackPlan> degree1_packed_near_plan;
-  // The packed AVX2 near path evaluates every non-self pair with the centroid
-  // monopole kernel.  For coupled node-patch panels the correct one-ring rule
-  // is the patch integral (tabi_near.cpp, the `node_patch_pair &&
-  // selected.one_ring` branch added in 7ba6ee23), so those pairs need
-  // K_patch - K_centroid added back.  The Cartesian full route already does
-  // this in its own adapter; production did not, and the two operators
-  // disagreed by 81% on barstar with zero far pairs.  See
-  // docs/TITAN_NODE_PATCH_ROOT_CAUSE_2026-09-16.md.  The near worklist is
-  // immutable across Krylov applies, so the deltas are built once with the
-  // plan and only contracted with the densities afterwards.
-  struct NodePatchOneRingCorrection {
-    std::uint32_t target{0};
-    std::uint32_t source{0};
-    double dk1{0.0};
-    double dk2{0.0};
-    double dk3{0.0};
-    double dk4{0.0};
-  };
-  mutable std::vector<NodePatchOneRingCorrection>
+  // build_node_patch_near_corrections for the degree-one near plan.
+  mutable std::vector<NodePatchNearCorrection>
       degree1_packed_one_ring_corrections;
+  // The scalar near loop's corrections: far-classified pairs only.
+  mutable bool degree1_scalar_far_built{false};
+  mutable std::vector<NodePatchNearCorrection> degree1_scalar_far_corrections;
   mutable std::mutex degree1_apply_mutex;
   mutable std::vector<PanelSourceMoments> degree1_moment_workspace;
   bool local_p4_prepared{false};
@@ -1298,17 +1659,33 @@ FmmM2lAnalyticContext::overlap_panel_groups(
 }
 
 std::vector<std::vector<std::size_t>>
-FmmM2lAnalyticContext::near_panel_graph(std::size_t neighbor_cap) const {
+FmmM2lAnalyticContext::near_panel_graph(std::size_t neighbor_cap,
+                                        TitanExecutor *executor) const {
   if (impl_ == nullptr) {
     throw std::logic_error("JCP analytic FMM/M2L context is not initialized");
   }
   const std::size_t n = impl_->panels.size();
   const std::size_t cap = std::max<std::size_t>(1, neighbor_cap);
   std::vector<std::vector<std::size_t>> graph(n);
-  std::vector<std::uint32_t> seen_generation(n, 0U);
-  std::uint32_t generation = 0U;
-
-  for (const int node_index : impl_->target_tree.target_leaf_nodes) {
+  // Every panel is a target of exactly one leaf and its row depends on that
+  // leaf's near list only, so the leaves are processed in parallel, each
+  // worker with its own visit stamps.
+  const std::vector<int> &leaf_nodes = impl_->target_tree.target_leaf_nodes;
+  const std::size_t workers =
+      executor != nullptr
+          ? std::max<std::size_t>(
+                1U, std::min(executor->capacity(), leaf_nodes.size()))
+          : 1U;
+  std::vector<std::vector<std::uint32_t>> stamps(workers);
+  std::vector<std::uint32_t> generations(workers, 0U);
+  const auto build_rows = [&](std::size_t worker, std::size_t leaf_begin,
+                              std::size_t leaf_end) {
+  std::vector<std::uint32_t> &seen_generation = stamps[worker];
+  if (seen_generation.size() != n)
+    seen_generation.assign(n, 0U);
+  std::uint32_t &generation = generations[worker];
+  for (std::size_t leaf = leaf_begin; leaf < leaf_end; ++leaf) {
+    const int node_index = leaf_nodes[leaf];
     if (node_index < 0 || static_cast<std::size_t>(node_index) >=
                               impl_->target_tree.cells.size()) {
       continue;
@@ -1377,6 +1754,11 @@ FmmM2lAnalyticContext::near_panel_graph(std::size_t neighbor_cap) const {
       graph[target_panel] = std::move(row);
     }
   }
+  };
+  if (workers > 1U)
+    executor->parallel_for(leaf_nodes.size(), workers, 1U, build_rows);
+  else
+    build_rows(0U, 0U, leaf_nodes.size());
   for (std::size_t panel = 0; panel < n; ++panel) {
     if (graph[panel].empty())
       graph[panel].push_back(panel);
@@ -1605,87 +1987,81 @@ JcpAnalyticOperatorResult FmmM2lAnalyticContext::apply_into(
   const bool use_packed_near =
       use_production_near_kernel && near_integration == "analytic_singular" &&
       quad_buffer == "off" && packed_jcp_fallback_avx2_available();
+  // Target leaves with their near source spans, for the correction lists.
+  const auto degree1_leaves = [&] {
+    std::vector<PackedFallbackLeafInput> leaves;
+    leaves.reserve(impl_->target_tree.target_leaf_nodes.size());
+    for (const int target_node : impl_->target_tree.target_leaf_nodes) {
+      const Cell &target_cell =
+          impl_->target_tree.cells[static_cast<std::size_t>(target_node)];
+      const TargetLeafWork &work =
+          impl_->target_tree.work[static_cast<std::size_t>(target_node)];
+      PackedFallbackLeafInput leaf;
+      leaf.target_panels.reserve(target_cell.count());
+      for (std::size_t pos = target_cell.begin; pos < target_cell.end; ++pos)
+        leaf.target_panels.push_back(impl_->target_tree.order[pos]);
+      leaf.source_spans.reserve(work.near_sources.size());
+      for (const int source_node : work.near_sources) {
+        const Cell &source_cell =
+            impl_->source_tree.cells[static_cast<std::size_t>(source_node)];
+        leaf.source_spans.push_back(
+            {source_cell.begin, source_cell.count(), false});
+      }
+      leaves.push_back(std::move(leaf));
+    }
+    return leaves;
+  };
+  // The scalar near loop takes every near-list pair with its own (curved)
+  // value; a one-ring or curved near-zone pair the tree puts in the far
+  // field gets its correction as on the packed route.
+  const bool sphere_patch_sources =
+      production_panels != nullptr && !production_panels->empty() &&
+      production_panels->front().sphere_patch_quadrature != nullptr;
+  if (!use_packed_near && use_production_near_kernel &&
+      (node_patch_sources || sphere_patch_sources) &&
+      !impl_->degree1_scalar_far_built) {
+    impl_->degree1_scalar_far_corrections = build_node_patch_near_corrections(
+        degree1_leaves(), impl_->source_tree.order, *production_panels,
+        impl_->eps_ratio, impl_->kappa, coupled, executor, false);
+    impl_->degree1_scalar_far_built = true;
+  }
   if (use_packed_near) {
     if (impl_->degree1_packed_near_plan == nullptr) {
-      std::vector<PackedFallbackLeafInput> leaves;
-      leaves.reserve(impl_->target_tree.target_leaf_nodes.size());
-      for (const int target_node : impl_->target_tree.target_leaf_nodes) {
-        const Cell &target_cell =
-            impl_->target_tree.cells[static_cast<std::size_t>(target_node)];
-        const TargetLeafWork &work =
-            impl_->target_tree.work[static_cast<std::size_t>(target_node)];
-        PackedFallbackLeafInput leaf;
-        leaf.target_panels.reserve(target_cell.count());
-        for (std::size_t pos = target_cell.begin; pos < target_cell.end; ++pos)
-          leaf.target_panels.push_back(impl_->target_tree.order[pos]);
-        leaf.source_spans.reserve(work.near_sources.size());
-        for (const int source_node : work.near_sources) {
-          const Cell &source_cell =
-              impl_->source_tree.cells[static_cast<std::size_t>(source_node)];
-          leaf.source_spans.push_back(
-              {source_cell.begin, source_cell.count(), false});
-        }
-        leaves.push_back(std::move(leaf));
-      }
+      const std::vector<PackedFallbackLeafInput> leaves = degree1_leaves();
       impl_->degree1_packed_near_plan = std::make_unique<PackedJcpFallbackPlan>(
           build_packed_jcp_fallback_plan(
               *production_panels, impl_->source_tree.order, leaves, 4, 32));
       // Built from the same leaves the plan is built from, so the corrected
-      // pairs are exactly the pairs the packed kernel evaluated.  Only pairs
-      // the near kernel itself reports as one-ring are corrected; self pairs
+      // pairs are exactly the pairs the packed kernel evaluated; self pairs
       // already take the scalar path inside the packed loop.
       impl_->degree1_packed_one_ring_corrections.clear();
-      if (coupled && node_patch_sources) {
-        const std::vector<TitanPBE::Tabi::Panel> &np = *production_panels;
-        for (const PackedFallbackLeafInput &leaf : leaves) {
-          for (const std::size_t target : leaf.target_panels) {
-            for (const auto &span : leaf.source_spans) {
-              for (std::size_t pos = span.first_panel;
-                   pos < span.first_panel + span.panel_count; ++pos) {
-                const std::size_t source = impl_->source_tree.order[pos];
-                if (source == target)
-                  continue;
-                const auto analytic =
-                    TitanPBE::Tabi::evaluate_jcp_near_pair_kernel(
-                        np[target], target, np[source], source,
-                        impl_->eps_ratio, impl_->kappa, true,
-                        "analytic_singular", "off", nullptr);
-                if (!analytic.valid || !analytic.one_ring)
-                  continue;
-                const auto centroid =
-                    TitanPBE::Tabi::evaluate_jcp_centroid_monopole_kernel(
-                        np[target], np[source], impl_->eps_ratio,
-                        impl_->kappa);
-                if (!centroid.valid)
-                  throw std::runtime_error(
-                      "packed node-patch one-ring correction is invalid");
-                impl_->degree1_packed_one_ring_corrections.push_back(
-                    {static_cast<std::uint32_t>(target),
-                     static_cast<std::uint32_t>(source),
-                     analytic.k1 - centroid.k1, analytic.k2 - centroid.k2,
-                     analytic.k3 - centroid.k3, analytic.k4 - centroid.k4});
-              }
-            }
-          }
-        }
-      }
+      // Clipped sphere patches take their one-ring pairs from the curved
+      // dispatcher too (sphere_coupled_near), as the direct operator does.
+      if (node_patch_sources ||
+          production_panels->front().sphere_patch_quadrature != nullptr)
+        impl_->degree1_packed_one_ring_corrections =
+            build_node_patch_near_corrections(
+                leaves, impl_->source_tree.order, *production_panels,
+                impl_->eps_ratio, impl_->kappa, coupled, executor);
     }
     const PackedFallbackApplyMetrics packed = accumulate_packed_jcp_fallback(
         *impl_->degree1_packed_near_plan, *production_panels, phi_values,
         phin_values, impl_->eps_ratio, impl_->kappa, coupled, near_integration,
         quad_buffer, "packed-avx2", executor, phi_out, phin_out);
-    for (const auto &c : impl_->degree1_packed_one_ring_corrections) {
-      phi_out[c.target] +=
-          c.dk2 * phi_values[c.source] + c.dk1 * phin_values[c.source];
-      phin_out[c.target] +=
-          c.dk3 * phin_values[c.source] + c.dk4 * phi_values[c.source];
-    }
+    apply_node_patch_near_corrections(
+        impl_->degree1_packed_one_ring_corrections, phi_values, phin_values,
+        phi_out.data(), phin_out.data());
     result.near_one_ring_pairs +=
         impl_->degree1_packed_one_ring_corrections.size();
     result.near_self_pairs = packed.scalar_self_pairs;
     if (node_patch_sources) {
       result.near_duffy_pairs = packed.scalar_self_pairs;
-      result.near_kernel_policy = "packed-avx2-node-patch-self-flat-pv";
+      // Self, one-ring and (curved) near-zone pairs are replaced in both
+      // cases; the name says which cell they are integrated over.
+      result.near_kernel_policy =
+          TitanPBE::Tabi::curved_dual_cell(production_panels->front())
+              ? "packed-avx2-node-patch-curved"
+              : "packed-avx2-node-patch-flat";
     } else {
       result.near_kernel_policy = "packed-avx2-self-asi";
     }
@@ -1759,6 +2135,12 @@ JcpAnalyticOperatorResult FmmM2lAnalyticContext::apply_into(
           }
         }
       });
+  if (!use_packed_near && use_production_near_kernel && node_patch_sources) {
+    apply_node_patch_near_corrections(impl_->degree1_scalar_far_corrections,
+                                      phi_values, phin_values, phi_out.data(),
+                                      phin_out.data());
+    result.near_one_ring_pairs += impl_->degree1_scalar_far_corrections.size();
+  }
   result.apply_seconds = elapsed_seconds(apply_begin, Clock::now());
 
   if (use_production_near_kernel && !use_packed_near) {
@@ -2169,26 +2551,27 @@ FmmM2lAnalyticContext::apply_local_cartesian_candidate(
         metric.source_node = source_node;
         metric.tail_sq_by_probe.assign(probe_moments.size(), 0.0);
         metric.signal_sq_by_probe.assign(probe_moments.size(), 0.0);
+        // The translation depends on the two centres only: one build serves
+        // every probe.
+        const CartesianJcpM2lOperatorP4 m2l =
+            build_cartesian_jcp_m2l_operator_p4(
+                source_cell.qx, source_cell.qy, source_cell.qz,
+                target_cell.qx, target_cell.qy, target_cell.qz,
+                impl_->eps_ratio, impl_->kappa);
         for (std::size_t probe = 0; probe < probe_moments.size(); ++probe) {
           const CartesianJcpLocalP4 translated =
               apply_cartesian_jcp_m2l_operator_p4_order(
-                  probe_moments[probe][source_index],
-                  build_cartesian_jcp_m2l_operator_p4(
-                      source_cell.qx, source_cell.qy, source_cell.qz,
-                      target_cell.qx, target_cell.qy, target_cell.qz,
-                      impl_->eps_ratio, impl_->kappa),
-                  local_order);
+                  probe_moments[probe][source_index], m2l, local_order);
           double pair_tail_sq = 0.0;
           double pair_signal_sq = 0.0;
           const int tail_low_order = std::max(1, local_order - 1);
           for (const std::size_t target_panel : active_target_panels) {
             const PrototypePanel &target = impl_->panels[target_panel];
-            const auto p_high = evaluate_cartesian_jcp_l2p_order(
+            const auto both = evaluate_cartesian_jcp_l2p_two_orders(
                 target, target_cell.qx, target_cell.qy, target_cell.qz,
-                translated, local_order);
-            const auto p_low = evaluate_cartesian_jcp_l2p_order(
-                target, target_cell.qx, target_cell.qy, target_cell.qz,
-                translated, tail_low_order);
+                translated, local_order, tail_low_order);
+            const auto &p_high = both[0];
+            const auto &p_low = both[1];
             for (const std::pair<int, int> range :
                  {std::pair<int, int>{0, 2}, {2, 4}}) {
               const double high_row =
@@ -2406,7 +2789,9 @@ FmmM2lAnalyticContext::apply_local_cartesian_candidate(
     build_plan();
   StaticLocalP4Plan &plan = *impl_->static_local_plan;
 
-  if (fallback_mode == "packed-avx2" && !plan.packed_fallback_plan) {
+  const bool packed_fallback = fallback_mode == "packed-avx2";
+  if ((packed_fallback && !plan.packed_fallback_plan) ||
+      (fallback_mode == "scalar" && !plan.scalar_far_built)) {
     std::vector<PackedFallbackLeafInput> leaves;
     leaves.reserve(plan.target_nodes.size());
     for (std::size_t target_index = 0; target_index < plan.target_nodes.size();
@@ -2423,9 +2808,33 @@ FmmM2lAnalyticContext::apply_local_cartesian_candidate(
       }
       leaves.push_back(std::move(input));
     }
-    plan.packed_fallback_plan =
-        std::make_unique<PackedJcpFallbackPlan>(build_packed_jcp_fallback_plan(
-            *production_panels, impl_->source_tree.order, leaves, 4, 32));
+    const bool node_patch =
+        !production_panels->empty() &&
+        production_panels->front().node_patch_geometry != nullptr;
+    // Each fallback builds the list it applies: the packed loop sums the
+    // one-point kernel, so every one-ring and curved near-zone pair needs
+    // its correction; the scalar loop evaluates near-list pairs with their
+    // curved value, so only the pairs the local expansions take need one.
+    if (packed_fallback) {
+      plan.packed_fallback_plan =
+          std::make_unique<PackedJcpFallbackPlan>(build_packed_jcp_fallback_plan(
+              *production_panels, impl_->source_tree.order, leaves, 4, 32));
+      plan.packed_node_patch_corrections.clear();
+      if (node_patch ||
+          production_panels->front().sphere_patch_quadrature != nullptr)
+        plan.packed_node_patch_corrections = build_node_patch_near_corrections(
+            leaves, impl_->source_tree.order, *production_panels,
+            impl_->eps_ratio, impl_->kappa, coupled, executor);
+    } else {
+      plan.scalar_far_built = true;
+      plan.scalar_far_node_patch_corrections.clear();
+      if (node_patch ||
+          production_panels->front().sphere_patch_quadrature != nullptr)
+        plan.scalar_far_node_patch_corrections =
+            build_node_patch_near_corrections(
+                leaves, impl_->source_tree.order, *production_panels,
+                impl_->eps_ratio, impl_->kappa, coupled, executor, false);
+    }
   }
 
   const std::size_t budget_bytes =
@@ -2469,51 +2878,74 @@ FmmM2lAnalyticContext::apply_local_cartesian_candidate(
       plan.compressed_green_term_count = green_terms;
       if (plan.far_pairs > 0) {
         plan.compressed_cache_offsets.assign(plan.work.size() + 1, 0);
+        for (std::size_t target_index = 0; target_index < plan.work.size();
+             ++target_index)
+          plan.compressed_cache_offsets[target_index + 1] =
+              plan.compressed_cache_offsets[target_index] +
+              plan.work[target_index].far_sources.size();
+        if (plan.compressed_cache_offsets.back() != plan.far_pairs)
+          throw std::logic_error("compressed cache: far-pair count mismatch");
         plan.compressed_cached_green_coefficients.assign(
             plan.far_pairs * 2 * green_terms, 0.0);
-        std::size_t far_pair_index = 0;
-        for (std::size_t target_index = 0; target_index < plan.work.size();
-             ++target_index) {
-          plan.compressed_cache_offsets[target_index] = far_pair_index;
-          const Cell &target_cell =
-              impl_->target_tree.cells[static_cast<std::size_t>(
-                  plan.target_nodes[target_index])];
-          for (const int source_node : plan.work[target_index].far_sources) {
-            const Cell &source_cell =
-                impl_->source_tree.cells[static_cast<std::size_t>(source_node)];
-            const std::size_t base = far_pair_index * 2 * green_terms;
-            build_cartesian_jcp_compressed_green_operator_p4_order(
-                source_cell.qx, source_cell.qy, source_cell.qz, target_cell.qx,
-                target_cell.qy, target_cell.qz, impl_->kappa, local_order,
-                std::span<double>(
-                    plan.compressed_cached_green_coefficients.data() + base,
-                    green_terms),
-                std::span<double>(
-                    plan.compressed_cached_green_coefficients.data() + base +
-                        green_terms,
-                    green_terms));
-            ++far_pair_index;
-          }
-        }
-        plan.compressed_cache_offsets.back() = far_pair_index;
+        // Every target leaf fills its own slice, so the leaves are built in
+        // parallel; each operator is the one the serial loop built.
+        executor.parallel_for(
+            plan.work.size(), std::max<std::size_t>(1, executor.capacity()), 1,
+            [&](std::size_t, std::size_t begin, std::size_t end) {
+              for (std::size_t target_index = begin; target_index < end;
+                   ++target_index) {
+                const Cell &target_cell =
+                    impl_->target_tree.cells[static_cast<std::size_t>(
+                        plan.target_nodes[target_index])];
+                std::size_t far_pair_index =
+                    plan.compressed_cache_offsets[target_index];
+                for (const int source_node :
+                     plan.work[target_index].far_sources) {
+                  const Cell &source_cell =
+                      impl_->source_tree.cells[static_cast<std::size_t>(
+                          source_node)];
+                  const std::size_t base = far_pair_index * 2 * green_terms;
+                  build_cartesian_jcp_compressed_green_operator_p4_order(
+                      source_cell.qx, source_cell.qy, source_cell.qz,
+                      target_cell.qx, target_cell.qy, target_cell.qz,
+                      impl_->kappa, local_order,
+                      std::span<double>(
+                          plan.compressed_cached_green_coefficients.data() +
+                              base,
+                          green_terms),
+                      std::span<double>(
+                          plan.compressed_cached_green_coefficients.data() +
+                              base + green_terms,
+                          green_terms));
+                  ++far_pair_index;
+                }
+              }
+            });
       }
     } else {
       plan.cached_operators.resize(plan.work.size());
-      for (std::size_t target_index = 0; target_index < plan.work.size();
-           ++target_index) {
-        const Cell &target_cell =
-            impl_->target_tree.cells[static_cast<std::size_t>(
-                plan.target_nodes[target_index])];
-        auto &operators = plan.cached_operators[target_index];
-        operators.reserve(plan.work[target_index].far_sources.size());
-        for (const int source_node : plan.work[target_index].far_sources) {
-          const Cell &source_cell =
-              impl_->source_tree.cells[static_cast<std::size_t>(source_node)];
-          operators.push_back(build_cartesian_jcp_m2l_operator_p4(
-              source_cell.qx, source_cell.qy, source_cell.qz, target_cell.qx,
-              target_cell.qy, target_cell.qz, impl_->eps_ratio, impl_->kappa));
-        }
-      }
+      executor.parallel_for(
+          plan.work.size(), std::max<std::size_t>(1, executor.capacity()), 1,
+          [&](std::size_t, std::size_t begin, std::size_t end) {
+            for (std::size_t target_index = begin; target_index < end;
+                 ++target_index) {
+              const Cell &target_cell =
+                  impl_->target_tree.cells[static_cast<std::size_t>(
+                      plan.target_nodes[target_index])];
+              auto &operators = plan.cached_operators[target_index];
+              operators.reserve(plan.work[target_index].far_sources.size());
+              for (const int source_node :
+                   plan.work[target_index].far_sources) {
+                const Cell &source_cell =
+                    impl_->source_tree.cells[static_cast<std::size_t>(
+                        source_node)];
+                operators.push_back(build_cartesian_jcp_m2l_operator_p4(
+                    source_cell.qx, source_cell.qy, source_cell.qz,
+                    target_cell.qx, target_cell.qy, target_cell.qz,
+                    impl_->eps_ratio, impl_->kappa));
+              }
+            }
+          });
     }
     plan.cache_bytes = required_bytes;
     plan.cache_operator_bytes = operator_bytes;
@@ -2784,6 +3216,9 @@ FmmM2lAnalyticContext::apply_local_cartesian_candidate(
       if (coupled)
         result.phin[panel] += fallback.phin[panel];
     }
+    apply_node_patch_near_corrections(
+        plan.packed_node_patch_corrections, phi_values, phin_values,
+        result.phi.data(), coupled ? result.phin.data() : nullptr);
     result.direct_fallback_seconds = fallback.apply_seconds;
     result.fallback_effective = fallback.effective_kernel;
     result.fallback_vectorized_sources = fallback.vectorized_sources;
@@ -2825,6 +3260,9 @@ FmmM2lAnalyticContext::apply_local_cartesian_candidate(
             }
           }
         });
+    apply_node_patch_near_corrections(
+        plan.scalar_far_node_patch_corrections, phi_values, phin_values,
+        result.phi.data(), coupled ? result.phin.data() : nullptr);
     result.direct_fallback_seconds =
         elapsed_seconds(direct_begin, Clock::now());
   }
@@ -4938,6 +5376,9 @@ ensure_jcp_fmm_m2l_context(
       converted.source_x = panel.source_x;
       converted.source_y = panel.source_y;
       converted.source_z = panel.source_z;
+      converted.source_nx = panel.source_nx;
+      converted.source_ny = panel.source_ny;
+      converted.source_nz = panel.source_nz;
       converted.has_source_quadrature_center =
           panel.has_source_quadrature_center;
       prototype.push_back(converted);

@@ -1,5 +1,7 @@
 #include "h_bond.h"
+#include "titan_interaction_primitives.h"
 #include "titan_simd_dispatch.h"
+#include "titan_executor.h"
 #include "titan_thread_compat.h"
 
 #include <algorithm>
@@ -33,12 +35,10 @@ constexpr std::string_view kHBondReceptorFile =
     "out_hydrogen_bonds_receptor.dat";
 constexpr std::string_view kHBondLigandFile = "out_hydrogen_bonds_ligand.dat";
 
+// The GROMACS name rule shared with -hbk (STR-21): NH1, OH, CH3 are heavy
+// atoms; the old second-letter rule made NME's CH3 a hydrogen of its N.
 inline bool is_hydrogen_atom(const mol_info &info) {
-  const auto &atom_type = info.get_atom_type();
-  const std::string atom_name = info.get_atom();
-  return (!atom_type.empty() && atom_type[0] == 'H') ||
-         (!atom_name.empty() && atom_name[0] == 'H') ||
-         (atom_name.size() >= 2 && atom_name[1] == 'H');
+  return titan_interaction::is_hydrogen_atom(info);
 }
 
 inline bool same_residue(const std::vector<mol_info> &info, std::size_t lhs,
@@ -539,16 +539,27 @@ int find_h_bonds(MOL &pro_in, MOL &pro_in_ref, MOL &lig, MOL &lig_ref,
                  const arguments &Arguments, std::size_t num_snap,
                  std::vector<mol_info> &info_rec,
                  std::vector<mol_info> &info_lg,
-                 std::vector<std::vector<std::size_t>> &Hbonds_vector) {
+                 std::vector<std::vector<std::size_t>> &Hbonds_vector,
+                 TitanExecutor *executor) {
   (void)pro_in_ref;
   (void)lig_ref;
 
+  // CORE-05: the shared executor runs the two group searches and the
+  // per-frame partitions; no threads are created per frame.
   if (num_snap == 0) {
-    if (Arguments.nt >= 2) {
-      titan::jthread t1(&h_groups::find_groups, &groups_1, std::cref(pro_in),
-                      std::cref(info_rec), std::cref(Arguments));
-      titan::jthread t2(&h_groups::find_groups, &groups_2, std::cref(lig),
-                      std::cref(info_lg), std::cref(Arguments));
+    if (Arguments.nt >= 2 && executor != nullptr) {
+      executor->parallel_for(2, 2, 1,
+                             [&](std::size_t, std::size_t begin,
+                                 std::size_t end) {
+                               for (std::size_t g = begin; g < end; ++g) {
+                                 if (g == 0)
+                                   groups_1.find_groups(pro_in, info_rec,
+                                                        Arguments);
+                                 else
+                                   groups_2.find_groups(lig, info_lg,
+                                                        Arguments);
+                               }
+                             });
     } else {
       groups_1.find_groups(pro_in, info_rec, Arguments);
       groups_2.find_groups(lig, info_lg, Arguments);
@@ -581,20 +592,24 @@ int find_h_bonds(MOL &pro_in, MOL &pro_in_ref, MOL &lig, MOL &lig_ref,
   const hbond_spatial_index *groups_2_spatial_ptr =
       use_spatial_index ? &groups_2_spatial : nullptr;
 
-  if (worker_count == 1) {
-    cal_h_bonds(pro_in, lig, 0, groups_1.groups.size(), Arguments, groups_1,
-                groups_2, groups_2_spatial_ptr, h_bonds_pro[0], h_bonds_lig[0]);
+  // partition p covers donors [p n / P, (p + 1) n / P) as before, so the
+  // concatenated lists are the same whatever runs them
+  const auto run_partition = [&](std::size_t i) {
+    const std::size_t begin = i * groups_1.groups.size() / worker_count;
+    const std::size_t end = (i + 1) * groups_1.groups.size() / worker_count;
+    cal_h_bonds(pro_in, lig, begin, end, Arguments, groups_1, groups_2,
+                groups_2_spatial_ptr, h_bonds_pro[i], h_bonds_lig[i]);
+  };
+  if (worker_count == 1 || executor == nullptr) {
+    for (std::size_t i = 0; i < worker_count; ++i)
+      run_partition(i);
   } else {
-    std::vector<titan::jthread> workers;
-    workers.reserve(worker_count);
-    for (std::size_t i = 0; i < worker_count; ++i) {
-      const std::size_t begin = i * groups_1.groups.size() / worker_count;
-      const std::size_t end = (i + 1) * groups_1.groups.size() / worker_count;
-      workers.emplace_back(cal_h_bonds, std::ref(pro_in), std::ref(lig), begin,
-                           end, std::cref(Arguments), std::ref(groups_1),
-                           std::ref(groups_2), groups_2_spatial_ptr,
-                           std::ref(h_bonds_pro[i]), std::ref(h_bonds_lig[i]));
-    }
+    executor->parallel_for(worker_count, worker_count, 1,
+                           [&](std::size_t, std::size_t begin,
+                               std::size_t end) {
+                             for (std::size_t i = begin; i < end; ++i)
+                               run_partition(i);
+                           });
   }
 
   std::size_t total_pro = 0;
@@ -763,7 +778,10 @@ int stat_hbonds(std::vector<std::vector<std::size_t>> &Hbonds_vector,
     }
     sd = std::sqrt(sd / static_cast<double>(Hbonds_vector[i].size()));
 
-    stat_hb << std::fixed << std::setprecision(3) << time_of_snaps[i] << '\t'
+    const double time = i < time_of_snaps.size()
+                            ? time_of_snaps[i]
+                            : std::numeric_limits<double>::quiet_NaN();
+    stat_hb << std::fixed << std::setprecision(3) << time << '\t'
             << mean << '\t' << sd << '\t' << min_hb << '\t' << max_hb << '\t'
             << Hbonds_vector[i].size() << '\n';
   }
@@ -851,7 +869,7 @@ int print_hbond_per_snap(const MOL &pro_in, const MOL &lig,
                          const std::vector<mol_info> &info_rec,
                          const std::vector<mol_info> &info_lg,
                          const arguments &Arguments, std::size_t frame_index) {
-  const double time_value = pro_in.get_time();
+  const double time_value = Arguments.output_time(pro_in.get_time());
   std::ostringstream out_all;
   std::ostringstream out_rec;
   std::ostringstream out_lig;

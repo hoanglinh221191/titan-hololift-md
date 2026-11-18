@@ -12,6 +12,7 @@
 #include <vector>
 
 namespace titan_nb { struct Topology; }
+namespace titan_gbsa { struct TopologyPairs; }
 
 // ---------------------------------------------------------------------------
 // cache_energy — lightweight energy pair
@@ -79,6 +80,8 @@ struct cache_force {
 struct cache_sigma_epsilon {
 
   std::shared_ptr<const titan_nb::Topology> nonbonded_topology;
+  // ENE-22: excluded and listed pairs between the two MM/GBSA groups.
+  std::shared_ptr<const titan_gbsa::TopologyPairs> gbsa_topology_pairs;
 
   // --- Nested sub-struct: groups all 6 force arrays for cache locality ---
   struct ForceArrays {

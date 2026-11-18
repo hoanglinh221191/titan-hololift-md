@@ -273,11 +273,12 @@ final_selection_failure_name(FinalSelectionFailure failure) noexcept {
   }
 }
 
-SelectionResult select_epsilon_progress_candidate(
+static SelectionResult select_epsilon_candidate_impl(
     std::span<const SelectionCandidate> candidates, RouteMode mode,
     double energy_key_epsilon, bool geometry_only,
     bool prefer_maximum_probe_length,
-    std::optional<double> navigation_cost_epsilon) {
+    std::optional<double> navigation_cost_epsilon, bool nonnegative_prefix,
+    bool bounded_reroute = false, bool exploratory = false) {
   if (!std::isfinite(energy_key_epsilon) || energy_key_epsilon < 0.0)
     throw std::invalid_argument("energy-key epsilon must be finite and non-negative");
   if (navigation_cost_epsilon.has_value() &&
@@ -313,8 +314,11 @@ SelectionResult select_epsilon_progress_candidate(
   std::vector<std::size_t> selectable;
   selectable.reserve(valid.size());
   for (const std::size_t index : valid) {
-    if (mode == RouteMode::Advance &&
-        candidates[index].delta_progress <= kProgressEpsilon)
+    if (bounded_reroute && !exploratory && candidates[index].delta_progress < -0.5-kProgressEpsilon)
+      continue;
+    if (mode == RouteMode::Advance && !bounded_reroute && !exploratory &&
+        (nonnegative_prefix ? candidates[index].delta_progress < -kProgressEpsilon
+                            : candidates[index].delta_progress <= kProgressEpsilon))
       continue;
     if (mode == RouteMode::Recovery && candidates[index].fixed_probe &&
         std::isfinite(candidates[index].reference_path_distance) &&
@@ -402,6 +406,36 @@ SelectionResult select_epsilon_progress_candidate(
   result.found = true;
   result.index = best;
   return result;
+}
+
+SelectionResult select_epsilon_progress_candidate(
+    std::span<const SelectionCandidate> candidates, RouteMode mode,
+    double energy_key_epsilon, bool geometry_only,
+    bool prefer_maximum_probe_length,
+    std::optional<double> navigation_cost_epsilon) {
+  return select_epsilon_candidate_impl(candidates, mode, energy_key_epsilon,
+      geometry_only, prefer_maximum_probe_length, navigation_cost_epsilon, false);
+}
+
+SelectionResult select_epsilon_nonnegative_prefix_candidate(
+    std::span<const SelectionCandidate> candidates, double energy_key_epsilon,
+    std::optional<double> navigation_cost_epsilon) {
+  return select_epsilon_candidate_impl(candidates, RouteMode::Advance,
+      energy_key_epsilon, false, false, navigation_cost_epsilon, true);
+}
+
+SelectionResult select_epsilon_reroute_candidate(
+    std::span<const SelectionCandidate> candidates, double energy_key_epsilon,
+    std::optional<double> navigation_cost_epsilon) {
+  return select_epsilon_candidate_impl(candidates, RouteMode::Advance,
+      energy_key_epsilon, false, false, navigation_cost_epsilon, false, true);
+}
+
+SelectionResult select_epsilon_exploratory_candidate(
+    std::span<const SelectionCandidate> candidates, double energy_key_epsilon,
+    std::optional<double> navigation_cost_epsilon) {
+  return select_epsilon_candidate_impl(candidates, RouteMode::Advance,
+      energy_key_epsilon, false, false, navigation_cost_epsilon, false, false, true);
 }
 
 } // namespace titan_path

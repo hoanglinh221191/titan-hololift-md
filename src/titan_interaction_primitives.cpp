@@ -3,6 +3,7 @@
 #include "polymer_classification.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
 
@@ -84,12 +85,38 @@ double clamp_cosine(double value) noexcept {
 
 namespace titan_interaction {
 
+PeriodicImage::PeriodicImage(const box &frame_box) : matrix_(frame_box) {
+  rectangular_ = std::abs(frame_box.get_alpha() - 90.0) < 1.0e-9 &&
+                 std::abs(frame_box.get_beta() - 90.0) < 1.0e-9 &&
+                 std::abs(frame_box.get_gamma() - 90.0) < 1.0e-9;
+  length_[0] = frame_box.get_a();
+  length_[1] = frame_box.get_b();
+  length_[2] = frame_box.get_c();
+  for (int axis = 0; axis < 3; ++axis)
+    inverse_[axis] = 1.0 / length_[axis];
+}
+
+void PeriodicImage::apply(double &dx, double &dy, double &dz) const noexcept {
+  if (!rectangular_) {
+    matrix_.apply_mic(dx, dy, dz);
+    return;
+  }
+  dx -= length_[0] * std::nearbyint(dx * inverse_[0]);
+  dy -= length_[1] * std::nearbyint(dy * inverse_[1]);
+  dz -= length_[2] * std::nearbyint(dz * inverse_[2]);
+}
+
 bool is_hydrogen_atom(const mol_info &info) {
-  const auto &atom_type = info.get_atom_type();
   const std::string atom_name = info.get_atom();
-  return (!atom_type.empty() && atom_type[0] == 'H') ||
-         (!atom_name.empty() && atom_name[0] == 'H') ||
-         (atom_name.size() >= 2 && atom_name[1] == 'H');
+  std::size_t first = 0;
+  while (first < atom_name.size() &&
+         (std::isdigit(static_cast<unsigned char>(atom_name[first])) ||
+          atom_name[first] == ' '))
+    ++first;
+  if (first < atom_name.size())
+    return std::toupper(static_cast<unsigned char>(atom_name[first])) == 'H';
+  const auto &atom_type = info.get_atom_type();
+  return !atom_type.empty() && atom_type[0] == 'H';
 }
 
 bool same_residue(const std::vector<mol_info> &info, std::size_t lhs,
@@ -240,7 +267,7 @@ std::size_t find_bonded_hydrogen(const MOL &mol,
   for (std::size_t h = res_start; h < res_end && h < info.size() &&
                                   h < mol.size();
        ++h) {
-    if (!is_hydrogen_atom(info[h]))
+    if (h == donor_idx || !is_hydrogen_atom(info[h]))
       continue;
     const double dx = mol.pos.x[h] - mol.pos.x[donor_idx];
     const double dy = mol.pos.y[h] - mol.pos.y[donor_idx];
@@ -249,6 +276,57 @@ std::size_t find_bonded_hydrogen(const MOL &mol,
       return h;
   }
   return SIZE_MAX;
+}
+
+void find_bonded_hydrogens(const MOL &mol, const std::vector<mol_info> &info,
+                           std::size_t donor_idx, std::size_t res_start,
+                           std::size_t res_end, const PeriodicImage *image,
+                           std::vector<std::size_t> &hydrogens) {
+  hydrogens.clear();
+  if (donor_idx >= mol.size() || donor_idx >= info.size())
+    return;
+  for (std::size_t h = res_start; h < res_end && h < info.size() &&
+                                  h < mol.size();
+       ++h) {
+    if (h == donor_idx || !is_hydrogen_atom(info[h]))
+      continue;
+    double dx = mol.pos.x[h] - mol.pos.x[donor_idx];
+    double dy = mol.pos.y[h] - mol.pos.y[donor_idx];
+    double dz = mol.pos.z[h] - mol.pos.z[donor_idx];
+    if (image != nullptr)
+      image->apply(dx, dy, dz);
+    if ((dx * dx + dy * dy + dz * dz) < 1.44)
+      hydrogens.push_back(h);
+  }
+}
+
+bool try_calculate_angle_deg(const MOL &donor_mol, std::size_t donor_idx,
+                             std::size_t hydrogen_idx,
+                             const MOL &acceptor_mol,
+                             std::size_t acceptor_idx, double cos_cutoff,
+                             const PeriodicImage &image,
+                             double &angle_deg) noexcept {
+  double dh_x = donor_mol.pos.x[donor_idx] - donor_mol.pos.x[hydrogen_idx];
+  double dh_y = donor_mol.pos.y[donor_idx] - donor_mol.pos.y[hydrogen_idx];
+  double dh_z = donor_mol.pos.z[donor_idx] - donor_mol.pos.z[hydrogen_idx];
+  image.apply(dh_x, dh_y, dh_z);
+  double ah_x = acceptor_mol.pos.x[acceptor_idx] - donor_mol.pos.x[hydrogen_idx];
+  double ah_y = acceptor_mol.pos.y[acceptor_idx] - donor_mol.pos.y[hydrogen_idx];
+  double ah_z = acceptor_mol.pos.z[acceptor_idx] - donor_mol.pos.z[hydrogen_idx];
+  image.apply(ah_x, ah_y, ah_z);
+
+  const double dh_norm_sq = dh_x * dh_x + dh_y * dh_y + dh_z * dh_z;
+  const double ah_norm_sq = ah_x * ah_x + ah_y * ah_y + ah_z * ah_z;
+  if (dh_norm_sq <= std::numeric_limits<double>::epsilon() ||
+      ah_norm_sq <= std::numeric_limits<double>::epsilon())
+    return false;
+  const double dot = dh_x * ah_x + dh_y * ah_y + dh_z * ah_z;
+  const double cosine =
+      clamp_cosine(dot / std::sqrt(dh_norm_sq * ah_norm_sq));
+  if (cosine > cos_cutoff)
+    return false;
+  angle_deg = std::acos(cosine) * 180.0 / kPi;
+  return true;
 }
 
 bool try_calculate_angle_deg(const MOL &donor_mol, std::size_t donor_idx,

@@ -1,6 +1,7 @@
 #include "titan_pca.h"
 #include "titan_alignment.h"
 #include "titan_executor.h"
+#include "titan_seeded_random.h"
 #include "titan_ui.h"
 #include "titan_zts.h"
 #include <algorithm>
@@ -26,7 +27,8 @@ namespace {
 
 constexpr double kBoltzmannKjPerMolK = 0.008314463;
 constexpr double kMinimumAxisRange = 1e-6;
-constexpr double kDefaultFreeEnergy = 20.0;
+// KIN-11: free energy of a bin without weight; written as "nan"
+constexpr double kEmptyBinFreeEnergy = std::numeric_limits<double>::quiet_NaN();
 using TitanPCA::FES2DResult;
 
 struct FrameWeightResolution {
@@ -496,7 +498,8 @@ bool solve_pca_eigenvalues(const Eigen::MatrixXd &cov_matrix,
                            int pca_max_k_full,
                            Eigen::VectorXd &out_eigenvalues_desc,
                            Eigen::MatrixXd &out_eigenvectors_desc,
-                           std::string &effective_solver_mode) {
+                           std::string &effective_solver_mode,
+                           std::uint64_t seed) {
   const int n_dim = static_cast<int>(cov_matrix.rows());
   if (n_dim <= 0)
     return false;
@@ -538,7 +541,9 @@ bool solve_pca_eigenvalues(const Eigen::MatrixXd &cov_matrix,
     constexpr int max_subspace_iter = 96;
     constexpr double subspace_tol = 1e-8;
 
-    Eigen::MatrixXd Q = Eigen::MatrixXd::Random(n_dim, topk);
+    // X-06/KIN-08: seeded start block (-msm-seed) instead of the unseeded,
+    // process-wide rand() behind Eigen's Random
+    Eigen::MatrixXd Q = titan_random::uniform_block(n_dim, topk, seed);
 
     auto orthonormalize = [&](Eigen::MatrixXd &M) {
       Eigen::HouseholderQR<Eigen::MatrixXd> qr(M);
@@ -652,7 +657,7 @@ FES2DResult compute_2d_fes_grid(
       auto &cell = result.bin(ix, iy);
       cell = {result.min_x + result.step_x * (static_cast<double>(ix) + 0.5),
               result.min_y + result.step_y * (static_cast<double>(iy) + 0.5), 0,
-              0.0, kDefaultFreeEnergy, -1};
+              0.0, kEmptyBinFreeEnergy, -1};
     }
   }
 
@@ -737,7 +742,13 @@ bool write_2d_fes_grid(const std::string &label, const std::string &path,
     for (int iy = 0; iy < fes_result.grid_size; ++iy) {
       const auto &bin = fes_result.bin(ix, iy);
       fes_out << std::fixed << std::setprecision(4) << bin.pc1 << " " << bin.pc2
-              << " " << bin.free_energy << "\n";
+              << " ";
+      // KIN-11: empty bins as "nan" (gnuplot, numpy and the e2e comparison
+      // read it), never as a number
+      if (std::isfinite(bin.free_energy))
+        fes_out << bin.free_energy << "\n";
+      else
+        fes_out << "nan\n";
     }
     fes_out << "\n";
   }
@@ -781,7 +792,10 @@ std::vector<TitanPCA::ClusterNode> detect_fes_clusters(
         for (int dy = -1; dy <= 1 && is_minimum; ++dy) {
           if (dx == 0 && dy == 0)
             continue;
-          if (fes_result.bin(ix + dx, iy + dy).free_energy < e)
+          // KIN-11: an empty neighbour is +infinity, never lower; with the
+          // old 20 kJ/mol fill it beat every sampled bin above 20
+          const auto &neighbor = fes_result.bin(ix + dx, iy + dy);
+          if (neighbor.count_w > 0.0 && neighbor.free_energy < e)
             is_minimum = false;
         }
       }
@@ -1276,7 +1290,8 @@ void execute_pca_fes_analysis(
   std::string pca_solver_mode;
   if (!solve_pca_eigenvalues(cov_matrix, args.msm.pca_solver, args.msm.pca_topk,
                              args.msm.pca_max_k_full, eigenvalues_desc,
-                             eigenvectors_desc, pca_solver_mode)) {
+                             eigenvectors_desc, pca_solver_mode,
+                             titan_random::solver_seed(args.msm.msm_seed))) {
     TitanUI::print_error("PCA ERROR: Eigenvalue Decomposition failed!");
     return;
   }

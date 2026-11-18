@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -85,11 +86,104 @@ std::array<double, 3> normalized(std::array<double, 3> a) {
   return a;
 }
 
-void apply_mic(const box &active_box, double &dx, double &dy, double &dz) {
-  if (BoxMatrix::valid_box(active_box)) {
-    BoxMatrix matrix(active_box);
-    matrix.apply_mic(dx, dy, dz);
+// The matrix of the last box seen by this thread: apply_mic runs per tail
+// bond per lipid per frame, and building BoxMatrix (trigonometry and an
+// inverse) on every call dominated it (MDB-18). Same matrix, same digits.
+const BoxMatrix *cached_box_matrix(const box &active_box) {
+  struct Cache {
+    bool filled{false};
+    std::array<double, 6> params{};
+    std::optional<BoxMatrix> matrix;
+  };
+  thread_local Cache cache;
+  const std::array<double, 6> params{active_box.get_a(),     active_box.get_b(),
+                                     active_box.get_c(),     active_box.get_alpha(),
+                                     active_box.get_beta(),  active_box.get_gamma()};
+  if (!cache.filled || params != cache.params) {
+    cache.filled = true;
+    cache.params = params;
+    cache.matrix.reset();
+    if (BoxMatrix::valid_box(active_box))
+      cache.matrix.emplace(active_box);
   }
+  return cache.matrix ? &*cache.matrix : nullptr;
+}
+
+void apply_mic(const box &active_box, double &dx, double &dy, double &dz) {
+  if (const BoxMatrix *matrix = cached_box_matrix(active_box))
+    matrix->apply_mic(dx, dy, dz);
+}
+
+// Fractional coordinate of the vector d along lattice direction `axis`.
+double fractional(const BoxMatrix &matrix, int axis, double dx, double dy,
+                  double dz) {
+  return matrix.inv[0][axis] * dx + matrix.inv[1][axis] * dy +
+         matrix.inv[2][axis] * dz;
+}
+
+// Folds d along one lattice direction to its nearest image; d is left bit
+// for bit when it already is the nearest image along that direction.
+void fold_along_axis(const BoxMatrix &matrix, int axis, double &dx, double &dy,
+                     double &dz) {
+  const double n = std::round(fractional(matrix, axis, dx, dy, dz));
+  if (n == 0.0)
+    return;
+  dx -= matrix.m[axis][0] * n;
+  dy -= matrix.m[axis][1] * n;
+  dz -= matrix.m[axis][2] * n;
+}
+
+// Minimum image within the membrane plane only: every lattice direction but
+// the stacking one is folded. The head beads are re-imaged along the
+// stacking direction first, so the two leaflets of a bilayer thicker than
+// half the box stay on their own sides (a full minimum image puts a
+// lower-leaflet head 40 A below an upper one 30 A above it in a 70 A box).
+void apply_mic_in_plane(const box &active_box, int stacking_axis, double &dx,
+                        double &dy, double &dz) {
+  const BoxMatrix *matrix = cached_box_matrix(active_box);
+  if (matrix == nullptr)
+    return;
+  for (int axis = 0; axis < 3; ++axis)
+    if (axis != stacking_axis)
+      fold_along_axis(*matrix, axis, dx, dy, dz);
+}
+
+// The bilayer's stacking direction and position along it, from the circular
+// mean of the fractional coordinates of the given beads: a bilayer is
+// periodic in its plane (resultant ~ 0 along the two in-plane lattice
+// directions) and a slab along the third (largest resultant), whose circular
+// mean is the slab centre even when a box face splits it.
+struct Stacking {
+  int axis{2};
+  double centre_fraction{0.0};
+};
+
+Stacking periodic_stacking(const AlignedDoubleVector &x,
+                           const AlignedDoubleVector &y,
+                           const AlignedDoubleVector &z,
+                           const BoxMatrix &matrix) {
+  double c[3] = {0.0, 0.0, 0.0};
+  double s[3] = {0.0, 0.0, 0.0};
+  constexpr double kTwoPi = 6.283185307179586476925;
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    for (int axis = 0; axis < 3; ++axis) {
+      const double f = fractional(matrix, axis, x[i], y[i], z[i]);
+      c[axis] += std::cos(kTwoPi * f);
+      s[axis] += std::sin(kTwoPi * f);
+    }
+  }
+  Stacking stacking;
+  double best = -1.0;
+  for (int axis = 0; axis < 3; ++axis) {
+    const double resultant = std::hypot(c[axis], s[axis]);
+    if (resultant > best) {
+      best = resultant;
+      stacking.axis = axis;
+    }
+  }
+  stacking.centre_fraction =
+      std::atan2(s[stacking.axis], c[stacking.axis]) / kTwoPi;
+  return stacking;
 }
 
 bool membrane_backbone_atom(const std::string &name) {
@@ -313,6 +407,56 @@ void TitanMembraneAnalyzer::reset_trajectory_state() {
   have_previous_normal_ = false;
 }
 
+void TitanMembraneAnalyzer::reimage_heads(const MOL &frame,
+                                          const box &active_box) {
+  const BoxMatrix *matrix = cached_box_matrix(active_box);
+  if (matrix == nullptr || head_x_.empty())
+    return;
+  core_x_.clear();
+  core_y_.clear();
+  core_z_.clear();
+  for (const LipidPlan &lipid : lipid_plans_)
+    for (const auto &tail : lipid.tails)
+      for (const std::size_t atom : tail) {
+        if (atom >= frame.size())
+          continue;
+        core_x_.push_back(frame.pos.x[atom]);
+        core_y_.push_back(frame.pos.y[atom]);
+        core_z_.push_back(frame.pos.z[atom]);
+      }
+  const Stacking stacking =
+      core_x_.empty() ? periodic_stacking(head_x_, head_y_, head_z_, *matrix)
+                      : periodic_stacking(core_x_, core_y_, core_z_, *matrix);
+  stacking_axis_ = stacking.axis;
+  const int axis = stacking.axis;
+  const double slab_x = matrix->m[axis][0] * stacking.centre_fraction;
+  const double slab_y = matrix->m[axis][1] * stacking.centre_fraction;
+  const double slab_z = matrix->m[axis][2] * stacking.centre_fraction;
+  // only the stacking direction is re-imaged: the in-plane coordinates are
+  // periodic for every later step and stay as read
+  for (std::size_t i = 0; i < head_x_.size(); ++i) {
+    const double n = std::round(fractional(*matrix, axis, head_x_[i] - slab_x,
+                                           head_y_[i] - slab_y,
+                                           head_z_[i] - slab_z));
+    if (n == 0.0)
+      continue;
+    head_x_[i] -= matrix->m[axis][0] * n;
+    head_y_[i] -= matrix->m[axis][1] * n;
+    head_z_[i] -= matrix->m[axis][2] * n;
+  }
+  const double n = static_cast<double>(head_x_.size());
+  membrane_center_ = {std::accumulate(head_x_.begin(), head_x_.end(), 0.0) / n,
+                      std::accumulate(head_y_.begin(), head_y_.end(), 0.0) / n,
+                      std::accumulate(head_z_.begin(), head_z_.end(), 0.0) / n};
+}
+
+double TitanMembraneAnalyzer::signed_height(
+    std::size_t lipid, const std::array<double, 3> &normal) const {
+  return (head_x_[lipid] - membrane_center_[0]) * normal[0] +
+         (head_y_[lipid] - membrane_center_[1]) * normal[1] +
+         (head_z_[lipid] - membrane_center_[2]) * normal[2];
+}
+
 void TitanMembraneAnalyzer::build_topology_cache(const Multi_MOL &lipids,
                                                  std::fstream &log) {
   lipid_plans_.clear();
@@ -424,6 +568,18 @@ void TitanMembraneAnalyzer::build_topology_cache(const Multi_MOL &lipids,
         }
         if (tail.size() >= 2)
           plan.tails.push_back(std::move(tail));
+      }
+    }
+    plan.order_keys.resize(plan.tails.size());
+    plan.proximity_keys.resize(plan.tails.size());
+    for (std::size_t tail_idx = 0; tail_idx < plan.tails.size(); ++tail_idx) {
+      for (std::size_t bond = 1; bond < plan.tails[tail_idx].size(); ++bond) {
+        plan.order_keys[tail_idx].push_back(
+            plan.resname + ",tail" + std::to_string(tail_idx + 1) + ",bond" +
+            std::to_string(bond));
+        plan.proximity_keys[tail_idx].push_back(
+            "tail" + std::to_string(tail_idx + 1) + ":bond" +
+            std::to_string(bond));
       }
     }
     lipid_plans_.push_back(std::move(plan));
@@ -543,7 +699,7 @@ void TitanMembraneAnalyzer::classify_leaflets(
             double rx = head_x_[j] - anchor[0];
             double ry = head_y_[j] - anchor[1];
             double rz = head_z_[j] - anchor[2];
-            apply_mic(active_box, rx, ry, rz);
+            apply_mic_in_plane(active_box, stacking_axis_, rx, ry, rz);
             local_x.push_back(anchor[0] + rx);
             local_y.push_back(anchor[1] + ry);
             local_z.push_back(anchor[2] + rz);
@@ -567,7 +723,8 @@ void TitanMembraneAnalyzer::classify_leaflets(
     std::array<double, 3> local_delta{head_x_[i] - local_center[0],
                                       head_y_[i] - local_center[1],
                                       head_z_[i] - local_center[2]};
-    apply_mic(active_box, local_delta[0], local_delta[1], local_delta[2]);
+    apply_mic_in_plane(active_box, stacking_axis_, local_delta[0],
+                       local_delta[1], local_delta[2]);
     signed_distance[i] = dot(local_delta, local_normal);
     leaflets[i] = signed_distance[i] >= 0.0 ? 1 : -1;
   }
@@ -658,19 +815,14 @@ void TitanMembraneAnalyzer::update_order_parameters(
             order_parameter(dx, dy, dz, normal[0], normal[1], normal[2]);
         if (!std::isfinite(value))
           continue;
-        const std::string key = lipid.resname + ",tail" +
-                                std::to_string(tail_idx + 1) + ",bond" +
-                                std::to_string(bond);
-        auto &acc = order_accumulators_[key];
+        auto &acc = order_accumulators_[lipid.order_keys[tail_idx][bond - 1]];
         acc.sum += value;
         acc.sum_sq += value * value;
         ++acc.count;
         if (leaflets != nullptr && !near_lipids.empty() &&
             lipid_idx < leaflets->size()) {
           record_proximity_value(
-              "order_S",
-              "tail" + std::to_string(tail_idx + 1) + ":bond" +
-                  std::to_string(bond),
+              "order_P2_bond", lipid.proximity_keys[tail_idx][bond - 1],
               leaflet_name((*leaflets)[lipid_idx]), lipid.resname, value,
               is_near_lipid(near_lipids, lipid_idx));
         }
@@ -680,16 +832,23 @@ void TitanMembraneAnalyzer::update_order_parameters(
 }
 
 void TitanMembraneAnalyzer::compute_interdigitation(
-    const MOL &frame, const std::array<double, 3> &normal,
-    const std::vector<int> &leaflets, double &overlap, double &penetration) const {
+    const MOL &frame, const box &active_box,
+    const std::array<double, 3> &normal, const std::vector<int> &leaflets,
+    double &overlap, double &penetration) const {
   std::vector<double> upper;
   std::vector<double> lower;
   for (std::size_t lipid_idx = 0; lipid_idx < lipid_plans_.size(); ++lipid_idx) {
     for (const auto &tail : lipid_plans_[lipid_idx].tails) {
       for (std::size_t atom : tail) {
+        // height relative to the membrane centre, the bead folded along the
+        // stacking direction to the centre's image
+        double dx = frame.pos.x[atom] - membrane_center_[0];
+        double dy = frame.pos.y[atom] - membrane_center_[1];
+        double dz = frame.pos.z[atom] - membrane_center_[2];
+        if (const BoxMatrix *matrix = cached_box_matrix(active_box))
+          fold_along_axis(*matrix, stacking_axis_, dx, dy, dz);
         const double projected =
-            frame.pos.x[atom] * normal[0] + frame.pos.y[atom] * normal[1] +
-            frame.pos.z[atom] * normal[2];
+            dx * normal[0] + dy * normal[1] + dz * normal[2];
         (leaflets[lipid_idx] > 0 ? upper : lower).push_back(projected);
       }
     }
@@ -733,7 +892,9 @@ void TitanMembraneAnalyzer::update_thickness_map(
     const int iy = std::min(grid_y_ - 1, static_cast<int>(pv / lv * grid_y_));
     const std::size_t cell = static_cast<std::size_t>(iy * grid_x_ + ix);
     lipid_cell[i] = cell;
-    const double height = dot(point, normal);
+    // signed distance from the membrane centre along the normal (the heads
+    // are re-imaged around it, so both leaflets are on their own side)
+    const double height = signed_height(i, normal);
     if (leaflets[i] > 0) {
       upper_sum[cell] += height;
       ++upper_count[cell];
@@ -764,8 +925,7 @@ void TitanMembraneAnalyzer::update_thickness_map(
     std::size_t nu = 0;
     std::size_t nl = 0;
     for (std::size_t i = 0; i < lipid_plans_.size(); ++i) {
-      const double height = head_x_[i] * normal[0] + head_y_[i] * normal[1] +
-                            head_z_[i] * normal[2];
+      const double height = signed_height(i, normal);
       if (leaflets[i] > 0) {
         upper += height;
         ++nu;
@@ -1169,7 +1329,7 @@ void TitanMembraneAnalyzer::update_proximity_coupling(
       record_proximity_value("thickness_A", "headgroup_cell", leaflet, resname,
                              per_lipid_thickness[i], near);
     if (args_.curvature == "grid" && i < per_lipid_curvature.size())
-      record_proximity_value("curvature_proxy_Ainv", "headgroup_cell", leaflet,
+      record_proximity_value("height_dev_over_cell_edge", "headgroup_cell", leaflet,
                              resname, per_lipid_curvature[i], near);
     record_proximity_value("contact_probability", "lipid_frame", leaflet,
                            resname, near ? 1.0 : 0.0, near);
@@ -1238,6 +1398,7 @@ void TitanMembraneAnalyzer::process_frame(const Multi_MOL &lipids,
     head_y_[i] = frame.pos.y[head];
     head_z_[i] = frame.pos.z[head];
   }
+  reimage_heads(frame, *active_box);
   const std::array<double, 3> normal = resolve_normal(frame);
   std::vector<int> leaflets;
   AlignedDoubleVector signed_distance;
@@ -1260,7 +1421,8 @@ void TitanMembraneAnalyzer::process_frame(const Multi_MOL &lipids,
                        &per_lipid_thickness);
   double interdigitation = 0.0;
   double penetration = 0.0;
-  compute_interdigitation(frame, normal, leaflets, interdigitation, penetration);
+  compute_interdigitation(frame, *active_box, normal, leaflets,
+                          interdigitation, penetration);
   std::vector<std::uint8_t> near_lipids(lipid_plans_.size(), 0);
   auto near_lipid_span =
       std::span<std::uint8_t>(near_lipids.data(), near_lipids.size());
@@ -1408,7 +1570,10 @@ void TitanMembraneAnalyzer::export_thickness_map(
 void TitanMembraneAnalyzer::export_order_parameters(
     const std::string &filename) const {
   std::ofstream out(filename);
-  out << "resname,tail,bond,mean_S,std_S,samples\n";
+  // STR-11: P2 of the vector between consecutive tail sites and the bilayer
+  // normal; MARTINI bead bonds, or C-C bonds (S_CC, not the NMR S_CD) for
+  // all-atom tail carbons.
+  out << "resname,tail,bond,mean_P2_bond,std_P2_bond,samples\n";
   for (const auto &[key, acc] : order_accumulators_) {
     const double mean = acc.count == 0 ? 0.0 : acc.sum / acc.count;
     const double variance =
@@ -1492,7 +1657,11 @@ void TitanMembraneAnalyzer::export_lipid_enrichment(
 void TitanMembraneAnalyzer::export_curvature_map(
     const std::string &filename) const {
   std::ofstream out(filename);
-  out << "grid_x,grid_y,curvature_proxy_Ainv,std_curvature_proxy_Ainv,samples\n";
+  // STR-11: (mean head height in the cell - leaflet mean height) / sqrt(cell
+  // area), averaged over the leaflets present: dimensionless height map, not
+  // a mean or Gaussian curvature (the old header said 1/A).
+  out << "grid_x,grid_y,height_dev_over_cell_edge,std_height_dev_over_cell_edge,"
+         "samples\n";
   for (int iy = 0; iy < grid_y_; ++iy) {
     for (int ix = 0; ix < grid_x_; ++ix) {
       const auto &cell = curvature_cells_[static_cast<std::size_t>(
@@ -1545,6 +1714,10 @@ void TitanMembraneAnalyzer::export_coupling_summary(
   out << "enrichment_enabled: " << (args_.enrichment ? "true" : "false")
       << '\n';
   out << "curvature_policy: " << args_.curvature << '\n';
+  if (args_.curvature == "grid")
+    out << "curvature_note: the grid map is height_dev_over_cell_edge = "
+           "(mean head height in the cell - leaflet mean height)/sqrt(cell "
+           "area), dimensionless; it is not a mean or Gaussian curvature.\n";
   out << "frames_analyzed: " << frame_summaries_.size() << '\n';
   out << "contact_frames: " << contact_frames_ << '\n';
   out << "contact_skipped_frames: " << contact_skipped_frames_ << '\n';
@@ -1593,7 +1766,8 @@ void TitanMembraneAnalyzer::export_coupling_summary(
     const std::string observable =
         first == std::string::npos ? key : key.substr(0, first);
     if (observable == "apl_A2" || observable == "thickness_A" ||
-        observable == "order_S" || observable == "curvature_proxy_Ainv") {
+        observable == "order_P2_bond" ||
+        observable == "height_dev_over_cell_edge") {
       out << "top_delta_" << observable << ": " << key << ','
           << near_mean - far_mean << '\n';
     }
@@ -1624,8 +1798,17 @@ void TitanMembraneAnalyzer::export_summary(const std::string &filename) const {
          "with sign continuity between analyzed frames, and auto leaflets use "
          "periodic local-neighborhood PCA midplanes.\n";
   out << "apl_note: APL is a periodic local Voronoi estimate per leaflet.\n";
-  out << "order_parameter_note: MARTINI tail order uses 0.5*(3*cos(theta)^2-1) "
-         "for consecutive tail-bead vectors.\n";
+  out << "order_parameter_note: P2_bond = 0.5*(3*cos(theta)^2-1) of the "
+         "vector between consecutive tail sites and the bilayer normal "
+         "(membrane_order_parameters.csv). For MARTINI beads it is the usual "
+         "bond order parameter; for all-atom tail carbons it is S_CC (C-C "
+         "bonds), not the NMR S_CD (C-H bonds), and cannot be compared with "
+         "deuterium order parameters.\n";
+  if (args_.curvature == "grid")
+    out << "curvature_note: membrane_curvature_map.csv reports "
+           "height_dev_over_cell_edge = (mean head height in the cell - "
+           "leaflet mean height)/sqrt(cell area), averaged over the leaflets "
+           "present; dimensionless, not a mean or Gaussian curvature.\n";
   out << "frames_analyzed: " << frame_summaries_.size() << '\n';
   out << "frames_skipped: " << skipped_frames_ << '\n';
   out << "lipids: " << lipid_plans_.size() << '\n';
@@ -1804,7 +1987,7 @@ void TitanMembraneAnalyzer::export_average(const std::string &base_dir,
   {
     std::ofstream out(join_output_path(
         base_dir, info_output.get_membrane_order_parameters_average_filename()));
-    out << "resname,tail,bond,mean_S,sem_S,replicates\n";
+    out << "resname,tail,bond,mean_P2_bond,sem_P2_bond,replicates\n";
     for (const auto &[key, acc] : aggregate_order_parameters_) {
       const auto [mean, sem] = mean_sem(acc);
       out << key << ',' << mean << ',' << sem << ',' << acc.count << '\n';
@@ -1829,8 +2012,8 @@ void TitanMembraneAnalyzer::export_average(const std::string &base_dir,
   if (args_.curvature == "grid") {
     std::ofstream out(join_output_path(
         base_dir, info_output.get_membrane_curvature_map_average_filename()));
-    out << "grid_x,grid_y,mean_curvature_proxy_Ainv,"
-           "sem_curvature_proxy_Ainv,replicates\n";
+    out << "grid_x,grid_y,mean_height_dev_over_cell_edge,"
+           "sem_height_dev_over_cell_edge,replicates\n";
     for (int iy = 0; iy < grid_y_; ++iy) {
       for (int ix = 0; ix < grid_x_; ++ix) {
         const std::size_t cell_index =

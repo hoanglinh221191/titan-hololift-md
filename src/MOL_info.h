@@ -10,6 +10,25 @@
 // để tránh hiện tượng Namespace Pollution (ô nhiễm không gian tên) ở các file
 // include nó.
 
+// Backbone atoms of an amino-acid residue in the naming schemes TITAN reads:
+// the amide H as H (AMBER, GROMOS, OPLS) or HN (CHARMM), the N-terminal
+// H1-H3 or HT1-HT3, and the C-terminal oxygens OXT (PDB, AMBER), OT1/OT2
+// (CHARMM) or OC1/OC2 (GROMACS ports). Every other atom is side chain.
+inline bool is_amino_acid_backbone_atom(std::string_view atom) {
+  return atom == "N" || atom == "CA" || atom == "C" || atom == "O" ||
+         atom == "H" || atom == "HN" || atom == "HA" || atom == "H1" ||
+         atom == "H2" || atom == "H3" || atom == "HT1" || atom == "HT2" ||
+         atom == "HT3" || atom == "OXT" || atom == "OT1" || atom == "OT2" ||
+         atom == "OC1" || atom == "OC2";
+}
+
+// Glycine has no side chain, so its whole residue stands in for one. AMBER
+// names the terminal forms NGLY and CGLY.
+inline bool is_glycine_residue_name(std::string_view res_name) {
+  return res_name.starts_with("GLY") || res_name == "NGLY" ||
+         res_name == "CGLY";
+}
+
 class mol_info {
 private: // OPT: Explicit private access modifier
   // OPT: Memory Alignment & Padding - Reordered members from largest size to
@@ -99,17 +118,10 @@ public:
 
   void set_side_chain(bool val) noexcept { side_chain = val; }
 
+  // For an atom of an amino-acid residue.
   bool check_side_chain() {
-    // OPT: Used modern C++ starts_with() instead of string::find()
-    if (original_res_name.starts_with("GLY")) {
-      side_chain = true;
-    } else if (atom != "C" && atom != "N" && atom != "CA" && atom != "O" &&
-               atom != "HA" && atom != "H" && atom != "H1" && atom != "H2" &&
-               atom != "H3") {
-      side_chain = true;
-    } else {
-      side_chain = false;
-    }
+    side_chain = is_glycine_residue_name(original_res_name) ||
+                 !is_amino_acid_backbone_atom(atom);
     return side_chain;
   }
 };

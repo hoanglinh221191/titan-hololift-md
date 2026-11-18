@@ -1,7 +1,7 @@
 #include "titan_executor.h"
 
 #include <algorithm>
-#include <cassert>
+#include <utility>
 
 thread_local TitanExecutor *TitanExecutor::active_executor_ = nullptr;
 
@@ -30,37 +30,19 @@ void TitanExecutor::parallel_for(
 
   const std::size_t active_workers =
       compute_parallel_for_workers(total_items, requested_workers, min_grain);
+  // CORE-08: a nested batch (submitted from a worker of this executor) runs
+  // inline on that worker; waiting for the pool from inside it would
+  // deadlock. The old code asserted here, and TITAN builds without NDEBUG,
+  // so a nested call aborted the run.
   if (active_workers <= 1 || active_executor_ == this) {
-    assert(active_executor_ != this && "Nested TitanExecutor::parallel_for is unsupported");
     fn(0, 0, total_items);
     return;
   }
 
   std::unique_lock<std::mutex> lock(mutex_);
-  done_cv_.wait(lock, [this]() { return batch_mode_ == BatchMode::None; });
-
-  batch_mode_ = BatchMode::ParallelFor;
-  batch_worker_count_ = active_workers;
-  pending_workers_ = active_workers;
-  total_items_ = total_items;
-  first_exception_ = nullptr;
-  for_fn_ = fn;
-  do_fn_ = {};
-  ++batch_generation_;
-
-  batch_cv_.notify_all();
-  done_cv_.wait(lock, [this]() { return pending_workers_ == 0; });
-
-  for_fn_ = {};
-  batch_mode_ = BatchMode::None;
-  total_items_ = 0;
-
-  if (first_exception_) {
-    auto exception = first_exception_;
-    first_exception_ = nullptr;
-    lock.unlock();
-    std::rethrow_exception(exception);
-  }
+  begin_batch(lock, BatchMode::ParallelFor, active_workers, total_items, &fn,
+              nullptr);
+  end_batch(lock);
 }
 
 void TitanExecutor::parallel_do(
@@ -71,36 +53,51 @@ void TitanExecutor::parallel_do(
 
   const std::size_t active_workers =
       compute_parallel_do_workers(requested_workers);
+  // nested batch: inline on the calling worker (see parallel_for)
   if (active_workers <= 1 || active_executor_ == this) {
-    assert(active_executor_ != this && "Nested TitanExecutor::parallel_do is unsupported");
     fn(0);
     return;
   }
 
   std::unique_lock<std::mutex> lock(mutex_);
-  done_cv_.wait(lock, [this]() { return batch_mode_ == BatchMode::None; });
+  begin_batch(lock, BatchMode::ParallelDo, active_workers, 0, nullptr, &fn);
+  end_batch(lock);
+}
 
-  batch_mode_ = BatchMode::ParallelDo;
+void TitanExecutor::begin_batch(
+    std::unique_lock<std::mutex> &lock, BatchMode mode,
+    std::size_t active_workers, std::size_t total_items,
+    const std::function<void(std::size_t, std::size_t, std::size_t)> *for_fn,
+    const std::function<void(std::size_t)> *do_fn) {
+  // other submitters wait here, on their own condition variable
+  idle_cv_.wait(lock, [this]() { return batch_mode_ == BatchMode::None; });
+
+  batch_mode_ = mode;
   batch_worker_count_ = active_workers;
   pending_workers_ = active_workers;
-  total_items_ = 0;
+  total_items_ = total_items;
   first_exception_ = nullptr;
-  do_fn_ = fn;
-  for_fn_ = {};
+  for_fn_ = for_fn ? *for_fn : std::function<void(std::size_t, std::size_t,
+                                                  std::size_t)>{};
+  do_fn_ = do_fn ? *do_fn : std::function<void(std::size_t)>{};
   ++batch_generation_;
-
   batch_cv_.notify_all();
+}
+
+void TitanExecutor::end_batch(std::unique_lock<std::mutex> &lock) {
+  // only the submitter of the running batch waits on done_cv_
   done_cv_.wait(lock, [this]() { return pending_workers_ == 0; });
 
+  for_fn_ = {};
   do_fn_ = {};
   batch_mode_ = BatchMode::None;
-
-  if (first_exception_) {
-    auto exception = first_exception_;
-    first_exception_ = nullptr;
-    lock.unlock();
+  total_items_ = 0;
+  const std::exception_ptr exception = std::exchange(first_exception_, nullptr);
+  lock.unlock();
+  // the executor is free: every waiting submitter re-checks; one takes it
+  idle_cv_.notify_all();
+  if (exception)
     std::rethrow_exception(exception);
-  }
 }
 
 void TitanExecutor::worker_loop(titan::stop_token stop_token,

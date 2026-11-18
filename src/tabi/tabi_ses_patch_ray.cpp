@@ -1051,6 +1051,7 @@ build_patch_ray_grid_impl(const PatchComplex &complex, const Vec3 &lower,
     bool provenance_repair_failed = false;
     bool repair_counter_overflow = false;
     std::size_t unresolved_odd_rows = 0U;
+    std::vector<std::size_t> unresolved_uncertified;
     for (std::size_t row = 0; row < crossings.row_count(); ++row) {
       std::span<const double> selected = crossings.row(row);
       const std::size_t original_crossing_begin = crossings.offsets[row];
@@ -1082,9 +1083,11 @@ build_patch_ray_grid_impl(const PatchComplex &complex, const Vec3 &lower,
         if (!repaired && was_odd)
           if (!checked_add_assign(unresolved_odd_rows, 1U))
             repair_counter_overflow = true;
-        if (!repaired && was_uncertified)
+        if (!repaired && was_uncertified) {
+          unresolved_uncertified.push_back(row);
           if (!checked_add_assign(result.unresolved_uncertified_rows, 1U))
             repair_counter_overflow = true;
+        }
         std::size_t repair_live_bytes = probe_index_bytes;
         std::size_t repaired_provenance_bytes = 0U;
         std::size_t candidate_provenance_bytes = 0U;
@@ -1161,6 +1164,7 @@ build_patch_ray_grid_impl(const PatchComplex &complex, const Vec3 &lower,
     if (options.retain_provenance)
       result.provenance.axes[axis_index] = std::move(repaired_provenance);
     crossings.odd_rows = unresolved_odd_rows;
+    crossings.uncertified_rows = std::move(unresolved_uncertified);
   }
   for (const AxisRayCrossings &crossings : result.axes) {
     telemetry_valid =
@@ -1168,7 +1172,9 @@ build_patch_ray_grid_impl(const PatchComplex &complex, const Vec3 &lower,
         checked_vector_bytes(crossings.coordinates.capacity(), sizeof(double),
                              result.retained_bytes) &&
         checked_vector_bytes(crossings.offsets.capacity(), sizeof(std::size_t),
-                             result.retained_bytes);
+                             result.retained_bytes) &&
+        checked_vector_bytes(crossings.uncertified_rows.capacity(),
+                             sizeof(std::size_t), result.retained_bytes);
   }
   if (!telemetry_valid) {
     result.status = "byte_telemetry_overflow";

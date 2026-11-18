@@ -82,6 +82,20 @@ JcpNearPairKernel evaluate_jcp_centroid_monopole_kernel(
     const Panel &target, const Panel &source, double eps_ratio,
     double kappa) noexcept;
 
+// Panel fields read by the plain-centroid pair kernel and its one-ring test,
+// laid out by field. A direct operator builds it once per application so the
+// rows stream contiguous arrays instead of every Panel; it describes only the
+// panels it was built from, in their original indexing.
+struct NearSourceCache {
+  std::vector<double> x, y, z; // source point (quadrature centre when set)
+  std::vector<double> nx, ny, nz, area;
+  // Vertex indices, or -1 for a panel without triangle geometry, so equal
+  // indices mean exactly what shared_vertex_count() counts.
+  std::vector<std::size_t> v0, v1, v2;
+};
+
+NearSourceCache build_near_source_cache(const std::vector<Panel> &panels);
+
 JcpNearAccum accumulate_jcp_near_ordered(
     const Panel &target, std::size_t target_index,
     const std::vector<Panel> &panels, const std::vector<double> &unknowns,
@@ -89,7 +103,8 @@ JcpNearAccum accumulate_jcp_near_ordered(
     const std::vector<std::size_t> &order, std::size_t begin,
     std::size_t count, const std::string &near_integration,
     const std::string &quad_buffer,
-    TreecodeStats *stats = nullptr);
+    TreecodeStats *stats = nullptr,
+    const NearSourceCache *sources = nullptr);
 
 } // namespace TitanPBE::Tabi
 

@@ -1,10 +1,14 @@
 #include "arguments.h"
 #include "folder.h"
 #include "titan_interaction_entropy.h"
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <span>
+#include <sstream>
+#include <string>
 #include <vector>
 
 
@@ -14,10 +18,13 @@ double entropy_duan_zhang(std::span<const double> E_e,
   if (Arguments.entropy == false || E_e.empty())
     return 1;
 
-  const double e_con{1.38064 * 0.3 * 6.02214 / Arguments.eu_par};
+  const double e_con{1.38064e-3 * Arguments.gbsa_temperature * 6.02214 / Arguments.eu_par};
   TitanEntropy::InteractionEntropyOptions options;
   options.rt_energy = e_con;
-  options.filter_sigma = 2.0;
+  // KIN-22: no trimming by default (was a fixed 2-sigma cut, which removes
+  // the tail that decides the exponential average: Gaussian sigma = 5 kJ/mol
+  // gave 3.4 instead of 5.0 kJ/mol)
+  options.filter_sigma = Arguments.entropy_filter_sigma;
   options.min_samples = 1;
   const TitanEntropy::InteractionEntropyResult entropy =
       TitanEntropy::compute_interaction_entropy(E_e, E_v, options);
@@ -38,18 +45,74 @@ int print_average_entropy_duan_zhange_time(vector<double> &E_e,
   output << "# Time (" << Arguments.tu << ")     Interaction entropy ("
          << Arguments.eu << ")\n";
 
-  const size_t SIZE{E_e.size() > time_of_snap.size() ? time_of_snap.size()
-                                                     : E_e.size()};
-  for (size_t i{}; i < SIZE; ++i) {
-    std::span<const double> ee_span(E_e.data(), i + 1);
-    std::span<const double> ev_span(E_v.data(), i + 1);
+  size_t SIZE{E_e.size() > time_of_snap.size() ? time_of_snap.size()
+                                               : E_e.size()};
+  SIZE = std::min(SIZE, E_v.size());
+  const double kt_out{1.38064e-3 * Arguments.gbsa_temperature * 6.02214 /
+                      Arguments.eu_par};
+  if (Arguments.entropy == false || SIZE == 0)
+    return 0;
 
-    double entropy{entropy_duan_zhang(ee_span, ev_span, Arguments)};
+  if (Arguments.entropy_filter_sigma > 0.0) {
+    // trimming depends on the mean and sigma of each prefix: recompute
+    // (O(N^2), only when -entropy-filter-sigma > 0 is requested)
+    for (size_t i{}; i < SIZE; ++i) {
+      std::span<const double> ee_span(E_e.data(), i + 1);
+      std::span<const double> ev_span(E_v.data(), i + 1);
+      const double entropy{entropy_duan_zhang(ee_span, ev_span, Arguments)};
+      output << setw(7) << left << time_of_snap[i] << right << setw(14)
+             << kt_out * entropy << '\n';
+    }
+    return 0;
+  }
+
+  // KIN-22: the estimate on every prefix [0, i] from running sums, O(N):
+  //   -TdS(n) = kT [ln sum_j exp(x_j) - ln n - mean_n(x)],  x_j = E_j / kT
+  // (x taken relative to the first sample; the log-sum-exp kept as a running
+  // maximum and a rescaled sum). Same estimator as entropy_duan_zhang on the
+  // prefix; a non-finite sample makes every later prefix 0, as before.
+  const double x0 = (E_e[0] + E_v[0]) / kt_out;
+  double running_max = -std::numeric_limits<double>::infinity();
+  long double scaled_sum = 0.0L; // sum_j exp(y_j - running_max)
+  long double y_sum = 0.0L;
+  bool nonfinite = false;
+  for (size_t i{}; i < SIZE; ++i) {
+    const double y = (E_e[i] + E_v[i]) / kt_out - x0;
+    double dimensionless = 0.0;
+    if (!std::isfinite(y))
+      nonfinite = true;
+    if (!nonfinite) {
+      if (y > running_max) {
+        scaled_sum = scaled_sum * std::exp(static_cast<long double>(running_max - y)) + 1.0L;
+        running_max = y;
+      } else {
+        scaled_sum += std::exp(static_cast<long double>(y - running_max));
+      }
+      y_sum += y;
+      const long double n = static_cast<long double>(i + 1);
+      dimensionless = static_cast<double>(running_max + std::log(scaled_sum) -
+                                          std::log(n) - y_sum / n);
+    }
     output << setw(7) << left << time_of_snap[i] << right << setw(14)
-           << 1.38064 * 0.3 * 6.02214 * entropy / Arguments.eu_par << '\n';
+           << kt_out * dimensionless << '\n';
   }
   return 0;
 }
+
+namespace {
+// KIN-22: the settings of the estimate, written into entropy_result.dat
+std::string entropy_settings_line(const arguments &Arguments) {
+  std::ostringstream line;
+  line << "Settings: T = " << Arguments.gbsa_temperature
+       << " K, filter_sigma = " << Arguments.entropy_filter_sigma;
+  if (Arguments.entropy_filter_sigma > 0.0)
+    line << " (samples farther than " << Arguments.entropy_filter_sigma
+         << " standard deviations from the mean removed)";
+  else
+    line << " (no trimming)";
+  return line.str();
+}
+} // namespace
 
 int impl_entropy_duan_zhang(folders &paths, vector<vector<double>> &E_e_vector,
                             vector<vector<double>> &E_v_vector,
@@ -65,11 +128,12 @@ int impl_entropy_duan_zhang(folders &paths, vector<vector<double>> &E_e_vector,
 
   out_entropy
       << "Average entropy (from time dependence of mean entropy values): "
-      << 1.38064 * 0.3 * 6.02214 * entropy_duan_zhang(E_e, E_v, Arguments) /
+      << 1.38064e-3 * Arguments.gbsa_temperature * 6.02214 * entropy_duan_zhang(E_e, E_v, Arguments) /
              Arguments.eu_par
       << " " << Arguments.eu << "\n"
       << "(calculated from average energy of " << paths.get_size()
       << " trajectories)\n"
+      << entropy_settings_line(Arguments) << "\n"
       << "-------------------------------------o0o-----------------------------"
          "--------\n";
 
@@ -89,7 +153,7 @@ int impl_entropy_duan_zhang(folders &paths, vector<vector<double>> &E_e_vector,
       }
 
     const double exp_beta_deltaE{entropy_duan_zhang(e_ele, e_vdw, Arguments)};
-    double entropy_1traj{1.38064 * 0.3 * 6.02214 * exp_beta_deltaE /
+    double entropy_1traj{1.38064e-3 * Arguments.gbsa_temperature * 6.02214 * exp_beta_deltaE /
                          Arguments.eu_par};
     entropy_values.emplace_back(entropy_1traj);
 
@@ -102,6 +166,7 @@ int impl_entropy_duan_zhang(folders &paths, vector<vector<double>> &E_e_vector,
       fstream out_per_file(paths.get_path(i) + "/entropy_result.dat", ios::out);
       out_per_file << "Interaction entropy (-T*DeltaS)= " << entropy_1traj
                    << " " << Arguments.eu << "\n";
+      out_per_file << entropy_settings_line(Arguments) << "\n";
       out_per_file << "=-------------------------------------------------------"
                       "----------------------------=\n";
       out_per_file

@@ -93,7 +93,7 @@ private:
 
   std::uint64_t total_frames_seen_{0};
   std::uint64_t valid_frames_{0};
-  std::uint64_t skipped_invalid_box_frames_{0};
+  std::uint64_t no_box_frames_{0};
   std::uint64_t skipped_incomplete_frames_{0};
 
   titan_contact_geometry::ContactGeometryCache row_geometry_;
@@ -112,7 +112,7 @@ private:
       records_;
   std::uint64_t pooled_valid_frames_{0};
   std::uint64_t pooled_total_frames_seen_{0};
-  std::uint64_t pooled_skipped_invalid_box_frames_{0};
+  std::uint64_t pooled_no_box_frames_{0};
   std::uint64_t pooled_skipped_incomplete_frames_{0};
   std::vector<std::uint64_t> pooled_row_occupancy_frames_;
   std::vector<std::uint64_t> pooled_col_occupancy_frames_;

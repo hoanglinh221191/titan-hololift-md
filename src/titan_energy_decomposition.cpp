@@ -6,6 +6,7 @@
 #include "c6c12.h"
 #include "charmm_nonbonded.h"
 #include "gromos_nonbonded.h"
+#include "titan_lj_pair_override.h"
 #include "titan_topology_energy.h"
 #include "martini_nonbonded.h"
 
@@ -263,7 +264,7 @@ EnergyDecompositionProvider::pair_energy_generic_at_distance(
   if (args_->flag_elec_screening && (is_amber || is_charmm) &&
       args_->salt_concentration > 0.0) {
     const double lambda_debye = titan_electrostatics::debye_length_nm(
-        args_->salt_concentration);
+        args_->salt_concentration, args_->gbsa_temperature);
     screening = std::exp(-d_nm / lambda_debye);
   }
   out.elec = 138.935457839 * qi * qj * screening /
@@ -312,6 +313,11 @@ EnergyDecompositionProvider::pair_energy_generic_at_distance(
     // Match the production pair kernels' 4*epsilon convention.
     out.vdw = 4.0 * epsilon_ij *
               (square(sr6) - (repulsive_only ? 0.0 : sr6));
+    // ENE-11: pair-specific [ nonbond_params ] replace the combination rule.
+    if (cached_data_->has_charmm_pair_overrides())
+      titan_lj::override_lj_energy(*cached_data_, mol_a.parameters,
+                                   mol_b.parameters, pos_a, pos_b, d_nm,
+                                   out.vdw);
   }
   return out;
 }

@@ -1165,6 +1165,11 @@ IMPORTANT NOTES
       neighborhood size, while `-allostery-knn` still means pair-pruning top-k.
     - `-allostery-bins` and `-allostery-kde-bandwidth` are ignored in
       knn mode and TITAN logs that decision.
+    - hist/kde: every MI and TE entropy term is the plug-in estimate of the
+      binned counts with the Miller-Madow correction (m - 1)/(2N) (m occupied
+      bins, N samples); kde smooths the MI joint histogram and then uses
+      plug-in entropies. Residual bias remains when the B^3 bins of the TE
+      histogram are sparsely filled (N not >> B^3).
 
 2.6a Mutual Information / Generalized Correlation
 
@@ -1443,7 +1448,12 @@ IMPORTANT NOTES
     replica outputs; if it is omitted, TITAN maps each frame to the nearest
     inferred ladder temperature using the XVG temperature column.
     `-mbar-ensemble nvt` treats the XVG observable as energy.
-    `-mbar-ensemble npt` treats the XVG observable as enthalpy-like.
+    `-mbar-ensemble npt` reweights with beta (U + p V): p from
+    `-mbar-pressure-bar` (default 1 bar), V from the trajectory boxes, U the
+    XVG column (the potential energy); <H> and Cp are then those of
+    H = U + p V. Without box volumes (energy-only input) or with a pressure
+    <= 0 the p V term is not added and the XVG column is used as it is;
+    mbar_summary.dat states which ("MBAR pV Term").
     `-mbar-domain tica` reuses the TICA/MSM frame metadata path.
     `-mbar-domain pca` reuses PCA trajectory metadata and the standard
     `pca_fel.csv` projection export.
@@ -2131,9 +2141,12 @@ IMPORTANT NOTES
   -mol2 <N>             Starting residue/atom index for molecule 2
   -n_wat <N>            Zero-based water index-group number; -1 disables
 
-  -b <time>             Begin time (ps)
-  -e <time>             End time (ps)
-  -dt <N>               Frame step interval
+  -b <time>             Begin time (ps, or ns with -tu=ns)
+  -e <time>             End time (ps, or ns with -tu=ns)
+  -dt <N>               Time between analysed frames (ps, or whole ns with
+                        -tu=ns)
+  -tu <ps|ns>           Time unit of -b/-e/-dt and of the times written in
+                        the outputs. Default: ps
   -nt <N>               Number of threads
 
 4.3 Energy / Solvation / Entropy
@@ -2515,7 +2528,15 @@ IMPORTANT NOTES
   -denfo <val>          Distance-energy cutoff
   -dsc <val>            Standard distance cutoff. Default: 6.5 A
 
-  -entropy              Interaction entropy
+  -entropy              Interaction entropy (Duan-Zhang), -TdS = kT ln
+                        <exp(beta (E - <E>))>, E = E_elec + E_vdW, at the
+                        -temperature (default 298.15 K)
+  -entropy-filter-sigma <x>
+                        Drop samples farther than x standard deviations from
+                        the mean before the exponential average. Default: 0
+                        (no trimming; a 2-sigma cut removes the tail that
+                        decides the average: -33 % for Gaussian sigma = 5
+                        kJ/mol). Written to entropy_result.dat.
   -entropy-quasi <com> <lig> <rec>
   -qha-temp=<K>                 Quasi-harmonic temperature (default: 300 K).
   -ml-predict-experimental=true  No effect. The bundled affinity model is closed
@@ -2743,9 +2764,13 @@ IMPORTANT NOTES
                         Optional per-frame state-assignment map for raw
                         replica outputs
   -mbar-pressure-bar <bar>
-                        Target/reporting pressure for NPT MBAR. Default: 1.0
+                        Pressure of the NPT p V term. Default: 1.0
   -mbar-dt-energy <ps>  Energy sampling interval in ps; 0 = auto
   -mbar-bootstrap <N>   Bootstrap replicates for Cv/<E> uncertainty. Default: 0
+                        Moving-block resampling per replica series, block
+                        length ceil(4 g) (g = statistical inefficiency);
+                        replicates whose MBAR solve fails are dropped and
+                        counted in mbar_summary.dat
   -mbar-scan-points <N> Number of temperature scan points; >1 writes mbar_cv.dat
                         Raw MBAR .xvg input also honors global -b/-e/-dt
 
@@ -3005,16 +3030,21 @@ IMPORTANT NOTES
   -water-type <type>    Water mode: surface or sphere
   -dis-water <val>      Water distance cutoff. Default: 3.5
 
-  -charged_atom_dis [N] Charged-atom distance distribution
+  -charged_atom_dis [N] -nocal: distribution of the distances from mol1's
+                        centre of mass to its charged atoms, per input
+                        (<input>_distributionChargedAtoms.dat); N bins (400)
   -charged_distances_min <val>
                         Min charged distance
   -charged_distances_max <val>
                         Max charged distance
   -angle_dipole_efield [N]
-                        Dipole-electric-field angle distribution
+                        -nocal: distribution of the cosine between each water
+                        dipole and the solute field there, per input; N bins
   -cal-mindis           Minimum distance per frame
-  -resdis2com           Residue-to-COM distance analysis
-  -com-dis <axis>       x, y, z, or default euclidean
+  -resdis2com           -nocal: distance from each residue's centre of mass
+                        to mol1's, mean and SD per input
+  -com-dis <axis>       mol1-mol2 centre-of-mass distance per frame
+                        (out_dis_com.dat): x, y, z, or xyz (default)
 
 4.7 Miscellaneous
 
@@ -3025,17 +3055,25 @@ IMPORTANT NOTES
                         LJ in this mode analyzes molecule 1 only
                         RMSD/RMSF in this mode analyzes molecule 1 only
                         GBSA/ALPB are ignored in this mode
-  -cscd                 Side-chain contact distances
-  -pqr                  Write PQR-style output
+  -cscd                 Side-chain centre-of-mass distance from each mol1
+                        residue to the nearest mol2 residue, one file per
+                        residue (out_cal_dis_com_<chain><resnr>.dat);
+                        -act gives one column per mol2 residue. Glycine,
+                        non-amino-acid residues and -side_chain_contact
+                        full-res use whole-residue centres; the file header
+                        says which
+  -pqr                 Write PQR-style output
   -cal-force            Calculate atomic forces
-  -cal-volume           Molecular volume
+  -cal-volume           -nocal: box volume per frame (volume.dat) and its
+                        mean, SD and 95% CI (stat_volumes.dat)
   -max-force            Report maximum force
   -cache                Enable cache
   -cache -no            Disable cache
   -use-CI               Use confidence intervals
   -elec-screening       Debye-Huckel screening for aqueous 1:1 electrolyte at
                         298.15 K (kappa=3.291*sqrt(I) nm^-1).
-  -dipole-moment        Dipole moment analysis
+  -dipole-moment        -nocal: mol1 dipole moment per frame
+                        (<input>_dipole_moment.dat)
   -split                Split results per trajectory
   -all-subfolders       Process all subfolders and split outputs
   -cat-result           Concatenate results from multiple inputs
@@ -3043,8 +3081,8 @@ IMPORTANT NOTES
   -contact-map yes      Deprecated alias for -cmap -cmap-scope=interface
                         -cmap-mode=sidechain-com; -dsc supplies its cutoff
   -contact-map no       Disable the deprecated alias only
-  -act                  Use all side-chain contacts
-  -new_al               New alignment in single-PDB mode
+  -act                  -cscd: every mol2 residue, not only the nearest
+  -new_al              New alignment in single-PDB mode
   -new-al               Alias of -new_al
   -side_chain_contact <mode>
                         full-res or other

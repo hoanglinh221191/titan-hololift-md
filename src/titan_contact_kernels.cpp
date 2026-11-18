@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <immintrin.h>
+#include <limits>
 
 namespace titan_contact_kernel {
 namespace {
@@ -242,6 +243,34 @@ void native_distances_optimized(const PointSoA &rows, const PointSoA &cols,
   native_distances_scalar(rows, cols, pairs, begin, bounded_end, box_matrix,
                           out_distances);
 #endif
+}
+
+void native_min_distances_ranges(const PointSoA &rows, const PointSoA &cols,
+                                 const std::vector<NativePairRange> &pairs,
+                                 std::size_t begin, std::size_t end,
+                                 const BoxMatrix &box_matrix,
+                                 std::vector<double> &out_distances) {
+  if (out_distances.size() < pairs.size())
+    out_distances.resize(pairs.size());
+  const std::size_t bounded_end = std::min(end, pairs.size());
+  for (std::size_t i = begin; i < bounded_end; ++i) {
+    const NativePairRange &pair = pairs[i];
+    double nearest_sq = std::numeric_limits<double>::infinity();
+    const std::size_t row_end =
+        std::min(pair.row_begin + pair.row_count, rows.size());
+    const std::size_t col_end =
+        std::min(pair.col_begin + pair.col_count, cols.size());
+    for (std::size_t r = pair.row_begin; r < row_end; ++r) {
+      for (std::size_t c = pair.col_begin; c < col_end; ++c) {
+        double dx = rows.x[r] - cols.x[c];
+        double dy = rows.y[r] - cols.y[c];
+        double dz = rows.z[r] - cols.z[c];
+        box_matrix.apply_mic(dx, dy, dz);
+        nearest_sq = std::min(nearest_sq, dx * dx + dy * dy + dz * dz);
+      }
+    }
+    out_distances[i] = std::sqrt(nearest_sq);
+  }
 }
 
 } // namespace titan_contact_kernel

@@ -66,6 +66,9 @@ public:
                                 nullptr);
 
   void finalize(std::fstream &log);
+  // Non-empty when a BIE frame did not succeed (status other than ok); the
+  // caller exits non-zero after every module has written its outputs.
+  [[nodiscard]] std::string failure_summary() const;
 
 private:
   std::unique_ptr<AnalyzerImpl> impl_;

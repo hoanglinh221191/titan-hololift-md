@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -694,7 +695,11 @@ SurfaceMesh build_triangle_mesh(const std::vector<Atom> &atoms,
     std::vector<SphereClip::Cap> caps;
     caps.reserve(neighbors[atom_index].size());
     bool covered = false;
-    if (options.surface_mode == "vdw") {
+    // Without clipping (-pbe-bie-sphere-patch-clip=off) the triangles stay
+    // whole and the buried test below decides each one, as before the
+    // clipping was introduced.
+    const bool clip = options.surface_mode == "vdw" && options.sphere_patch_clip;
+    if (clip) {
       for (const auto j : neighbors[atom_index]) {
         const auto &other = atoms[j];
         const double dx = other.x - atom.x, dy = other.y - atom.y,
@@ -764,7 +769,7 @@ SurfaceMesh build_triangle_mesh(const std::vector<Atom> &atoms,
         const double py = atom.y + panel_uy * radius;
         const double pz = atom.z + panel_uz * radius;
 
-        if (options.surface_mode != "vdw") {
+        if (!clip) {
           const bool centroid_buried = point_buried(
               px, py, pz, atoms, surface_radii, neighbors[atom_index]);
           const int buried_vertices =
@@ -1112,7 +1117,12 @@ std::vector<Panel> build_surface(const std::vector<Atom> &atoms,
                        finite_atoms, options.ses_grid_spacing,
                        options.probe_radius, executor,
                        options.ses_max_grid_vertices, true,
-                       options.analytic_ses_engine)
+                       options.analytic_ses_engine, options.ses_remesh_edge,
+                       calderon::ChargeRefinement{
+                           options.ses_charge_refine,
+                           options.ses_charge_refine_min_edge,
+                           options.ses_charge_refine_min_charge},
+                       options.ses_remesh_iterations)
                  : calderon::build_implicit_ses_surface(
                        finite_atoms, options.ses_grid_spacing,
                        options.probe_radius, executor,
@@ -1145,11 +1155,84 @@ std::vector<Panel> build_surface(const std::vector<Atom> &atoms,
           " surface failed watertight topology gate: " +
           primary_surface.status + hint);
     }
+    if (analytic && options.analytic_ses_engine == "patch-ray-resolution") {
+      // The resolution policy accepts what the certified engine refuses, so
+      // say how much of the surface is on the analytic patches.
+      const auto &s = primary_surface;
+      const std::size_t vertices = s.mesh.vertices.size();
+      std::cerr << "TABI SES patch-ray-resolution: h=" << options.ses_grid_spacing
+                << " A vertices=" << vertices
+                << " triangles=" << s.mesh.triangles.size()
+                << " marching_vertices=" << s.projection_queries
+                << " projected=" << s.projected_vertices << " ("
+                << (s.projection_queries == 0U
+                        ? 0.0
+                        : 100.0 * static_cast<double>(s.projected_vertices) /
+                              static_cast<double>(s.projection_queries))
+                << "%) partial=" << s.resolution_partial_projection_vertices
+                << " star_refused=" << s.resolution_star_refused_vertices
+                << " sheet_refused=" << s.resolution_sheet_refused_vertices
+                << " missing=" << s.resolution_missing_projection_vertices
+                << " reverted=" << s.resolution_reverted_vertices
+                << " revert_rounds=" << s.resolution_revert_rounds
+                << " initial_intersections="
+                << s.resolution_initial_intersections
+                << " odd_ray_rows=" << s.odd_ray_rows
+                << " uncertified_ray_rows="
+                << s.patch_ray_unresolved_uncertified_rows
+                << " nearby_parity_vertices="
+                << s.resolution_nearby_parity_vertices
+                << " fallback_sign_vertices=" << s.morphology_fallback_vertices
+                << " thin_solvent_filled=" << s.resolution_thin_solvent_filled
+                << " thin_plates_opened=" << s.resolution_thin_plates_opened
+                << " unprojected_distance_max_A="
+                << s.resolution_unprojected_distance_max
+                << " projection_rms_A=" << s.analytic_projection_distance_rms
+                << " min_angle_below_5/10/20_deg=" << s.resolution_angle_below_5
+                << '/' << s.resolution_angle_below_10 << '/'
+                << s.resolution_angle_below_20
+                << " remesh_edge_A=" << s.resolution_remesh_edge
+                << " remesh_iterations=" << s.resolution_remesh_iterations
+                << " remesh_undone=" << s.resolution_remesh_reverted
+                << " splits=" << s.resolution_remesh_splits
+                << " collapses=" << s.resolution_remesh_collapses
+                << " remesh_flips=" << s.resolution_remesh_flips
+                << " off_surface=" << s.resolution_remesh_off_surface
+                << " remesh_sheet_refused=" << s.resolution_remesh_sheet_refused
+                << " refine_charges=" << s.resolution_refine_charges
+                << " refined_vertices=" << s.resolution_refined_vertices
+                << " analytic_normals=" << s.resolution_analytic_normal_vertices
+                << " analytic_normal_refused="
+                << s.resolution_analytic_normal_refused
+                << " edges_below_0.05/0.2_A=" << s.resolution_short_edges_005
+                << '/' << s.resolution_short_edges_020
+                << " edge_min_A=" << s.resolution_edge_min
+                << " edge_mean_A=" << s.resolution_edge_mean
+                << " build_s=" << s.build_ms / 1000.0
+                << " (patches_s=" << s.patch_build_ms / 1000.0
+                << " rays_s=" << s.ray_build_ms / 1000.0
+                << " topology_s=" << s.topology_ms / 1000.0
+                << " polygonize_s=" << s.polygonize_ms / 1000.0
+                << " projection_s=" << s.projection_ms / 1000.0
+                << " remesh_s=" << s.resolution_remesh_ms / 1000.0 << ")\n";
+    }
+    if (!analytic) {
+      const auto &s = primary_surface;
+      std::cerr << "TABI Grid-SES: h=" << options.ses_grid_spacing
+                << " A vertices=" << s.mesh.vertices.size()
+                << " triangles=" << s.mesh.triangles.size()
+                << " projected=" << s.projected_vertices << " ("
+                << (s.projection_queries == 0U
+                        ? 0.0
+                        : 100.0 * static_cast<double>(s.projected_vertices) /
+                              static_cast<double>(s.projection_queries))
+                << "%) build_s=" << s.build_ms / 1000.0 << "\n";
+    }
     mesh = std::move(primary_surface.mesh);
     calderon_trace = std::move(primary_surface.trace_spaces);
     mesh.sphere_mesh_mode = options.primary_surface;
-    if (analytic && options.analytic_ses_engine ==
-                        "patch-ray-experimental") {
+    if (analytic && (options.analytic_ses_engine == "patch-ray-experimental" ||
+                     options.analytic_ses_engine == "patch-ray-resolution")) {
       // Reuse the established profile columns as a stable high-level split:
       // neighbor = patch graph + compact ray CSR, mesh = topology + active
       // polygonization + projection/repair. surface_build_ms remains total.
@@ -1165,6 +1248,27 @@ std::vector<Panel> build_surface(const std::vector<Atom> &atoms,
       if (vertex.atom_index < original_indices.size()) {
         vertex.atom_index = original_indices[vertex.atom_index];
       }
+    }
+    // Hand the analytic vertex normals to the triangles, where node-patch
+    // construction can find them by vertex index.  Only the surface engine
+    // knows which vertices lie on the SES - the analytic engines' certified
+    // projections, or Grid-SES vertices moved onto it from their nearest
+    // probe position - so this is the last point at which the information
+    // exists.
+    if (std::any_of(mesh.vertices.begin(), mesh.vertices.end(),
+                    [](const Vertex &v) { return v.normal_analytic; })) {
+      constexpr double nan = std::numeric_limits<double>::quiet_NaN();
+      auto normals = std::make_shared<std::vector<std::array<double, 3>>>(
+          mesh.vertices.size(), std::array<double, 3>{nan, nan, nan});
+      for (std::size_t i = 0; i < mesh.vertices.size(); ++i) {
+        const Vertex &v = mesh.vertices[i];
+        if (v.normal_analytic)
+          (*normals)[i] = {v.nx, v.ny, v.nz};
+      }
+      std::shared_ptr<const std::vector<std::array<double, 3>>> shared =
+          std::move(normals);
+      for (Panel &panel : mesh.panels)
+        panel.analytic_vertex_normals = shared;
     }
     for (Triangle &triangle : mesh.triangles) {
       if (triangle.atom_index < original_indices.size()) {
@@ -1238,11 +1342,9 @@ std::vector<Panel> build_surface(const std::vector<Atom> &atoms,
         primary_surface.analytic_ses_engine;
     result->surface_status_detail = primary_surface.status;
     if (options.primary_surface == "sphere-patch" && options.surface_mode == "vdw") {
-      result->surface_topology_source = "sphere_patch_cap_clip";
-      result->surface_status_detail = "approximate_exposed_patches";
-    }
-    if (options.primary_surface == "sphere-patch" && options.surface_mode == "vdw") {
-      result->surface_topology_source = "sphere_patch_cap_clip";
+      result->surface_topology_source = options.sphere_patch_clip
+                                            ? "sphere_patch_cap_clip"
+                                            : "sphere_patch_whole_triangles";
       result->surface_status_detail = "approximate_exposed_patches";
     }
     result->surface_cavity_policy = primary_surface.cavity_policy;

@@ -68,6 +68,7 @@ struct PbctopoSelectedEvidenceAudit {
   std::size_t selected_compatible_contact_loss_count = 0;
   std::size_t no_supported_contact_relation_count = 0;
   bool selected_relation_has_support = false;
+  PbctopoContactCycleSummary contact_cycle;
   std::vector<PbctopoSelectedEvidenceRelationAudit> relation_audits;
 };
 
@@ -506,8 +507,15 @@ audit_pbctopo_selected_hypotheses(
       3 * result.unconstrained_relative_components;
   result.evaluated = true;
   result.consistent = lost_pairs.empty();
+  result.contact_cycle = hypothesis_set.contact_cycle;
+  // A pair seen at two images is a nonzero cycle of length two, so every
+  // frame with ambiguous relations has rank >= 1 when the cycle lattice was
+  // evaluated; weak_ambiguous remains for a rank-0 network whose selected
+  // placement leaves a relation unsupported.
   if (!result.consistent) {
     result.state = PbctopoEvidenceState::Contradicted;
+  } else if (result.contact_cycle.evaluated && result.contact_cycle.rank > 0) {
+    result.state = PbctopoEvidenceState::ExtendedPeriodic;
   } else if (unsupported_relation ||
              hypothesis_set.ambiguous_component_relation_count != 0) {
     result.state = PbctopoEvidenceState::WeakAmbiguous;

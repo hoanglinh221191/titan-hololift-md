@@ -25,7 +25,15 @@ struct NodeAccum {
   double owner_area{-1.0};
   std::size_t atom_index{0};
   bool initialized{false};
+  // Certified analytic SES normal at the vertex, when the surface has one.
+  std::array<double, 3> analytic_normal{};
+  bool has_analytic_normal{false};
 };
+
+// The surface engine refuses a vertex whose star turns more than this far
+// from its analytic normal (kResolutionSheetCosine); the same bound keeps a
+// node from taking the normal of a facing sheet.
+constexpr double kAnalyticNormalStarCosine = 0.2;
 
 std::array<double, 3> panel_vertex(const Panel &panel, int local) {
   if (local == 0)
@@ -129,6 +137,14 @@ build_node_patch_panels(const std::vector<Panel> &triangle_panels,
             "PBE BIE: inconsistent coordinates for a shared mesh vertex.");
       node.xyz = xyz;
       node.initialized = true;
+      if (!node.has_analytic_normal && panel.analytic_vertex_normals &&
+          id < panel.analytic_vertex_normals->size()) {
+        const auto &n = (*panel.analytic_vertex_normals)[id];
+        if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2])) {
+          node.analytic_normal = n;
+          node.has_analytic_normal = true;
+        }
+      }
       const double share = panel.area / 3.0;
       node.area += share;
       node.nx_area += share * panel.nx;
@@ -218,6 +234,36 @@ build_node_patch_panels(const std::vector<Panel> &triangle_panels,
     patch.nx = node.nx_area / norm;
     patch.ny = node.ny_area / norm;
     patch.nz = node.nz_area / norm;
+    // The flat patch takes a third of each incident triangle, so the
+    // area-weighted star normal is its mean normal: the one-point source
+    // normal, whatever the collocation normal becomes below.
+    patch.source_nx = patch.nx;
+    patch.source_ny = patch.ny;
+    patch.source_nz = patch.nz;
+    // The collocation point is the vertex, so its normal is the surface
+    // normal there when the surface is analytic: that is the tangent plane
+    // the curved cell is built on and the one the jump coefficient assumes.
+    // The area-weighted star normal remains for vertices off the analytic
+    // surface and for surfaces without one.
+    if (node.has_analytic_normal) {
+      const auto &n = node.analytic_normal;
+      const double length = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+      const double cosine =
+          length > 0.0
+              ? (n[0] * patch.nx + n[1] * patch.ny + n[2] * patch.nz) / length
+              : -1.0;
+      if (cosine >= kAnalyticNormalStarCosine) {
+        patch.nx = n[0] / length;
+        patch.ny = n[1] / length;
+        patch.nz = n[2] / length;
+        ++geometry->analytic_normal_nodes;
+      } else {
+        ++geometry->analytic_normal_rejected;
+        ++geometry->averaged_normal_nodes;
+      }
+    } else {
+      ++geometry->averaged_normal_nodes;
+    }
     patch.area = node.area;
     constexpr double two_pi = 2.0 * 3.14159265358979323846;
     patch.diagonal = diagonal_mode == "off" ? 0.0 : 1.0;

@@ -134,6 +134,13 @@ std::array<double, 4> evaluate_cartesian_jcp_l2p_order(
     double target_center_y, double target_center_z,
     const CartesianJcpLocalP4 &local, int target_order) noexcept;
 
+// [0] at high_order, [1] at low_order, in one pass; equal bit for bit to two
+// calls of evaluate_cartesian_jcp_l2p_order().
+std::array<std::array<double, 4>, 2> evaluate_cartesian_jcp_l2p_two_orders(
+    const PrototypePanel &target, double target_center_x,
+    double target_center_y, double target_center_z,
+    const CartesianJcpLocalP4 &local, int high_order, int low_order) noexcept;
+
 } // namespace titan::tabi::fmm_m2l
 
 #endif // TITAN_TABI_FMM_M2L_LOCAL_H

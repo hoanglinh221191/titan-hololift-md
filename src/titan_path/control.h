@@ -104,6 +104,24 @@ select_epsilon_progress_candidate(std::span<const SelectionCandidate> candidates
                                   std::optional<double>
                                       navigation_cost_epsilon = std::nullopt);
 
+// Offline short-path search ONLY. Same objective as Advance, but permits a
+// nonnegative-progress prefix. This does not admit a complete path or MD step.
+[[nodiscard]] SelectionResult select_epsilon_nonnegative_prefix_candidate(
+    std::span<const SelectionCandidate> candidates, double energy_key_epsilon,
+    std::optional<double> navigation_cost_epsilon = std::nullopt);
+
+// Opt-in rerouting ONLY: caller validates episode/clearance/goal constraints.
+// Retains Advance energy/navigation/progress ranking; permits <=0.5 A retreat.
+[[nodiscard]] SelectionResult select_epsilon_reroute_candidate(
+    std::span<const SelectionCandidate> candidates, double energy_key_epsilon,
+    std::optional<double> navigation_cost_epsilon = std::nullopt);
+
+// Opt-in exploratory domain: progress is ranked, not a hard eligibility gate.
+// Caller still owns finite geometry, swept clearance and physical MD admission.
+[[nodiscard]] SelectionResult select_epsilon_exploratory_candidate(
+    std::span<const SelectionCandidate> candidates, double energy_key_epsilon,
+    std::optional<double> navigation_cost_epsilon = std::nullopt);
+
 } // namespace titan_path
 
 #endif

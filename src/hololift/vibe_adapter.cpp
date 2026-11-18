@@ -59,6 +59,7 @@ convert_evidence_state(titan_pbctopo::PbctopoEvidenceState value) noexcept {
   case Source::Contradicted:
     return HoloLiftEvidenceState::Contradicted;
   case Source::WeakAmbiguous:
+  case Source::ExtendedPeriodic:
     return HoloLiftEvidenceState::WeakAmbiguous;
   }
   return HoloLiftEvidenceState::NotEvaluated;
@@ -341,6 +342,8 @@ hololift_vibe_frame_provenance(
           titan_pbctopo::PbctopoEvidenceState::WeakDisconnected ||
       report.evidence_state ==
           titan_pbctopo::PbctopoEvidenceState::WeakAmbiguous ||
+      report.evidence_state ==
+          titan_pbctopo::PbctopoEvidenceState::ExtendedPeriodic ||
       report.evidence_state == titan_pbctopo::PbctopoEvidenceState::Contradicted;
   if (evaluated_evidence &&
       (!report.soft_observed_contact_construction_attempted ||
@@ -370,7 +373,13 @@ hololift_vibe_frame_provenance(
       report.temporal_inference_experimental
           ? HoloLiftTemporalPolicyStatus::ExperimentalViterbiDiagnostic
           : HoloLiftTemporalPolicyStatus::FramewiseProduction;
-  provenance.evidence_state = convert_evidence_state(report.evidence_state);
+  // HoloLift keeps the schema-7 evidence semantics (extended_periodic is
+  // mapped back to the state the 1.0.x rule gave).
+  provenance.evidence_state = convert_evidence_state(
+      titan_pbctopo::pbctopo_schema7_evidence_state(
+          report.evidence_state, report.soft_observed_ambiguous_relation_count,
+          report.soft_observed_no_support_relation_count,
+          report.evidence_graph_connected));
   provenance.evidence_consistency_evaluated =
       report.evidence_consistency_evaluated;
   provenance.evidence_consistent = report.evidence_consistent;

@@ -418,51 +418,6 @@ void TitanLLPS::process_frame_impl(const std::vector<float> &pos_nm,
                                   .count();
   }
 
-  if (adj_ring_.empty()) {
-    const std::size_t avail = get_available_ram();
-    const std::size_t ring_budget =
-        (avail > 0) ? (avail / 4) : (256ULL * 1024ULL * 1024ULL);
-    const std::size_t bytes_per_slot =
-        static_cast<std::size_t>(n_words_) * sizeof(uint64_t);
-    const int ideal_cap = max_lag_frames_ * 2;
-    int ring_cap_local = ideal_cap;
-    if (bytes_per_slot > 0) {
-      int budget_cap = static_cast<int>(ring_budget / bytes_per_slot);
-      budget_cap = std::max(budget_cap, max_lag_frames_ + 1);
-      ring_cap_local = std::min(ring_cap_local, budget_cap);
-    }
-    ring_cap_local = std::max(ring_cap_local, 2);
-    max_ring_cap_ = ring_cap_local;
-    adj_ring_.resize(static_cast<std::size_t>(max_ring_cap_),
-                     std::vector<uint64_t>(static_cast<std::size_t>(n_words_),
-                                           0));
-    ct_num_.assign(static_cast<std::size_t>(max_lag_frames_), 0.0);
-    ct_den_.assign(static_cast<std::size_t>(max_lag_frames_), 0.0);
-    ct_count_.assign(static_cast<std::size_t>(max_lag_frames_), 0);
-    pair_contact_cnt_.assign(static_cast<std::size_t>(n_pairs_), 0);
-  }
-
-  const int slot = ct_total_frames_ % max_ring_cap_;
-  auto &bits = adj_ring_[static_cast<std::size_t>(slot)];
-  std::fill(bits.begin(), bits.end(), uint64_t(0));
-  for (uint64_t key : contacts) {
-    const auto [ci, cj] = unpack_pair(key);
-    set_adj_bit(bits, ci, cj);
-  }
-
-  for (int word = 0; word < n_words_; ++word) {
-    uint64_t mask = bits[static_cast<std::size_t>(word)];
-    while (mask) {
-      const int bit = __builtin_ctzll(mask);
-      const int idx = word * 64 + bit;
-      if (idx < n_pairs_)
-        ++pair_contact_cnt_[static_cast<std::size_t>(idx)];
-      mask &= mask - 1;
-    }
-  }
-  ring_count_ = std::min(ring_count_ + 1, max_ring_cap_);
-  ++ct_total_frames_;
-
   uf_.reset(n_macro_);
   degree_buf_.assign(static_cast<std::size_t>(n_macro_), 0);
   auto &degree = degree_buf_;
@@ -518,11 +473,14 @@ void TitanLLPS::process_frame_impl(const std::vector<float> &pos_nm,
   result_.frames.push_back({frame_idx, time_ns, gcc_fraction, n_clusters,
                             gcc_size, gcc_rg, mean_k, rho_dense, rho_dilute, phase});
 
+  bool percolates_now = false;
   if (!result_.is_percolated && gcc_fraction >= perc_thr_) {
     result_.is_percolated = true;
     result_.percolation_time_ns = time_ns;
     percolation_frame_idx_ = static_cast<int>(result_.frames.size()) - 1;
+    percolates_now = true;
   }
+  record_ct_frame(contacts, percolates_now);
 
   int local_max_k = 0;
   for (int d : degree)
@@ -532,10 +490,20 @@ void TitanLLPS::process_frame_impl(const std::vector<float> &pos_nm,
     pk_sq_.resize(static_cast<std::size_t>(local_max_k + 1), 0.0);
     pk_max_k_ = local_max_k;
   }
-  for (int d : degree) {
-    const double pk = (n_macro_ > 0) ? (1.0 / n_macro_) : 0.0;
-    pk_sum_[static_cast<std::size_t>(d)] += pk;
-    pk_sq_[static_cast<std::size_t>(d)] += pk * pk;
+  // STR-04: P_f(k), the fraction of nodes with degree k in this frame; the
+  // sums of P_f(k) and P_f(k)^2 over frames give the mean and the standard
+  // deviation across frames. The old code added (1/n)^2 once per node.
+  if (n_macro_ > 0) {
+    std::vector<int> &histogram = degree_hist_buf_;
+    histogram.assign(static_cast<std::size_t>(local_max_k + 1), 0);
+    for (int d : degree)
+      ++histogram[static_cast<std::size_t>(d)];
+    const double inv_n = 1.0 / static_cast<double>(n_macro_);
+    for (int k = 0; k <= local_max_k; ++k) {
+      const double pk = histogram[static_cast<std::size_t>(k)] * inv_n;
+      pk_sum_[static_cast<std::size_t>(k)] += pk;
+      pk_sq_[static_cast<std::size_t>(k)] += pk * pk;
+    }
   }
 
   if(density_mode_!="off" && density_mode_!="projection" && cell_.metric && !gcc_representatives.empty()) {
@@ -644,6 +612,83 @@ void TitanLLPS::process_frame_impl(const std::vector<float> &pos_nm,
 
 
 // ============================================================================
+// C(t) history (STR-03)
+// ============================================================================
+// The old estimator kept a ring of the last 2*500 frames (500 fixed, not
+// -llps-maxlag; shorter when RAM was short), counted the persistent pattern
+// over every frame but compared it with half the post-percolation frames,
+// and took dt from the first two frames. Now the window is the
+// post-percolation frames, both for the pattern and for the origins, every
+// window frame is an origin, and the lag time uses the median step.
+void TitanLLPS::record_ct_frame(const std::vector<uint64_t> &contacts,
+                                bool restart) {
+  if (n_words_ <= 0 || n_pairs_ <= 0)
+    return;
+  const std::size_t words = static_cast<std::size_t>(n_words_);
+  const std::size_t bytes_per_frame = words * sizeof(uint64_t);
+  if (pair_contact_cnt_.size() != static_cast<std::size_t>(n_pairs_))
+    pair_contact_cnt_.assign(static_cast<std::size_t>(n_pairs_), 0);
+  if (ct_budget_bytes_ == 0) {
+    // as the old ring: a quarter of the free RAM, at least 256 MB
+    const std::size_t avail = get_available_ram();
+    ct_budget_bytes_ =
+        std::max<std::size_t>(256ULL * 1024ULL * 1024ULL, avail / 4);
+  }
+  if (restart) {
+    // first percolated frame: the frames before it leave the window
+    ct_history_.clear();
+    ct_stored_frames_ = 0;
+    ct_stride_ = 1;
+    ct_window_frames_ = 0;
+    std::fill(pair_contact_cnt_.begin(), pair_contact_cnt_.end(), 0);
+  }
+
+  ct_bits_buf_.assign(words, 0);
+  for (uint64_t key : contacts) {
+    const auto [ci, cj] = unpack_pair(key);
+    set_adj_bit(ct_bits_buf_, ci, cj);
+  }
+  for (std::size_t word = 0; word < words; ++word) {
+    uint64_t mask = ct_bits_buf_[word];
+    while (mask) {
+      const int idx = static_cast<int>(word) * 64 + __builtin_ctzll(mask);
+      if (idx < n_pairs_)
+        ++pair_contact_cnt_[static_cast<std::size_t>(idx)];
+      mask &= mask - 1;
+    }
+  }
+
+  if (ct_window_frames_ % ct_stride_ == 0 && ct_stored_frames_ >= 2 &&
+      (ct_stored_frames_ + 1) * bytes_per_frame > ct_budget_bytes_) {
+    // keep stored frames 0, 2, 4, ... (window frames 0, 2s, 4s, ...)
+    std::size_t kept = 0;
+    for (std::size_t f = 0; f < ct_stored_frames_; f += 2, ++kept)
+      std::copy_n(ct_history_.begin() + static_cast<std::ptrdiff_t>(f * words),
+                  words,
+                  ct_history_.begin() + static_cast<std::ptrdiff_t>(kept * words));
+    ct_stored_frames_ = kept;
+    ct_history_.resize(kept * words);
+    ct_stride_ *= 2;
+    if (!ct_budget_warned_) {
+      ct_budget_warned_ = true;
+      TitanUI::print_warning(
+          "LLPS: the C(t) contact history reached its memory budget (" +
+          std::to_string(ct_budget_bytes_ >> 20) +
+          " MB); C(t) now keeps one window frame in " +
+          std::to_string(ct_stride_) +
+          " (the stride doubles again if needed; llps_summary.dat records "
+          "the final ct_frame_stride).");
+    }
+  }
+  if (ct_window_frames_ % ct_stride_ == 0) {
+    ct_history_.insert(ct_history_.end(), ct_bits_buf_.begin(),
+                       ct_bits_buf_.end());
+    ++ct_stored_frames_;
+  }
+  ++ct_window_frames_;
+}
+
+// ============================================================================
 // Finalize
 // ============================================================================
 double TitanLLPS::fit_tau(const std::vector<double> &ct,
@@ -681,7 +726,9 @@ void TitanLLPS::finalize(TitanExecutor &executor, int max_lag_frames) {
 
   const int perc_frame = (percolation_frame_idx_ >= 0) ? percolation_frame_idx_ : 0;
   const int post_perc_frames = N - perc_frame;
-  if (post_perc_frames >= 2 && n_words_ > 0 && ring_count_ >= 2) {
+  const int stored = static_cast<int>(ct_stored_frames_);
+  if (post_perc_frames >= 2 && n_words_ > 0 && stored >= 2 &&
+      ct_window_frames_ == post_perc_frames) {
     std::vector<uint64_t> mean_adj(static_cast<std::size_t>(n_words_), 0);
     for (int idx = 0; idx < n_pairs_; ++idx) {
       if (pair_contact_cnt_[static_cast<std::size_t>(idx)] * 2 >= post_perc_frames)
@@ -689,13 +736,30 @@ void TitanLLPS::finalize(TitanExecutor &executor, int max_lag_frames) {
             (uint64_t(1) << (idx & 63));
     }
 
-    const int usable_ring = ring_count_;
-    const int n_lags = std::min(max_lag_frames, usable_ring / 2);
+    // lag index k = k * stride window frames; at least half of the stored
+    // frames are origins of the longest lag, as before
+    const int n_lags =
+        std::min(std::max(1, max_lag_frames / ct_stride_), stored / 2);
     result_.ct_lags_ns.assign(static_cast<std::size_t>(n_lags), 0.0);
     result_.ct_values.assign(static_cast<std::size_t>(n_lags), 0.0);
-    const double dt_ns =
-        (N >= 2) ? (result_.frames[1].time_ns - result_.frames[0].time_ns) : 1.0;
-    const int ring_cap = static_cast<int>(adj_ring_.size());
+    // median positive step of the window frames (the first steps of a
+    // trajectory are often irregular)
+    std::vector<double> steps;
+    for (int f = perc_frame + 1; f < N; ++f) {
+      const double step = static_cast<double>(result_.frames[f].time_ns) -
+                          static_cast<double>(result_.frames[f - 1].time_ns);
+      if (step > 0.0)
+        steps.push_back(step);
+    }
+    double dt_ns = 1.0;
+    if (!steps.empty()) {
+      std::sort(steps.begin(), steps.end());
+      const std::size_t mid = steps.size() / 2;
+      dt_ns = steps.size() % 2 ? steps[mid] : 0.5 * (steps[mid - 1] + steps[mid]);
+    }
+    ct_dt_ns_ = dt_ns;
+    const double lag_step_ns = dt_ns * static_cast<double>(ct_stride_);
+    const std::size_t words = static_cast<std::size_t>(n_words_);
     const std::size_t workers =
         std::max<std::size_t>(1, std::min<std::size_t>(executor.capacity(),
                                                        static_cast<std::size_t>(n_lags)));
@@ -709,23 +773,20 @@ void TitanLLPS::finalize(TitanExecutor &executor, int max_lag_frames) {
                                        static_cast<std::size_t>(n_lags) /
                                        workers);
       for (int lag = begin; lag < end; ++lag) {
-        result_.ct_lags_ns[static_cast<std::size_t>(lag)] = lag * dt_ns;
+        result_.ct_lags_ns[static_cast<std::size_t>(lag)] = lag * lag_step_ns;
         double num = 0.0;
         double denom = 0.0;
-        const int oldest_global = ct_total_frames_ - usable_ring;
-        for (int gi = oldest_global; gi + lag < ct_total_frames_; ++gi) {
-          const int slot0 = gi % ring_cap;
-          const int slotL = (gi + lag) % ring_cap;
+        for (int origin = 0; origin + lag < stored; ++origin) {
+          const uint64_t *first =
+              ct_history_.data() + static_cast<std::size_t>(origin) * words;
+          const uint64_t *second =
+              ct_history_.data() + static_cast<std::size_t>(origin + lag) * words;
           const auto counts =
               use_avx2_ct
                   ? titan_simd_dispatch::xor_overlap_popcount(
-                        adj_ring_[static_cast<std::size_t>(slot0)].data(),
-                        adj_ring_[static_cast<std::size_t>(slotL)].data(),
-                        mean_adj.data(), static_cast<std::size_t>(n_words_))
+                        first, second, mean_adj.data(), words)
                   : titan_simd_dispatch::xor_overlap_popcount_scalar(
-                        adj_ring_[static_cast<std::size_t>(slot0)].data(),
-                        adj_ring_[static_cast<std::size_t>(slotL)].data(),
-                        mean_adj.data(), static_cast<std::size_t>(n_words_));
+                        first, second, mean_adj.data(), words);
           num += static_cast<double>(counts.overlap);
           denom += static_cast<double>(counts.reference);
         }
@@ -747,8 +808,9 @@ void TitanLLPS::finalize(TitanExecutor &executor, int max_lag_frames) {
     TitanUI::print_info("LLPS: not enough post-percolation frames for C(t).");
   }
 
-  adj_ring_.clear();
-  adj_ring_.shrink_to_fit();
+  ct_origin_frames_ = ct_stored_frames_;
+  ct_history_.clear();
+  ct_history_.shrink_to_fit();
   pair_contact_cnt_.clear();
   pair_contact_cnt_.shrink_to_fit();
 

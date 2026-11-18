@@ -34,6 +34,10 @@ struct PbctopoSpatialLiftResult {
   PbctopoHash128 identity;
   std::size_t ambiguous_hard_edges = 0;
   std::size_t cycle_residuals = 0;
+  // Independent residual vectors of the hard-edge cycles (bonded winding):
+  // a cycle whose image sum is nonzero runs through the periodic boundary.
+  std::array<Int3, 3> winding_basis{};
+  std::size_t winding_rank = 0;
   bool valid = false;
   std::string error;
 };

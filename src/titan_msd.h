@@ -62,7 +62,45 @@ private:
     std::size_t n{0};
   };
 
+  // D (and alpha) per contiguous TIME block of the trajectory, each from the
+  // MSD of origins inside the block over the full-trajectory fit window
+  // (STR-25): the sampling error of D, unlike blocks along the lag axis of
+  // one MSD curve, which only measure its curvature.
+  struct TimeBlocks {
+    std::string status{"not_requested"};
+    std::size_t count{0};
+    double length_ps{0.0};
+    std::vector<double> slopes;
+    std::vector<double> alphas;
+  };
+
   void reset_trajectory_state();
+  // Moves the stored frames into calc_* (unwrapped in place when the policy
+  // is unwrap): one copy of the coordinates at a time (STR-13).
+  void prepare_coordinates(AlignedDoubleVector &calc_x,
+                           AlignedDoubleVector &calc_y,
+                           AlignedDoubleVector &calc_z,
+                           std::string &effective_pbc,
+                           std::string &pbc_warning);
+  void lag_results_in_range(const AlignedDoubleVector &calc_x,
+                            const AlignedDoubleVector &calc_y,
+                            const AlignedDoubleVector &calc_z,
+                            const std::string &effective_pbc,
+                            std::size_t first_frame, std::size_t end_frame,
+                            std::size_t maxlag, TitanExecutor &executor,
+                            std::vector<LagResult> &results) const;
+  [[nodiscard]] FitResult fit_linear_window(
+      const std::vector<LagResult> &results, bool loglog, double tmin,
+      double tmax) const;
+  [[nodiscard]] TimeBlocks
+  compute_time_blocks(const std::string &blocks_spec, const FitResult &diffusion,
+                      const FitResult &alpha, const AlignedDoubleVector &calc_x,
+                      const AlignedDoubleVector &calc_y,
+                      const AlignedDoubleVector &calc_z,
+                      const std::string &effective_pbc,
+                      TitanExecutor &executor) const;
+  [[nodiscard]] std::size_t resolved_maxlag(std::size_t frames) const;
+  void check_memory_budget() const;
   void build_selection(const Multi_MOL &target, const arguments &args);
   void build_residue_selection(const Multi_MOL &target,
                                const std::string &selector);
@@ -74,10 +112,12 @@ private:
   [[nodiscard]] bool valid_box(const box &frame_box) const noexcept;
   [[nodiscard]] double atom_mass(std::size_t atom_index) const noexcept;
   void append_frame_points(const MOL &frame);
-  void compute_lag_results(TitanExecutor &executor,
-                           std::vector<LagResult> &results,
-                           std::string &effective_pbc,
-                           std::string &pbc_warning) const;
+  void compute_lag_results(const AlignedDoubleVector &calc_x,
+                           const AlignedDoubleVector &calc_y,
+                           const AlignedDoubleVector &calc_z,
+                           const std::string &effective_pbc,
+                           TitanExecutor &executor,
+                           std::vector<LagResult> &results) const;
   [[nodiscard]] FitResult fit_linear(const std::vector<LagResult> &results,
                                      bool loglog) const;
   [[nodiscard]] std::pair<double, double> resolve_fit_window(
@@ -90,6 +130,7 @@ private:
                                 const FitResult &fit,
                                 const std::string &effective_pbc,
                                 const std::string &pbc_warning,
+                                const TimeBlocks &blocks,
                                 std::fstream &log) const;
   void export_alpha_fit(const std::string &filename, const FitResult &fit,
                         std::fstream &log) const;
@@ -105,6 +146,12 @@ private:
   std::string pbc_{"auto"};
   bool rotational_requested_{false};
   std::string rotational_fit_window_{"auto"};
+  std::string memory_limit_{"auto"};
+  // STR-13: every frame is kept (multiple time origins, time blocks), so
+  // the storage grows by bytes_per_frame_ per frame; the run stops with a
+  // message when it would pass memory_budget_bytes_.
+  std::size_t memory_budget_bytes_{0};
+  std::size_t bytes_per_frame_{0};
 
   std::vector<titan_selection::SelectedAtom> selected_atoms_;
   AlignedDoubleVector selected_masses_;
@@ -119,6 +166,10 @@ private:
   AlignedDoubleVector reconstructed_com_x_;
   AlignedDoubleVector reconstructed_com_y_;
   AlignedDoubleVector reconstructed_com_z_;
+  // STR-28: com mode, per selected atom: position unwrapped in time and the
+  // raw position of the previous frame (O(atoms) memory, streaming).
+  std::vector<double> unwrapped_atom_x_, unwrapped_atom_y_, unwrapped_atom_z_;
+  std::vector<double> previous_atom_x_, previous_atom_y_, previous_atom_z_;
   titan_rotational_diffusion::Analyzer rotational_analyzer_;
 };
 

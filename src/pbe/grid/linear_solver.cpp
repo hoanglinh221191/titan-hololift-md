@@ -663,7 +663,7 @@ void AnalyzerImpl::maybe_write_boundary_diff(const GridShape &shape,
 AnalyzerImpl::BoundaryDiagnostics
 AnalyzerImpl::set_boundary(const GridShape &shape,
                            const std::vector<Atom> &atoms, double eps_out,
-                           double kappa) {
+                           double kappa, TitanExecutor &executor) {
   std::fill(grid_.phi.begin(), grid_.phi.end(), 0.0);
   BoundaryDiagnostics diag;
   if (args_.boundary == "zero")
@@ -702,90 +702,111 @@ AnalyzerImpl::set_boundary(const GridShape &shape,
     py += atom.q * (atom.y - cy);
     pz += atom.q * (atom.z - cz);
   }
-  double sumsq = 0.0;
-  std::size_t count = 0;
-  for (std::size_t k = 0; k < shape.nz; ++k) {
-    for (std::size_t j = 0; j < shape.ny; ++j) {
-      for (std::size_t i = 0; i < shape.nx; ++i) {
-        if (!is_boundary(i, j, k, shape))
+  // GRID-02: boundary nodes are independent sums over the atoms; they are
+  // listed in (k, j, i) order, evaluated in parallel, and the diagnostics
+  // are summed afterwards in the same serial order as before, so the
+  // potentials and the reported rms do not depend on the thread count.
+  std::vector<std::size_t> boundary_ids;
+  boundary_ids.reserve(2 * (shape.nx * shape.ny + shape.ny * shape.nz +
+                            shape.nx * shape.nz));
+  for (std::size_t k = 0; k < shape.nz; ++k)
+    for (std::size_t j = 0; j < shape.ny; ++j)
+      for (std::size_t i = 0; i < shape.nx; ++i)
+        if (is_boundary(i, j, k, shape))
+          boundary_ids.push_back(idx3(i, j, k, shape.nx, shape.ny));
+  const auto boundary_value = [&](std::size_t i, std::size_t j,
+                                  std::size_t k) {
+    double potential = 0.0;
+    if (args_.biomodel == "rpbe") {
+      const bool vacuum_phase = eps_out <= args_.int_diel + 1.0e-9;
+      const double x = shape.ox + static_cast<double>(i) * shape.h;
+      const double y = shape.oy + static_cast<double>(j) * shape.h;
+      const double z = shape.oz + static_cast<double>(k) * shape.h;
+      const double epkt = delphi_epkt();
+      const double indi_scaled =
+          std::max(1.0e-30, args_.int_diel / std::max(1.0e-30, epkt));
+      const double media_scaled =
+          std::max(1.0e-30, (vacuum_phase ? args_.int_diel : eps_out) /
+                                std::max(1.0e-30, epkt));
+      double coulomb_map = 0.0;
+      double media_map = 0.0;
+      for (const Atom &atom : atoms) {
+        if (std::abs(atom.q) <= 0.0)
           continue;
-        double potential = 0.0;
-        if (args_.biomodel == "rpbe") {
-          const bool vacuum_phase = eps_out <= args_.int_diel + 1.0e-9;
-          const double x = shape.ox + static_cast<double>(i) * shape.h;
-          const double y = shape.oy + static_cast<double>(j) * shape.h;
-          const double z = shape.oz + static_cast<double>(k) * shape.h;
-          const double epkt = delphi_epkt();
-          const double indi_scaled =
-              std::max(1.0e-30, args_.int_diel / std::max(1.0e-30, epkt));
-          const double media_scaled =
-              std::max(1.0e-30, (vacuum_phase ? args_.int_diel : eps_out) /
-                                    std::max(1.0e-30, epkt));
-          double coulomb_map = 0.0;
-          double media_map = 0.0;
-          for (const Atom &atom : atoms) {
-            if (std::abs(atom.q) <= 0.0)
-              continue;
-            const double dx = x - atom.x;
-            const double dy = y - atom.y;
-            const double dz = z - atom.z;
-            const double r = std::sqrt(dx * dx + dy * dy + dz * dz);
-            if (r <= 1.0e-10)
-              continue;
-            coulomb_map += atom.q / (r * indi_scaled);
-            double q = atom.q;
-            if (!vacuum_phase)
-              q *= std::exp(-kappa * r);
-            media_map += q / (r * media_scaled);
-          }
-          potential = media_map - coulomb_map;
-        } else if (delphi_boundary_convention_active()) {
-          potential =
-              boundary_formula_sample(shape, atoms, i, j, k, eps_out, kappa)
-                  .selected_phi;
-        } else if (args_.boundary == "dipolar") {
-          const double x = shape.ox + static_cast<double>(i) * shape.h;
-          const double y = shape.oy + static_cast<double>(j) * shape.h;
-          const double z = shape.oz + static_cast<double>(k) * shape.h;
-          const double dx = x - cx;
-          const double dy = y - cy;
-          const double dz = z - cz;
-          const double r2 = dx * dx + dy * dy + dz * dz;
-          const double r = std::sqrt(r2);
-          if (r > 1.0e-10) {
-            const double screened = std::exp(-kappa * r);
-            const double monopole = total_charge / r;
-            const double dipole =
-                (px * dx + py * dy + pz * dz) / std::max(1.0e-30, r2 * r);
-            potential =
-                screened * (monopole + dipole) / std::max(1.0e-12, eps_out);
-          }
-          if (delphi_field_units_active())
-            potential *= delphi_epkt();
-        } else {
-          const double x = shape.ox + static_cast<double>(i) * shape.h;
-          const double y = shape.oy + static_cast<double>(j) * shape.h;
-          const double z = shape.oz + static_cast<double>(k) * shape.h;
-          for (const Atom &atom : atoms) {
-            const double dx = x - atom.x;
-            const double dy = y - atom.y;
-            const double dz = z - atom.z;
-            const double r = std::sqrt(dx * dx + dy * dy + dz * dz);
-            if (r > 1.0e-10) {
-              potential += atom.q * std::exp(-kappa * r) /
-                           (std::max(1.0e-12, eps_out) * r);
-            }
-          }
-          if (delphi_field_units_active())
-            potential *= delphi_epkt();
-        }
-        grid_.phi[idx3(i, j, k, shape.nx, shape.ny)] = potential;
-        sumsq += potential * potential;
-        diag.max_abs = std::max(diag.max_abs, std::abs(potential));
-        ++count;
+        const double dx = x - atom.x;
+        const double dy = y - atom.y;
+        const double dz = z - atom.z;
+        const double r = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (r <= 1.0e-10)
+          continue;
+        coulomb_map += atom.q / (r * indi_scaled);
+        double q = atom.q;
+        if (!vacuum_phase)
+          q *= std::exp(-kappa * r);
+        media_map += q / (r * media_scaled);
       }
+      potential = media_map - coulomb_map;
+    } else if (delphi_boundary_convention_active()) {
+      potential =
+          boundary_formula_sample(shape, atoms, i, j, k, eps_out, kappa)
+              .selected_phi;
+    } else if (args_.boundary == "dipolar") {
+      const double x = shape.ox + static_cast<double>(i) * shape.h;
+      const double y = shape.oy + static_cast<double>(j) * shape.h;
+      const double z = shape.oz + static_cast<double>(k) * shape.h;
+      const double dx = x - cx;
+      const double dy = y - cy;
+      const double dz = z - cz;
+      const double r2 = dx * dx + dy * dy + dz * dz;
+      const double r = std::sqrt(r2);
+      if (r > 1.0e-10) {
+        const double screened = std::exp(-kappa * r);
+        const double monopole = total_charge / r;
+        const double dipole =
+            (px * dx + py * dy + pz * dz) / std::max(1.0e-30, r2 * r);
+        potential =
+            screened * (monopole + dipole) / std::max(1.0e-12, eps_out);
+      }
+      if (delphi_field_units_active())
+        potential *= delphi_epkt();
+    } else {
+      const double x = shape.ox + static_cast<double>(i) * shape.h;
+      const double y = shape.oy + static_cast<double>(j) * shape.h;
+      const double z = shape.oz + static_cast<double>(k) * shape.h;
+      for (const Atom &atom : atoms) {
+        const double dx = x - atom.x;
+        const double dy = y - atom.y;
+        const double dz = z - atom.z;
+        const double r = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (r > 1.0e-10) {
+          potential += atom.q * std::exp(-kappa * r) /
+                       (std::max(1.0e-12, eps_out) * r);
+        }
+      }
+      if (delphi_field_units_active())
+        potential *= delphi_epkt();
     }
+    return potential;
+  };
+  const std::size_t plane = shape.nx * shape.ny;
+  executor.parallel_for(
+      boundary_ids.size(), effective_workers(executor, boundary_ids.size()),
+      256, [&](std::size_t, std::size_t begin, std::size_t end) {
+        for (std::size_t b = begin; b < end; ++b) {
+          const std::size_t id = boundary_ids[b];
+          const std::size_t k = id / plane;
+          const std::size_t j = (id % plane) / shape.nx;
+          const std::size_t i = id % shape.nx;
+          grid_.phi[id] = boundary_value(i, j, k);
+        }
+      });
+  double sumsq = 0.0;
+  for (const std::size_t id : boundary_ids) {
+    const double potential = grid_.phi[id];
+    sumsq += potential * potential;
+    diag.max_abs = std::max(diag.max_abs, std::abs(potential));
   }
+  const std::size_t count = boundary_ids.size();
   diag.rms = count > 0 ? std::sqrt(sumsq / static_cast<double>(count)) : 0.0;
   return diag;
 }
@@ -1734,7 +1755,7 @@ AnalyzerImpl::FieldSolve AnalyzerImpl::solve_focused_field(
       maybe_write_maps(shape, *map_result, false);
     const auto boundary_begin = std::chrono::steady_clock::now();
     BoundaryDiagnostics boundary_diag =
-        set_boundary(shape, *level_atoms, eps_out, kappa);
+        set_boundary(shape, *level_atoms, eps_out, kappa, executor);
     if (args_.test_boundary_map == "oracle" && oracle_replay_applies(shape))
       boundary_diag = apply_oracle_boundary_map(shape, eps_out, kappa);
     if (level + 1 == levels)

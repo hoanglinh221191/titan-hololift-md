@@ -82,6 +82,8 @@ enum class PbctopoFailureReason {
   EvidenceContradicted,
   EvidenceHypothesisUnavailable,
   EvidenceUnderdetermined,
+  EvidencePeriodic,
+  BondedWinding,
 };
 
 constexpr bool pbctopo_frame_status_has_selected_assignment(
@@ -90,6 +92,30 @@ constexpr bool pbctopo_frame_status_has_selected_assignment(
          status == PbctopoFrameStatus::Rescued ||
          status == PbctopoFrameStatus::WeakObservation ||
          status == PbctopoFrameStatus::Contradicted;
+}
+
+// The evidence state under the schema-7 rule, for consumers (HoloLift) whose
+// frame semantics predate extended_periodic: a frame with an ambiguous or
+// unsupported relation was weak_ambiguous, otherwise connected or not.
+constexpr PbctopoEvidenceState pbctopo_schema7_evidence_state(
+    PbctopoEvidenceState state, std::size_t ambiguous_relations,
+    std::size_t unsupported_relations, bool evidence_graph_connected) noexcept {
+  if (state != PbctopoEvidenceState::ExtendedPeriodic)
+    return state;
+  if (ambiguous_relations > 0 || unsupported_relations > 0)
+    return PbctopoEvidenceState::WeakAmbiguous;
+  return evidence_graph_connected ? PbctopoEvidenceState::SupportedConnected
+                                  : PbctopoEvidenceState::WeakDisconnected;
+}
+
+// Reason for a weak_observation frame from the selected evidence state.
+constexpr PbctopoFailureReason pbctopo_weak_evidence_reason(
+    PbctopoEvidenceState state) noexcept {
+  return state == PbctopoEvidenceState::ExtendedPeriodic
+             ? PbctopoFailureReason::EvidencePeriodic
+         : state == PbctopoEvidenceState::WeakAmbiguous
+             ? PbctopoFailureReason::EvidenceUnderdetermined
+             : PbctopoFailureReason::EvidenceDisconnected;
 }
 
 constexpr PbctopoFailureReason pbctopo_resolve_fallback_reason(
@@ -278,6 +304,22 @@ struct PbctopoFrameReport {
   std::size_t soft_pair_fundamental_cycle_count = 0;
   double soft_pair_fundamental_cycle_residual_rms = 0.0;
   double soft_pair_fundamental_cycle_residual_max = 0.0;
+  // Schema 8: steric policy, input overlap scan and periodic contact network.
+  bool steric_filter = false;
+  bool candidate_steric_counts_evaluated = true;
+  bool input_overlap_evaluated = false;
+  bool input_overlap_complete = false;
+  double input_overlap_vdw_scale = std::numeric_limits<double>::quiet_NaN();
+  double input_overlap_fallback_cutoff_A =
+      std::numeric_limits<double>::quiet_NaN();
+  std::size_t input_overlap_pairs = 0;
+  std::size_t input_overlap_unit_pairs = 0;
+  double input_overlap_min_distance_A =
+      std::numeric_limits<double>::quiet_NaN();
+  double input_overlap_min_ratio = std::numeric_limits<double>::quiet_NaN();
+  PbctopoContactCycleSummary contact_cycle;
+  std::size_t bonded_winding_rank = 0;
+  std::array<Int3, 3> bonded_winding_basis{};
 };
 
 const char *pbctopo_frame_status_name(PbctopoFrameStatus status);

@@ -1,0 +1,15 @@
+-ff=charmm36
+-path-a=../../forcefields
+-path-n=../../forcefields
+-s=reference.pdb
+-traj=frames.xtc
+-n=index.ndx
+-g=0-0
+-common_topo=topol.top
+-pbctopo=true
+-pbctopo-temporal=hololift
+-nocal=true
+-no-dssp=true
+-noprint-side_chain_contact=true
+-opdb=placed.pdb
+-nt=4

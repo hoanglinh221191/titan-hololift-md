@@ -32,11 +32,12 @@ using Block2 = JcpSparseIluPreconditioner::Block2;
 
 std::shared_ptr<const PanelGraph> make_normalized_ilu_graph(
     const titan::tabi::fmm_m2l::FmmM2lAnalyticContext &context,
-    std::size_t cap, const std::string &graph_source) {
+    std::size_t cap, const std::string &graph_source,
+    TitanExecutor *executor = nullptr) {
   auto graph = std::make_shared<PanelGraph>(
       graph_source == "distance-knn"
           ? context.distance_knn_panel_graph(cap)
-          : context.near_panel_graph(cap));
+          : context.near_panel_graph(cap, executor));
   for (std::size_t row_index = 0; row_index < graph->size(); ++row_index) {
     auto &row = (*graph)[row_index];
     if (!std::binary_search(row.begin(), row.end(), row_index))
@@ -548,7 +549,7 @@ FmmIluBudgetSelection select_fmm_m2l_nearfield_ilu0_budget(
     const titan::tabi::fmm_m2l::FmmM2lAnalyticContext &context,
     std::size_t diagonal_size, bool coupled, std::size_t neighbor_cap,
     std::size_t memory_budget_bytes, bool include_regularization_retry,
-    const std::string &graph_source) {
+    const std::string &graph_source, TitanExecutor *executor) {
   FmmIluBudgetSelection selection;
   selection.requested_neighbor_cap = std::clamp<std::size_t>(
       neighbor_cap, kMinFmmIluNeighborCap, kMaxFmmIluNeighborCap);
@@ -557,7 +558,7 @@ FmmIluBudgetSelection select_fmm_m2l_nearfield_ilu0_budget(
   while (true) {
     const auto graph_begin = std::chrono::steady_clock::now();
     selection.normalized_graph = make_normalized_ilu_graph(
-        context, selection.effective_neighbor_cap, graph_source);
+        context, selection.effective_neighbor_cap, graph_source, executor);
     selection.graph_build_ms +=
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - graph_begin)
@@ -631,7 +632,8 @@ build_fmm_m2l_nearfield_ilu0_preconditioner(
                     return !row.empty() && row.size() <= cap;
                   });
   if (!graph_cache_reused)
-    normalized_graph = make_normalized_ilu_graph(context, cap, graph_source);
+    normalized_graph =
+        make_normalized_ilu_graph(context, cap, graph_source, &executor);
   precond->graph_cache_reused = graph_cache_reused;
   const PanelGraph &graph = *normalized_graph;
   if (graph.size() != n)

@@ -35,6 +35,8 @@ struct alignas(64) GistVoxel {
 // ============================================================================
 // TitanGIST — main analysis class
 // ============================================================================
+class TitanExecutor;
+
 class TitanGIST {
 public:
   TitanGIST() = default;
@@ -53,7 +55,7 @@ public:
                      const std::vector<mol_info> &pro_info,
                      const Eigen::MatrixXd &ref_ca_centered,
                      const Eigen::Matrix3d &R, bool is_frame_zero,
-                     bool tica_available);
+                     bool tica_available, TitanExecutor *executor = nullptr);
 
   // Post-processing: compute thermodynamics and export .dx files
   void export_dx_maps(const std::string &prefix, int n_frames,

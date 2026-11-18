@@ -1423,6 +1423,16 @@ FrameResult AnalyzerImpl::consume_frame(
     result.tabi_discretization = tabi_solve.tabi_discretization;
     result.tabi_node_patch_representation =
         tabi_solve.tabi_node_patch_representation;
+    result.tabi_node_patch_normal_source =
+        tabi_solve.tabi_node_patch_normal_source;
+    result.tabi_node_patch_certificate =
+        tabi_solve.tabi_node_patch_certificate;
+    if (endpoint_cycle) {
+      result.tabi_receptor_node_patch_certificate =
+          tabi_receptor_solve.tabi_node_patch_certificate;
+      result.tabi_ligand_node_patch_certificate =
+          tabi_ligand_solve.tabi_node_patch_certificate;
+    }
     result.tabi_rhs_scale = tabi_solve.tabi_rhs_scale;
     result.tabi_dielectric_contrast = tabi_solve.tabi_dielectric_contrast;
     result.tabi_operator_contrast = tabi_solve.tabi_operator_contrast;
@@ -1747,21 +1757,27 @@ FrameResult AnalyzerImpl::consume_frame(
         std::max(max_boundary_max_seen_, result.boundary_max);
 
     const double frame_n = static_cast<double>(frames_total_);
-    const double delta = result.energy_kj_mol - energy_mean_;
-    energy_mean_ += delta / frame_n;
-    energy_m2_ += delta * (result.energy_kj_mol - energy_mean_);
-    if (frames_total_ == 1) {
-      energy_min_ = result.energy_kj_mol;
-      energy_max_ = result.energy_kj_mol;
-    } else {
-      energy_min_ = std::min(energy_min_, result.energy_kj_mol);
-      energy_max_ = std::max(energy_max_, result.energy_kj_mol);
+    // A failed BIE solve has a NaN energy (analyzer_reaction.cpp); the energy
+    // statistics cover the frames that have one.
+    if (std::isfinite(result.energy_kj_mol)) {
+      ++energy_frames_;
+      const double energy_n = static_cast<double>(energy_frames_);
+      const double delta = result.energy_kj_mol - energy_mean_;
+      energy_mean_ += delta / energy_n;
+      energy_m2_ += delta * (result.energy_kj_mol - energy_mean_);
+      if (energy_frames_ == 1) {
+        energy_min_ = result.energy_kj_mol;
+        energy_max_ = result.energy_kj_mol;
+      } else {
+        energy_min_ = std::min(energy_min_, result.energy_kj_mol);
+        energy_max_ = std::max(energy_max_, result.energy_kj_mol);
+      }
     }
     iter_mean_ +=
         (static_cast<double>(result.solvent_iterations) - iter_mean_) / frame_n;
     mg_cycle_mean_ +=
         (static_cast<double>(result.mg_cycles) - mg_cycle_mean_) / frame_n;
-    if (result.dgsolv_enabled) {
+    if (result.dgsolv_enabled && std::isfinite(result.deltaG_solv_kj_mol)) {
       ++dgsolv_frames_;
       const double dg_n = static_cast<double>(dgsolv_frames_);
       const double dg_delta = result.deltaG_solv_kj_mol - dgsolv_mean_;
@@ -2318,6 +2334,7 @@ FrameResult AnalyzerImpl::consume_frame(
       std::max(max_boundary_max_seen_, result.boundary_max);
 
   const double frame_n = static_cast<double>(frames_total_);
+  ++energy_frames_;
   const double delta = result.energy_kj_mol - energy_mean_;
   energy_mean_ += delta / frame_n;
   energy_m2_ += delta * (result.energy_kj_mol - energy_mean_);

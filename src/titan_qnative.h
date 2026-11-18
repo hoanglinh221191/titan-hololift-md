@@ -80,18 +80,20 @@ private:
   [[nodiscard]] bool has_valid_box(const box &frame_box) const noexcept;
   [[nodiscard]] bool pair_allowed(const titan_contact::ResidueKey &lhs,
                                   const titan_contact::ResidueKey &rhs) const;
-  [[nodiscard]] double native_pair_distance(
-      const std::vector<titan_contact_geometry::ContactPoint> &row_points,
-      const std::vector<titan_contact_geometry::ContactPoint> &col_points,
-      const titan_contact::ResiduePairKey &key, const BoxMatrix &box_matrix) const;
   void build_native_contacts_from_reference(const Multi_MOL &mol1,
                                             const Multi_MOL *mol2);
+  // Native residues are found in the trajectory geometry by (chain, resnr,
+  // resname), not by position in the reference residue list; the frame
+  // kernel then measures the minimum distance over each residue's points.
+  void resolve_native_pairs_in_trajectory();
   [[nodiscard]] std::size_t residue_index(
       const std::vector<titan_contact::ResidueKey> &residues,
       const titan_contact::ResidueKey &residue) const;
   [[nodiscard]] std::string residue_label(
       const titan_contact::ResidueKey &residue) const;
-  [[nodiscard]] double contact_contribution(double distance_a) const;
+  [[nodiscard]] double soft_lambda() const noexcept;
+  [[nodiscard]] double contact_contribution(double distance_a,
+                                            double reference_a) const;
   [[nodiscard]] double mean_q() const;
   [[nodiscard]] double std_q() const;
   [[nodiscard]] double min_q() const;
@@ -118,7 +120,7 @@ private:
 
   std::uint64_t total_frames_seen_{0};
   std::uint64_t valid_frames_{0};
-  std::uint64_t skipped_invalid_box_frames_{0};
+  std::uint64_t no_box_frames_{0};
   std::uint64_t skipped_incomplete_frames_{0};
 
   titan_contact_geometry::ContactGeometryCache row_geometry_;
@@ -133,6 +135,8 @@ private:
   titan_contact_kernel::PointSoA col_soa_scratch_;
   std::vector<NativeContact> native_contacts_;
   std::vector<titan_contact_kernel::NativePairIndex> native_pair_indices_;
+  std::vector<titan_contact_kernel::NativePairRange> native_pair_ranges_;
+  bool native_single_point_{true};
   std::vector<ContactOccupancy> occupancy_;
   std::vector<FrameRecord> timeseries_;
   std::vector<double> q_values_;
@@ -140,7 +144,7 @@ private:
 
   std::uint64_t pooled_total_frames_seen_{0};
   std::uint64_t pooled_valid_frames_{0};
-  std::uint64_t pooled_skipped_invalid_box_frames_{0};
+  std::uint64_t pooled_no_box_frames_{0};
   std::uint64_t pooled_skipped_incomplete_frames_{0};
   std::vector<ContactOccupancy> pooled_occupancy_;
   std::vector<FrameRecord> pooled_timeseries_;

@@ -4,6 +4,7 @@
 #include "info.h"
 #include "titan_contact_kernels.h"
 #include "titan_executor.h"
+#include "titan_ui.h"
 
 #include <algorithm>
 #include <cctype>
@@ -85,7 +86,7 @@ void TitanContactMapAnalyzer::reset_trajectory_state() {
   warned_invalid_box_ = false;
   total_frames_seen_ = 0;
   valid_frames_ = 0;
-  skipped_invalid_box_frames_ = 0;
+  no_box_frames_ = 0;
   skipped_incomplete_frames_ = 0;
   row_occupancy_frames_.assign(row_residues_.size(), 0);
   col_occupancy_frames_.assign(col_residues_.size(), 0);
@@ -96,7 +97,7 @@ void TitanContactMapAnalyzer::reset_trajectory_state() {
 void TitanContactMapAnalyzer::accumulate_pooled_state() {
   pooled_total_frames_seen_ += total_frames_seen_;
   pooled_valid_frames_ += valid_frames_;
-  pooled_skipped_invalid_box_frames_ += skipped_invalid_box_frames_;
+  pooled_no_box_frames_ += no_box_frames_;
   pooled_skipped_incomplete_frames_ += skipped_incomplete_frames_;
   if (pooled_row_occupancy_frames_.size() != row_occupancy_frames_.size())
     pooled_row_occupancy_frames_.assign(row_occupancy_frames_.size(), 0);
@@ -152,10 +153,10 @@ void TitanContactMapAnalyzer::init(const Multi_MOL &mol1, const Multi_MOL *mol2,
   log_cmap_value(log, "CMap Columns", std::to_string(col_residues_.size()));
 }
 
+// MDB-13: lengths > 0 and angles that give a finite cell (BoxMatrix check).
 bool TitanContactMapAnalyzer::has_valid_box(const box &frame_box) const
     noexcept {
-  return frame_box.get_a() > 0.0 && frame_box.get_b() > 0.0 &&
-         frame_box.get_c() > 0.0;
+  return BoxMatrix::valid_box(frame_box);
 }
 
 bool TitanContactMapAnalyzer::pair_allowed(
@@ -221,10 +222,17 @@ void TitanContactMapAnalyzer::process_frame(const Multi_MOL &mol1,
     return;
   ++total_frames_seen_;
   const MOL &frame = mol1.m_mol[snap_idx];
-  if (!has_valid_box(frame.Box)) {
-    ++skipped_invalid_box_frames_;
-    warned_invalid_box_ = true;
-    return;
+  // MDB-13: without a usable periodic box the frame is measured with plain
+  // distances (as the dihedral module does), not dropped in silence.
+  const bool periodic = has_valid_box(frame.Box);
+  if (!periodic) {
+    ++no_box_frames_;
+    if (!warned_invalid_box_) {
+      warned_invalid_box_ = true;
+      TitanUI::print_warning(
+          "CMap: frame(s) without a valid periodic box; their contact "
+          "distances are taken without the minimum image.");
+    }
   }
   if (scope_ == "interface" &&
       (mol2 == nullptr || snap_idx >= mol2->m_mol.size())) {
@@ -243,7 +251,8 @@ void TitanContactMapAnalyzer::process_frame(const Multi_MOL &mol1,
   }
 
   ++valid_frames_;
-  const BoxMatrix box_matrix(frame.Box);
+  const BoxMatrix box_matrix =
+      periodic ? BoxMatrix(frame.Box) : titan_contact_kernel::open_boundary_matrix();
   const double cutoff_sq = cutoff_a_ * cutoff_a_;
   std::unordered_map<titan_contact::ResiduePairKey, double,
                      titan_contact::ResiduePairKeyHash>
@@ -394,7 +403,7 @@ void TitanContactMapAnalyzer::export_summary(const std::string &filename,
   }
   out << "frames_seen: " << total_frames_seen_ << '\n';
   out << "valid_frames: " << valid_frames_ << '\n';
-  out << "skipped_invalid_box_frames: " << skipped_invalid_box_frames_ << '\n';
+  out << "frames_without_box_plain_distances: " << no_box_frames_ << '\n';
   out << "skipped_incomplete_frames: " << skipped_incomplete_frames_ << '\n';
   out << "rows: " << row_residues_.size() << '\n';
   out << "columns: " << col_residues_.size() << '\n';
@@ -558,14 +567,14 @@ void TitanContactMapAnalyzer::finalize_all(const std::string &base_dir,
     return;
   const auto saved_valid_frames = valid_frames_;
   const auto saved_total_frames = total_frames_seen_;
-  const auto saved_skipped_box = skipped_invalid_box_frames_;
+  const auto saved_skipped_box = no_box_frames_;
   const auto saved_skipped_incomplete = skipped_incomplete_frames_;
   const auto saved_records = records_;
   const auto saved_row_occupancy = row_occupancy_frames_;
   const auto saved_col_occupancy = col_occupancy_frames_;
   total_frames_seen_ = pooled_total_frames_seen_;
   valid_frames_ = pooled_valid_frames_;
-  skipped_invalid_box_frames_ = pooled_skipped_invalid_box_frames_;
+  no_box_frames_ = pooled_no_box_frames_;
   skipped_incomplete_frames_ = pooled_skipped_incomplete_frames_;
   records_ = pooled_records_;
   row_occupancy_frames_ = pooled_row_occupancy_frames_;
@@ -584,7 +593,7 @@ void TitanContactMapAnalyzer::finalize_all(const std::string &base_dir,
       log);
   total_frames_seen_ = saved_total_frames;
   valid_frames_ = saved_valid_frames;
-  skipped_invalid_box_frames_ = saved_skipped_box;
+  no_box_frames_ = saved_skipped_box;
   skipped_incomplete_frames_ = saved_skipped_incomplete;
   records_ = saved_records;
   row_occupancy_frames_ = saved_row_occupancy;

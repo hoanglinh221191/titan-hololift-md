@@ -44,7 +44,20 @@ struct RuntimeCutoffs {
   double pair_contact_cutoff = 4.5;
   double continuity_cutoff = 20.0;
   double vdw_clash_scale = 0.55;
+  // Steric policy.  filter (1.0.x): a candidate whose placed atoms overlap is
+  // rejected and overlaps lower the pair-shift score.  report (default):
+  // placement ignores overlaps, because under periodic boundary conditions
+  // an overlap between two parts at the images a placement uses is in the
+  // input for every placement; overlaps are reported by the input scan with
+  // the thresholds below.  Placement then uses kReportOnlyStericThresholdA
+  // for both the radius scale and the fallback cutoff, so only coincident
+  // atoms count as clashing.
+  bool steric_filter = false;
+  double overlap_vdw_scale = 0.55;
+  double overlap_fallback_cutoff = 1.05;
 };
+
+inline constexpr double kReportOnlyStericThresholdA = 1.0e-6;
 
 RuntimeCutoffs resolve_runtime_cutoffs(const arguments &Arguments);
 SolveMode resolve_solve_mode(const arguments &Arguments);

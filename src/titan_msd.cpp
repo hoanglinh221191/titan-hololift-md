@@ -2,6 +2,7 @@
 
 #include "BoxMatrix.h"
 #include "info.h"
+#include "memory_utils.h"
 #include "titan_executor.h"
 #include "titan_ui.h"
 
@@ -88,6 +89,7 @@ void TitanMSDAnalyzer::configure(const MsdArgs &args) {
   pbc_ = args.pbc;
   rotational_requested_ = args.rot;
   rotational_fit_window_ = args.rot_fit_window;
+  memory_limit_ = args.memory_limit;
   rotational_analyzer_.configure(rotational_requested_, rotational_fit_window_,
                                  maxlag_, pbc_, selection_);
   use_mol2_ = selection_ == "mol2";
@@ -106,14 +108,62 @@ void TitanMSDAnalyzer::init(const Multi_MOL &mol1, const Multi_MOL *mol2,
   initialized_ = point_count_ > 0;
   enabled_ = requested_ && initialized_;
   rotational_analyzer_.init(selected_atoms_, selected_masses_, log);
+
+  // STR-13. Bytes kept per frame: time and box, three doubles per point
+  // (atom mode: per selected atom; com mode: raw and reconstructed COM), the
+  // same again per atom for -msd-rot. Budget: -msd-memory-limit MB, or half
+  // the free RAM at start (at least 1024 MB).
+  constexpr std::size_t kMiB = 1024ULL * 1024ULL;
+  bytes_per_frame_ = sizeof(double) + sizeof(box) +
+                     3 * sizeof(double) * point_count_ * (mode_ == "atom" ? 1 : 2);
+  if (rotational_requested_)
+    bytes_per_frame_ += sizeof(double) + sizeof(box) +
+                        3 * sizeof(double) * selected_atoms_.size();
+  if (memory_limit_ == "auto") {
+    memory_budget_bytes_ = std::max<std::size_t>(1024 * kMiB, get_available_ram() / 2);
+  } else {
+    memory_budget_bytes_ = static_cast<std::size_t>(
+        std::max(1.0, std::stod(memory_limit_) * static_cast<double>(kMiB)));
+  }
+  const std::size_t frame_limit = memory_budget_bytes_ / std::max<std::size_t>(1, bytes_per_frame_);
+  if (mode_ == "atom" || rotational_requested_) {
+    std::ostringstream note;
+    note << "MSD keeps every frame: " << bytes_per_frame_ << " B per frame ("
+         << selected_atoms_.size() << " atoms), memory limit "
+         << (memory_budget_bytes_ / kMiB) << " MB = " << frame_limit
+         << " frames (-msd-memory-limit).";
+    TitanUI::print_info(note.str());
+  }
   if (log.is_open()) {
     TitanUI::log_kv(log, "MSD Selection", selection_);
     TitanUI::log_kv(log, "MSD Mode", mode_);
     TitanUI::log_kv(log, "MSD PBC", pbc_);
     TitanUI::log_kv(log, "MSD Selected Atoms",
                     std::to_string(selected_atoms_.size()));
+    TitanUI::log_kv(log, "MSD Bytes Per Frame", std::to_string(bytes_per_frame_));
+    TitanUI::log_kv(log, "MSD Memory Limit Frames", std::to_string(frame_limit));
   }
   reset_trajectory_state();
+}
+
+void TitanMSDAnalyzer::check_memory_budget() const {
+  const std::size_t stored = time_ps_.size();
+  if ((stored + 1) * bytes_per_frame_ <= memory_budget_bytes_)
+    return;
+  constexpr double kMiB = 1024.0 * 1024.0;
+  std::ostringstream message;
+  message << std::fixed << std::setprecision(3)
+          << "MSD: frame " << (stored + 1) << " would raise the stored "
+          << "coordinates to " << static_cast<double>((stored + 1) * bytes_per_frame_) / kMiB
+          << " MB (" << bytes_per_frame_ << " B per frame for "
+          << selected_atoms_.size() << " selected atoms in " << mode_
+          << " mode), above the MSD memory limit of "
+          << static_cast<double>(memory_budget_bytes_) / kMiB
+          << " MB (-msd-memory-limit; auto = half the free RAM). Every frame is "
+             "kept for the multiple-origin MSD and its time blocks: use "
+             "-msd-mode=com, a smaller -msd-selection, fewer frames (-b/-e/-dt) "
+             "or a larger -msd-memory-limit.";
+  throw std::runtime_error(message.str());
 }
 
 void TitanMSDAnalyzer::reset_trajectory_state() {
@@ -231,6 +281,7 @@ void TitanMSDAnalyzer::append_frame_points(const MOL &frame) {
       (!time_ps_.empty() && !(time_ps > time_ps_.back())))
     throw std::runtime_error(
         "MSD: frame timestamps must be finite and strictly increasing.");
+  check_memory_budget();
   time_ps_.push_back(time_ps);
   boxes_.push_back(frame.Box);
   box_valid_.push_back(valid_box(frame.Box));
@@ -265,10 +316,31 @@ void TitanMSDAnalyzer::append_frame_points(const MOL &frame) {
   const bool reconstruct_body = box_valid_.back();
   const std::optional<BoxMatrix> box_matrix =
       reconstruct_body ? std::optional<BoxMatrix>{frame.Box} : std::nullopt;
-  double anchor_x = 0.0;
-  double anchor_y = 0.0;
-  double anchor_z = 0.0;
-  for (std::size_t i = 0; i < selected_atoms_.size(); ++i) {
+  // STR-28 (22/10/2026). The old reconstruction imaged every atom next to
+  // atom 0 in each frame, which broke any body larger than half the box (the
+  // H10 dimer in a 74 A box) and made its centre of mass jump between frames
+  // (~120 A^2 at 50 ps for a molecule held in place). Now each atom is
+  // unwrapped in time (minimum image of its step since the previous frame)
+  // and the centre of mass is taken from those continuous positions, which
+  // also follows a chain that changes image relative to the other. The first
+  // frame (or one after a frame without a box) is made whole by walking the
+  // selection in order, each atom nearest to the previous one (as MDA-07).
+  const std::size_t n_sel = selected_atoms_.size();
+  const bool previous_usable = reconstruct_body && box_valid_.size() >= 2 &&
+                               box_valid_[box_valid_.size() - 2] &&
+                               unwrapped_atom_x_.size() == n_sel;
+  const std::optional<BoxMatrix> step_matrix =
+      previous_usable ? std::optional<BoxMatrix>{boxes_[boxes_.size() - 2]}
+                      : std::nullopt;
+  if (!previous_usable) {
+    unwrapped_atom_x_.assign(n_sel, 0.0);
+    unwrapped_atom_y_.assign(n_sel, 0.0);
+    unwrapped_atom_z_.assign(n_sel, 0.0);
+    previous_atom_x_.assign(n_sel, 0.0);
+    previous_atom_y_.assign(n_sel, 0.0);
+    previous_atom_z_.assign(n_sel, 0.0);
+  }
+  for (std::size_t i = 0; i < n_sel; ++i) {
     const std::size_t idx = static_cast<std::size_t>(selected_atoms_[i].atom_index);
     if (idx >= frame.pos.x.size() || idx >= frame.pos.y.size() ||
         idx >= frame.pos.z.size())
@@ -277,23 +349,30 @@ void TitanMSDAnalyzer::append_frame_points(const MOL &frame) {
     const double x = frame.pos.x[idx];
     const double y = frame.pos.y[idx];
     const double z = frame.pos.z[idx];
-    if (i == 0) {
-      anchor_x = x;
-      anchor_y = y;
-      anchor_z = z;
-    }
     double reconstructed_x = x;
     double reconstructed_y = y;
     double reconstructed_z = z;
-    if (reconstruct_body && i > 0) {
-      reconstructed_x -= anchor_x;
-      reconstructed_y -= anchor_y;
-      reconstructed_z -= anchor_z;
-      box_matrix->apply_mic(reconstructed_x, reconstructed_y, reconstructed_z);
-      reconstructed_x += anchor_x;
-      reconstructed_y += anchor_y;
-      reconstructed_z += anchor_z;
+    if (previous_usable) {
+      double dx = x - previous_atom_x_[i], dy = y - previous_atom_y_[i],
+             dz = z - previous_atom_z_[i];
+      step_matrix->apply_mic(dx, dy, dz);
+      reconstructed_x = unwrapped_atom_x_[i] + dx;
+      reconstructed_y = unwrapped_atom_y_[i] + dy;
+      reconstructed_z = unwrapped_atom_z_[i] + dz;
+    } else if (reconstruct_body && i > 0) {
+      double dx = x - previous_atom_x_[i - 1], dy = y - previous_atom_y_[i - 1],
+             dz = z - previous_atom_z_[i - 1];
+      box_matrix->apply_mic(dx, dy, dz);
+      reconstructed_x = unwrapped_atom_x_[i - 1] + dx;
+      reconstructed_y = unwrapped_atom_y_[i - 1] + dy;
+      reconstructed_z = unwrapped_atom_z_[i - 1] + dz;
     }
+    previous_atom_x_[i] = x;
+    previous_atom_y_[i] = y;
+    previous_atom_z_[i] = z;
+    unwrapped_atom_x_[i] = reconstructed_x;
+    unwrapped_atom_y_[i] = reconstructed_y;
+    unwrapped_atom_z_[i] = reconstructed_z;
     ux += x;
     uy += y;
     uz += z;
@@ -331,15 +410,32 @@ void TitanMSDAnalyzer::append_frame_points(const MOL &frame) {
   }
 }
 
+std::size_t TitanMSDAnalyzer::resolved_maxlag(std::size_t frames) const {
+  std::size_t maxlag = frames > 0 ? frames - 1 : 0;
+  if (maxlag_ == "auto")
+    return std::min<std::size_t>(maxlag, 1000);
+  return std::min<std::size_t>(maxlag,
+                               static_cast<std::size_t>(std::stoul(maxlag_)));
+}
+
 void TitanMSDAnalyzer::compute_lag_results(
-    TitanExecutor &executor, std::vector<LagResult> &results,
-    std::string &effective_pbc, std::string &pbc_warning) const {
+    const AlignedDoubleVector &calc_x, const AlignedDoubleVector &calc_y,
+    const AlignedDoubleVector &calc_z, const std::string &effective_pbc,
+    TitanExecutor &executor, std::vector<LagResult> &results) const {
   results.clear();
-  effective_pbc = "not_evaluated";
   const std::size_t frames = time_ps_.size();
   if (frames < 2 || point_count_ == 0)
     return;
+  lag_results_in_range(calc_x, calc_y, calc_z, effective_pbc, 0, frames,
+                       resolved_maxlag(frames), executor, results);
+}
 
+void TitanMSDAnalyzer::prepare_coordinates(AlignedDoubleVector &calc_x,
+                                           AlignedDoubleVector &calc_y,
+                                           AlignedDoubleVector &calc_z,
+                                           std::string &effective_pbc,
+                                           std::string &pbc_warning) {
+  const std::size_t frames = time_ps_.size();
   const bool all_boxes_valid =
       std::all_of(box_valid_.begin(), box_valid_.end(), [](bool v) { return v; });
   if ((pbc_ == "unwrap" || pbc_ == "mic") && !all_boxes_valid)
@@ -353,15 +449,23 @@ void TitanMSDAnalyzer::compute_lag_results(
       pbc_warning = "auto selected raw coordinates because at least one frame has no valid box";
   }
 
-  AlignedDoubleVector calc_x = raw_x_;
-  AlignedDoubleVector calc_y = raw_y_;
-  AlignedDoubleVector calc_z = raw_z_;
+  // moved, not copied: the stored frames are not needed after this
   if (mode_ == "com" &&
       (effective_pbc == "unwrap" || effective_pbc == "mic")) {
-    calc_x = reconstructed_com_x_;
-    calc_y = reconstructed_com_y_;
-    calc_z = reconstructed_com_z_;
+    calc_x = std::move(reconstructed_com_x_);
+    calc_y = std::move(reconstructed_com_y_);
+    calc_z = std::move(reconstructed_com_z_);
+  } else {
+    calc_x = std::move(raw_x_);
+    calc_y = std::move(raw_y_);
+    calc_z = std::move(raw_z_);
   }
+  raw_x_.clear();
+  raw_y_.clear();
+  raw_z_.clear();
+  reconstructed_com_x_.clear();
+  reconstructed_com_y_.clear();
+  reconstructed_com_z_.clear();
   if (effective_pbc == "unwrap") {
     for (std::size_t frame = 1; frame < frames; ++frame) {
       for (std::size_t point = 0; point < point_count_; ++point) {
@@ -377,12 +481,19 @@ void TitanMSDAnalyzer::compute_lag_results(
       }
     }
   }
+}
 
-  std::size_t maxlag = frames - 1;
-  if (maxlag_ == "auto")
-    maxlag = std::min<std::size_t>(maxlag, 1000);
-  else
-    maxlag = std::min<std::size_t>(maxlag, static_cast<std::size_t>(std::stoul(maxlag_)));
+// MSD over origins and targets inside frames [first_frame, end_frame).
+void TitanMSDAnalyzer::lag_results_in_range(
+    const AlignedDoubleVector &calc_x, const AlignedDoubleVector &calc_y,
+    const AlignedDoubleVector &calc_z, const std::string &effective_pbc,
+    std::size_t first_frame, std::size_t end_frame, std::size_t maxlag,
+    TitanExecutor &executor, std::vector<LagResult> &results) const {
+  results.clear();
+  const std::size_t frames = end_frame - first_frame;
+  if (frames < 2)
+    return;
+  maxlag = std::min(maxlag, frames - 1);
   results.resize(maxlag);
 
   const std::size_t workers = std::max<std::size_t>(1, executor.capacity());
@@ -394,7 +505,8 @@ void TitanMSDAnalyzer::compute_lag_results(
       double sum_dt = 0.0;
       std::uint64_t samples = 0;
       const std::size_t origins = frames - lag;
-      for (std::size_t origin = 0; origin < origins; ++origin) {
+      for (std::size_t origin = first_frame; origin < first_frame + origins;
+           ++origin) {
         const std::size_t target = origin + lag;
         sum_dt += time_ps_[target] - time_ps_[origin];
         for (std::size_t point = 0; point < point_count_; ++point) {
@@ -426,6 +538,23 @@ std::pair<double, double> TitanMSDAnalyzer::resolve_fit_window(
   if (valid_times.empty())
     return {0.0, 0.0};
   if (fit_window_ == "auto") {
+    // STR-13 (MDA-04). Only lags that keep at least half of the frames as
+    // time origins (lag <= frames/2), and at least the first three lags; then
+    // 20-80 % of that lag range, so the fit ends at <= 40 % of the trajectory.
+    // The old window was 20-80 % of every lag up to min(frames - 1, 1000):
+    // for a short run it reached 80 % of the trajectory, where only 20 % of
+    // the frames are origins. gmx msd fits 10-90 % of its lag range (all
+    // lags by default), which has the same problem.
+    const std::size_t frames = time_ps_.size();
+    std::vector<double> eligible;
+    for (const LagResult &row : results)
+      if (row.samples > 0 && row.lag_time_ps > 0.0 && 2 * row.lag_index <= frames)
+        eligible.push_back(row.lag_time_ps);
+    if (eligible.size() < 3)
+      eligible.assign(valid_times.begin(),
+                      valid_times.begin() +
+                          static_cast<std::ptrdiff_t>(std::min<std::size_t>(3, valid_times.size())));
+    valid_times = std::move(eligible);
     const std::size_t n = valid_times.size();
     const std::size_t lo = std::min(n - 1, static_cast<std::size_t>(std::floor(0.2 * static_cast<double>(n - 1))));
     const std::size_t hi = std::min(n - 1, static_cast<std::size_t>(std::ceil(0.8 * static_cast<double>(n - 1))));
@@ -444,8 +573,95 @@ std::pair<double, double> TitanMSDAnalyzer::resolve_fit_window(
 TitanMSDAnalyzer::FitResult
 TitanMSDAnalyzer::fit_linear(const std::vector<LagResult> &results,
                              bool loglog) const {
-  FitResult fit;
   const auto [tmin, tmax] = resolve_fit_window(results);
+  return fit_linear_window(results, loglog, tmin, tmax);
+}
+
+TitanMSDAnalyzer::TimeBlocks TitanMSDAnalyzer::compute_time_blocks(
+    const std::string &blocks_spec, const FitResult &diffusion,
+    const FitResult &alpha, const AlignedDoubleVector &calc_x,
+    const AlignedDoubleVector &calc_y, const AlignedDoubleVector &calc_z,
+    const std::string &effective_pbc, TitanExecutor &executor) const {
+  TimeBlocks blocks;
+  const std::size_t frames = time_ps_.size();
+  if (frames < 10 || point_count_ == 0 || !diffusion.ok) {
+    blocks.status = diffusion.ok ? "too_few_frames" : "no_diffusion_fit";
+    return blocks;
+  }
+  // block count as for the other time-series sidecars: auto = 5 below 50
+  // frames, else floor(sqrt(frames)) up to 20
+  std::size_t requested = 0;
+  if (blocks_spec == "auto") {
+    requested = frames < 50 ? 5
+                            : std::min<std::size_t>(
+                                  20, static_cast<std::size_t>(std::floor(
+                                          std::sqrt(static_cast<double>(frames)))));
+  } else {
+    try {
+      requested = static_cast<std::size_t>(std::max(0, std::stoi(blocks_spec)));
+    } catch (...) {
+      requested = 0;
+    }
+  }
+  // a block must hold the whole fit window twice over: each fitted lag then
+  // has at least half the block's frames as origins
+  auto block_span = [&](std::size_t count, std::size_t index) {
+    const std::size_t base = frames / count;
+    const std::size_t rem = frames % count;
+    const std::size_t begin = index * base + std::min(index, rem);
+    const std::size_t len = base + (index < rem ? 1 : 0);
+    return std::pair<std::size_t, std::size_t>{begin, begin + len};
+  };
+  std::size_t count = std::min(requested, frames / 2);
+  for (; count >= 2; --count) {
+    bool long_enough = true;
+    for (std::size_t b = 0; b < count && long_enough; ++b) {
+      const auto [begin, end] = block_span(count, b);
+      long_enough = time_ps_[end - 1] - time_ps_[begin] >= 2.0 * diffusion.tmax_ps;
+    }
+    if (long_enough)
+      break;
+  }
+  if (count < 2) {
+    blocks.status = "fit_window_exceeds_half_block";
+    return blocks;
+  }
+
+  const std::size_t maxlag = resolved_maxlag(frames);
+  std::vector<LagResult> block_results;
+  double length_sum = 0.0;
+  for (std::size_t b = 0; b < count; ++b) {
+    const auto [begin, end] = block_span(count, b);
+    lag_results_in_range(calc_x, calc_y, calc_z, effective_pbc, begin, end,
+                         maxlag, executor, block_results);
+    const FitResult fit = fit_linear_window(block_results, false,
+                                            diffusion.tmin_ps,
+                                            diffusion.tmax_ps);
+    const FitResult block_alpha =
+        fit_linear_window(block_results, true, alpha.tmin_ps, alpha.tmax_ps);
+    if (!fit.ok) {
+      blocks.status = "block_fit_failed";
+      blocks.slopes.clear();
+      blocks.alphas.clear();
+      return blocks;
+    }
+    blocks.slopes.push_back(fit.slope);
+    blocks.alphas.push_back(block_alpha.ok
+                                ? block_alpha.slope
+                                : std::numeric_limits<double>::quiet_NaN());
+    length_sum += time_ps_[end - 1] - time_ps_[begin];
+  }
+  blocks.count = count;
+  blocks.length_ps = length_sum / static_cast<double>(count);
+  blocks.status = "ok";
+  return blocks;
+}
+
+TitanMSDAnalyzer::FitResult
+TitanMSDAnalyzer::fit_linear_window(const std::vector<LagResult> &results,
+                                    bool loglog, double tmin,
+                                    double tmax) const {
+  FitResult fit;
   fit.tmin_ps = tmin;
   fit.tmax_ps = tmax;
 
@@ -502,7 +718,8 @@ void TitanMSDAnalyzer::export_timeseries(
 void TitanMSDAnalyzer::export_diffusion_summary(
     const std::string &filename, const std::vector<LagResult> &,
     const FitResult &fit, const std::string &effective_pbc,
-    const std::string &pbc_warning, std::fstream &log) const {
+    const std::string &pbc_warning, const TimeBlocks &blocks,
+    std::fstream &log) const {
   std::ofstream out(filename);
   const double d_a2_per_ps = fit.ok ? fit.slope / 6.0 : 0.0;
   out << std::fixed << std::setprecision(8);
@@ -516,12 +733,33 @@ void TitanMSDAnalyzer::export_diffusion_summary(
   if (!pbc_warning.empty())
     out << "pbc_warning: " << pbc_warning << '\n';
   out << "fit_status: " << fit.status << '\n';
+  out << "fit_window_policy: "
+      << (fit_window_ == "auto"
+              ? "auto (20-80 % of the lags with lag <= frames/2)"
+              : "user")
+      << '\n';
   out << "fit_window_ps: " << fit.tmin_ps << ',' << fit.tmax_ps << '\n';
   out << "fit_points: " << fit.n << '\n';
   out << "slope_A2_per_ps: " << fit.slope << '\n';
   out << "D_A2_per_ps: " << d_a2_per_ps << '\n';
   out << "D_cm2_per_s: " << d_a2_per_ps * 1.0e-4 << '\n';
   out << "R2: " << fit.r2 << '\n';
+  if (blocks.status != "not_requested") {
+    // per-block MSD slope and alpha over the same fit window, for the
+    // time-block uncertainty of D (STR-25); full precision for the sidecar
+    auto join = [](const std::vector<double> &values) {
+      std::ostringstream text;
+      text << std::setprecision(17);
+      for (std::size_t i = 0; i < values.size(); ++i)
+        text << (i ? "," : "") << values[i];
+      return text.str();
+    };
+    out << "time_block_status: " << blocks.status << '\n';
+    out << "time_blocks: " << blocks.count << '\n';
+    out << "time_block_length_ps: " << blocks.length_ps << '\n';
+    out << "time_block_slope_A2_per_ps: " << join(blocks.slopes) << '\n';
+    out << "time_block_alpha: " << join(blocks.alphas) << '\n';
+  }
   if (log.is_open())
     TitanUI::log_kv(log, "MSD Diffusion Summary", filename);
 }
@@ -549,11 +787,22 @@ void TitanMSDAnalyzer::finalize_trajectory(
   if (!enabled_)
     return;
   std::vector<LagResult> results;
-  std::string effective_pbc;
+  std::string effective_pbc = "not_evaluated";
   std::string pbc_warning;
-  compute_lag_results(executor, results, effective_pbc, pbc_warning);
+  AlignedDoubleVector calc_x, calc_y, calc_z;
+  if (time_ps_.size() >= 2 && point_count_ > 0) {
+    prepare_coordinates(calc_x, calc_y, calc_z, effective_pbc, pbc_warning);
+    compute_lag_results(calc_x, calc_y, calc_z, effective_pbc, executor,
+                        results);
+  }
   const FitResult diffusion_fit = fit_linear(results, false);
   const FitResult alpha_fit = fit_linear(results, true);
+  const TimeBlocks time_blocks =
+      args.uncertainty.mode == "off"
+          ? TimeBlocks{}
+          : compute_time_blocks(args.uncertainty.blocks, diffusion_fit,
+                                alpha_fit, calc_x, calc_y, calc_z,
+                                effective_pbc, executor);
   export_timeseries(
       join_output_path(base_dir, info_output.get_msd_timeseries_filename(
                                      args, input_line, input_name)),
@@ -562,7 +811,7 @@ void TitanMSDAnalyzer::finalize_trajectory(
       join_output_path(base_dir,
                        info_output.get_msd_diffusion_summary_filename(
                            args, input_line, input_name)),
-      results, diffusion_fit, effective_pbc, pbc_warning, log);
+      results, diffusion_fit, effective_pbc, pbc_warning, time_blocks, log);
   export_alpha_fit(
       join_output_path(base_dir, info_output.get_msd_alpha_fit_filename(
                                      args, input_line, input_name)),

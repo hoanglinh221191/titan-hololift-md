@@ -49,8 +49,8 @@ void TitanLLPS::update_contact_dynamics(double time_ns, int frame_idx,
   auto update_lifetimes =
       [&](const std::vector<uint64_t> &current,
           std::unordered_map<uint64_t, ActiveContactRun> &active,
-          std::vector<double> &lifetimes, const std::string &type,
-          auto decode_ids) {
+          std::vector<double> &lifetimes, std::vector<double> &uncensored,
+          const std::string &type, auto decode_ids) {
         for (uint64_t key : current) {
           auto it = active.find(key);
           if (it == active.end()) {
@@ -73,6 +73,10 @@ void TitanLLPS::update_contact_dynamics(double time_ns, int frame_idx,
           }
           const double duration = std::max(0.0, time_ns - it->second.start_time_ns);
           lifetimes.push_back(duration);
+          // Liquidity v3: formation observed only if the contact was absent
+          // at an earlier analysed frame, i.e. it did not exist at frame 1.
+          if (it->second.start_time_ns > first_contact_time_ns_ + 1e-9)
+            uncensored.push_back(duration);
           if (dynamics_detailed_) {
             const auto ids = decode_ids(it->first);
             emit_contact_trace(time_ns, type, ids.first, ids.second, 0,
@@ -83,10 +87,12 @@ void TitanLLPS::update_contact_dynamics(double time_ns, int frame_idx,
       };
 
   update_lifetimes(sticker_pairs, active_sticker_contacts_,
-                   sticker_contact_lifetimes_ns_, "sticker_pair",
+                   sticker_contact_lifetimes_ns_,
+                   sticker_contact_lifetimes_uncensored_ns_, "sticker_pair",
                    [](uint64_t key) { return TitanLLPS::unpack_pair(key); });
   update_lifetimes(
       protein_rna_pairs, active_prna_contacts_, prna_contact_lifetimes_ns_,
+      prna_contact_lifetimes_uncensored_ns_,
       "protein_rna_chain_pair", [&](uint64_t key) {
         const auto ids = unpack_pair(key);
         const int raw_rna =
@@ -296,6 +302,18 @@ void TitanLLPS::update_contact_dynamics(double time_ns, int frame_idx,
 void TitanLLPS::finalize_contact_dynamics() {
   if (!dynamics_enabled_)
     return;
+  // Liquidity v3: count censoring before the active runs are flushed.
+  const auto count_censored = [&](const auto &active, uint64_t &right,
+                                  uint64_t &full) {
+    right = static_cast<uint64_t>(active.size());
+    full = 0;
+    for (const auto &entry : active)
+      if (entry.second.start_time_ns <= first_contact_time_ns_ + 1e-9)
+        ++full;
+  };
+  uint64_t st_right = 0, st_full = 0, pr_right = 0, pr_full = 0;
+  count_censored(active_sticker_contacts_, st_right, st_full);
+  count_censored(active_prna_contacts_, pr_right, pr_full);
   for (const auto &entry : active_sticker_contacts_) {
     sticker_contact_lifetimes_ns_.push_back(
         std::max(0.0, last_contact_time_ns_ - entry.second.start_time_ns));
@@ -311,6 +329,36 @@ void TitanLLPS::finalize_contact_dynamics() {
       build_lifetime_distribution(sticker_contact_lifetimes_ns_);
   contact_dynamics_result_.protein_rna_contact_lifetime =
       build_lifetime_distribution(prna_contact_lifetimes_ns_);
+  {
+    const auto fill = [&](LLPSLifetimeDistributionResult &r,
+                          std::vector<double> unc, uint64_t right,
+                          uint64_t full) {
+      r.right_censored_events = right;
+      r.full_window_events = full;
+      r.window_ns = std::max(0.0, last_contact_time_ns_ - first_contact_time_ns_);
+      r.uncensored_events = static_cast<uint64_t>(unc.size());
+      if (unc.empty())
+        return;
+      std::sort(unc.begin(), unc.end());
+      const auto q = [&](double p) {
+        const double pos = p * static_cast<double>(unc.size() - 1);
+        const auto lo = static_cast<std::size_t>(std::floor(pos));
+        const auto hi = std::min(unc.size() - 1, lo + 1);
+        return unc[lo] + (pos - static_cast<double>(lo)) * (unc[hi] - unc[lo]);
+      };
+      double s = 0.0;
+      for (double v : unc)
+        s += v;
+      r.uncensored_mean_ns = s / static_cast<double>(unc.size());
+      r.uncensored_median_ns = q(0.5);
+      r.uncensored_p90_ns = q(0.9);
+      r.uncensored_p99_ns = q(0.99);
+    };
+    fill(contact_dynamics_result_.sticker_contact_lifetime,
+         sticker_contact_lifetimes_uncensored_ns_, st_right, st_full);
+    fill(contact_dynamics_result_.protein_rna_contact_lifetime,
+         prna_contact_lifetimes_uncensored_ns_, pr_right, pr_full);
+  }
   if (count_protein_neighbor_persistence_ > 0) {
     contact_dynamics_result_.protein_neighbor_persistence =
         sum_protein_neighbor_persistence_ /
@@ -365,6 +413,18 @@ void TitanLLPS::export_contact_dynamics(const info &info_output,
     out << "# median_ns " << dist.median_ns << "\n";
     out << "# p90_ns " << dist.p90_ns << "\n";
     out << "# max_ns " << dist.max_ns << "\n";
+    out << "# window_ns " << dist.window_ns << "\n";
+    out << "# right_censored_events " << dist.right_censored_events
+        << " (still present at the last frame: lifetime is a lower bound)\n";
+    out << "# full_window_events " << dist.full_window_events
+        << " (present at every frame of the window)\n";
+    out << "# uncensored_events " << dist.uncensored_events
+        << " (formation and rupture both observed)\n";
+    out << "# uncensored_mean_ns " << dist.uncensored_mean_ns << "\n";
+    out << "# uncensored_median_ns " << dist.uncensored_median_ns << "\n";
+    out << "# uncensored_p90_ns " << dist.uncensored_p90_ns << "\n";
+    out << "# uncensored_p99_ns " << dist.uncensored_p99_ns << "\n";
+    out << "# lifetime convention: frames present x frame interval; all events, censored included\n";
     out << "# lifetime_ns count\n";
     for (std::size_t i = 0; i < dist.lifetime_ns.size(); ++i)
       out << dist.lifetime_ns[i] << " " << dist.counts[i] << "\n";

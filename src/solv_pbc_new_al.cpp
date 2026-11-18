@@ -1,6 +1,7 @@
 #include "BoxMatrix.h"
 #include "functions.h"
 #include "pbctopo_hull.h"
+#include "titan_executor.h"
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -2414,7 +2415,8 @@ int Multi_MOL::solve_pbc_new(Multi_MOL &mol2, arguments &Arguments,
   return 0;
 }
 
-int Multi_MOL::solv_pbc_pbcn(Multi_MOL &mol2, arguments &Arguments) {
+int Multi_MOL::solv_pbc_pbcn(Multi_MOL &mol2, arguments &Arguments,
+                              TitanExecutor *executor) {
   {
     auto worker = [&](int start_frame, int end_frame) {
       if (start_frame >= end_frame ||
@@ -2493,19 +2495,18 @@ int Multi_MOL::solv_pbc_pbcn(Multi_MOL &mol2, arguments &Arguments) {
       }
     };
 
-    const int num_threads =
-        Arguments.nt > 0 ? static_cast<int>(Arguments.nt) : 1;
-    vector<thread> threads(num_threads);
-    const int chunk = static_cast<int>(m_mol.size()) / num_threads;
-    for (int t = 0; t < num_threads; ++t) {
-      const int start = t * chunk;
-      const int end = (t == num_threads - 1) ? static_cast<int>(m_mol.size())
-                                             : (t + 1) * chunk;
-      threads[t] = thread(worker, start, end);
-    }
-    for (auto &th : threads) {
-      if (th.joinable())
-        th.join();
+    // CORE-05: frames are independent; the shared executor splits them
+    // (no threads created per chunk).
+    const std::size_t num_threads =
+        Arguments.nt > 0 ? static_cast<std::size_t>(Arguments.nt) : 1;
+    if (executor == nullptr || num_threads <= 1) {
+      worker(0, static_cast<int>(m_mol.size()));
+    } else {
+      executor->parallel_for(
+          m_mol.size(), num_threads, 1,
+          [&](std::size_t, std::size_t begin, std::size_t end) {
+            worker(static_cast<int>(begin), static_cast<int>(end));
+          });
     }
     return 0;
   }

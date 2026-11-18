@@ -10,7 +10,11 @@
 
 namespace titan_pbctopo {
 
-inline constexpr std::uint32_t VIBE_OBSERVATION_SCHEMA_VERSION = 7;
+// 8: steric_policy, input overlap scan, contact cycle lattice and bonded
+// winding columns appended to the frame report; evidence_state
+// extended_periodic and fallback_reason evidence_periodic.
+inline constexpr std::uint32_t VIBE_OBSERVATION_SCHEMA_VERSION = 8;
+inline constexpr std::uint32_t VIBE_OBSERVATION_MIN_READABLE_SCHEMA_VERSION = 7;
 inline constexpr std::string_view VIBE_OBSERVATION_COORDINATE_UNIT =
     "angstrom";
 inline constexpr std::string_view VIBE_OBSERVATION_TIME_UNIT = "ps";

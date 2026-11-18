@@ -485,15 +485,69 @@ void TitanDSSPAnalyzer::prepare_backbone_coordinates(const MOL &frame) {
     copy_atom(residue.atom_o, i, o_x_, o_y_, o_z_, has_o_);
   }
 
+  // STR-10 (MDB-07). Chain breaks are found from the coordinates, as mkdssp
+  // does: another chain, a missing C or N, or C(i)-N(i+1) longer than 2.5 A.
+  // The residue order alone (the old local_index test) never saw a gap inside
+  // a chain, so helices, turns and bridges ran across missing residues.
+  constexpr double kMaxPeptideBond2 = 2.5 * 2.5;
+  break_prefix_.assign(n_res, 0);
+  std::size_t gap_count = 0;
+  std::size_t first_gap = n_res;
+  double first_gap_length = 0.0;
+  for (std::size_t i = 0; i + 1 < n_res; ++i) {
+    bool broken = residues_[i].chainnum != residues_[i + 1].chainnum;
+    if (!broken) {
+      if (!has_c_[i] || !has_n_[i + 1]) {
+        broken = true;
+      } else {
+        const double dx = n_x_[i + 1] - c_x_[i];
+        const double dy = n_y_[i + 1] - c_y_[i];
+        const double dz = n_z_[i + 1] - c_z_[i];
+        const double d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 > kMaxPeptideBond2) {
+          broken = true;
+          if (gap_count++ == 0) {
+            first_gap = i;
+            first_gap_length = std::sqrt(d2);
+          }
+        }
+      }
+    }
+    break_prefix_[i + 1] = break_prefix_[i] + (broken ? 1u : 0u);
+  }
+  if (gap_count > 0 && !reported_gap_) {
+    reported_gap_ = true;
+    std::ostringstream message;
+    message << "[DSSP] " << label_ << ": " << gap_count
+            << " chain break(s) inside a chain (C(i)-N(i+1) > 2.5 A), first "
+            << "after " << residues_[first_gap].chain << ':'
+            << residues_[first_gap].resnr << " (" << std::fixed
+            << std::setprecision(2) << first_gap_length
+            << " A); no helix, turn or bridge spans a break.";
+    TitanUI::print_warning(message.str());
+  }
+
+  // STR-10 (MDB-06). Missing amide H at N + 1.0 A along the C=O vector of
+  // the previous residue, N + (C - O)/|C - O| as mkdssp; the old code added
+  // the unnormalised C - O (N-H 1.23 A, bonds ~1 kcal/mol too strong for a
+  // heavy-atom input). No H is placed across a chain break: the previous
+  // residue's carbonyl does not orient this N-H.
   for (std::size_t i = 1; i < n_res; ++i) {
     if (!has_n_[i] || has_h_[i] || is_proline_like(residues_[i].resname))
       continue;
-    if (!has_c_[i - 1] || !has_o_[i - 1])
+    if (!has_c_[i - 1] || !has_o_[i - 1] ||
+        break_prefix_[i] != break_prefix_[i - 1])
       continue;
 
-    h_x_[i] = n_x_[i] + (c_x_[i - 1] - o_x_[i - 1]);
-    h_y_[i] = n_y_[i] + (c_y_[i - 1] - o_y_[i - 1]);
-    h_z_[i] = n_z_[i] + (c_z_[i - 1] - o_z_[i - 1]);
+    const double cx = c_x_[i - 1] - o_x_[i - 1];
+    const double cy = c_y_[i - 1] - o_y_[i - 1];
+    const double cz = c_z_[i - 1] - o_z_[i - 1];
+    const double co = norm3(cx, cy, cz);
+    if (!(co > 0.0) || !std::isfinite(co))
+      continue;
+    h_x_[i] = n_x_[i] + cx / co;
+    h_y_[i] = n_y_[i] + cy / co;
+    h_z_[i] = n_z_[i] + cz / co;
     has_h_[i] = 1;
   }
 
@@ -536,10 +590,9 @@ bool TitanDSSPAnalyzer::no_chain_break_between(std::size_t begin,
     return false;
   if (begin > end)
     std::swap(begin, end);
-  const auto &lhs = residues_[begin];
-  const auto &rhs = residues_[end];
-  return lhs.chainnum == rhs.chainnum &&
-         rhs.local_index == lhs.local_index + (end - begin);
+  if (break_prefix_.size() != residues_.size())
+    return false;
+  return break_prefix_[begin] == break_prefix_[end];
 }
 
 bool TitanDSSPAnalyzer::donor_acceptor_excluded(std::size_t donor,
@@ -728,10 +781,13 @@ void TitanDSSPAnalyzer::classify_current_frame() {
   std::vector<Bridge> bridges;
   bridges.reserve(n_res / 2 + 1);
 
+  // MDB-08: partners at least three residues apart, as mkdssp (j = i + 3);
+  // from j = i + 1 two bonds of a tight turn (e.g. 3 -> 4 and 4 -> 1) made
+  // a "bridge" (2, 4).
   for (std::size_t i = 1; i + 1 < n_res; ++i) {
     if (!has_ca_[i])
       continue;
-    for (std::size_t j = i + 1; j + 1 < n_res; ++j) {
+    for (std::size_t j = i + 3; j + 1 < n_res; ++j) {
       if (!has_ca_[j])
         continue;
       const double dx = ca_x_[i] - ca_x_[j];
@@ -795,6 +851,16 @@ void TitanDSSPAnalyzer::classify_current_frame() {
               return lhs.i.front() < rhs.i.front();
             });
 
+  // MDB-09: mkdssp computes the ladder gaps below in uint32, so a negative
+  // difference (the second ladder's partner strand lies before the end of the
+  // first one's, e.g. a strand paired with two strands that follow each
+  // other in sequence) is huge and never a bulge. Signed differences merged
+  // such ladders, and the merged j range ran backwards, so the partner
+  // residues lost their E state.
+  auto gap = [](long long later, long long earlier) {
+    return later >= earlier ? later - earlier
+                            : std::numeric_limits<long long>::max();
+  };
   for (std::size_t i = 0; i < bridges.size(); ++i) {
     for (std::size_t j = i + 1; j < bridges.size(); ++j) {
       const long long ibi = static_cast<long long>(bridges[i].i.front());
@@ -816,14 +882,16 @@ void TitanDSSPAnalyzer::classify_current_frame() {
               static_cast<std::size_t>(std::max(jei, jej)))) {
         continue;
       }
-      if (ibj - iei >= 6 || (iei >= ibj && ibi <= iej))
+      if (gap(ibj, iei) >= 6 || (iei >= ibj && ibi <= iej))
         continue;
 
       bool bulge = false;
       if (bridges[i].type == BridgeType::Parallel) {
-        bulge = (((jbj - jei) < 6 && (ibj - iei) < 3) || ((jbj - jei) < 3));
+        bulge = ((gap(jbj, jei) < 6 && gap(ibj, iei) < 3) ||
+                 gap(jbj, jei) < 3);
       } else {
-        bulge = (((jbi - jej) < 6 && (ibj - iei) < 3) || ((jbi - jej) < 3));
+        bulge = ((gap(jbi, jej) < 6 && gap(ibj, iei) < 3) ||
+                 gap(jbi, jej) < 3);
       }
       if (!bulge)
         continue;

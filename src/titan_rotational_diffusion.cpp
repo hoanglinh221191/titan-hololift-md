@@ -87,6 +87,18 @@ std::array<double, 3>
 instantaneous_diffusion(double lag_time_ps, const Eigen::Vector3d &eigenvalues,
                         bool &valid);
 
+// For a rotation by theta, the Legendre correlations of a body-fixed unit
+// vector u averaged over its direction: <u . R u> = (1 + 2 cos theta)/3 and
+// <P2(u . R u)> = (4 cos^2 theta + 2 cos theta - 1)/5, which decay as
+// exp(-2Dt) and exp(-6Dt) for isotropic diffusion. The old C1/C2 were cos
+// theta and P2(cos theta) of the rotation angle itself (MDA-06), kept as
+// mean_cos_theta.
+inline void accumulate_rotation_angle(LagResult &row, double cosine) {
+  row.mean_cos_theta += cosine;
+  row.c1 += (1.0 + 2.0 * cosine) / 3.0;
+  row.c2 += (4.0 * cosine * cosine + 2.0 * cosine - 1.0) / 5.0;
+}
+
 double horizontal_sum(__m256d values) {
   alignas(32) std::array<double, 4> lanes{};
   _mm256_store_pd(lanes.data(), values);
@@ -164,8 +176,7 @@ compute_lag_results_soa(std::span<const double> qw, std::span<const double> qx,
               2.0 * std::acos(std::clamp(std::abs(lane_w[lane]), 0.0, 1.0));
           const double cosine = std::cos(theta);
           row.rotational_msd_rad2 += theta * theta;
-          row.c1 += cosine;
-          row.c2 += 0.5 * (3.0 * cosine * cosine - 1.0);
+          accumulate_rotation_angle(row, cosine);
           row.lag_time_ps += time_ps[origin + lane + lag] -
                              time_ps[origin + lane];
         }
@@ -197,8 +208,7 @@ compute_lag_results_soa(std::span<const double> qw, std::span<const double> qx,
             2.0 * std::acos(std::clamp(std::abs(relative.w), 0.0, 1.0));
         const double cosine = std::cos(theta);
         row.rotational_msd_rad2 += theta * theta;
-        row.c1 += cosine;
-        row.c2 += 0.5 * (3.0 * cosine * cosine - 1.0);
+        accumulate_rotation_angle(row, cosine);
         row.covariance.values[0] += relative.x * relative.x;
         row.covariance.values[1] += relative.y * relative.y;
         row.covariance.values[2] += relative.z * relative.z;
@@ -213,6 +223,7 @@ compute_lag_results_soa(std::span<const double> qw, std::span<const double> qx,
         row.rotational_msd_rad2 /= denom;
         row.c1 /= denom;
         row.c2 /= denom;
+        row.mean_cos_theta /= denom;
         row.orientation_correlation = row.c1;
         row.lag_time_ps /= denom;
         for (double &value : row.covariance.values)
@@ -411,20 +422,47 @@ Quaternion quaternion_from_matrix(const Eigen::Matrix3d &matrix) {
   return quaternion;
 }
 
+// Makes the body whole by walking the selection in order: each atom takes
+// the image nearest to the previous (already placed) atom. Consecutive atoms
+// of a molecule are close, so a body larger than half the box comes out
+// whole; the old reconstruction took every atom's image nearest to atom 0
+// and broke such bodies (MDA-07). An atom already nearest to its
+// predecessor is left bit for bit.
 std::vector<Point3> reconstruct_points(std::span<const Point3> points,
                                        const box *frame_box) {
   std::vector<Point3> reconstructed(points.begin(), points.end());
   if (frame_box == nullptr || reconstructed.empty())
     return reconstructed;
   const BoxMatrix box_matrix(*frame_box);
+  double shift[3] = {0.0, 0.0, 0.0}; // lattice translation carried along
   for (std::size_t i = 1; i < reconstructed.size(); ++i) {
-    double dx = reconstructed[i].x - reconstructed[0].x;
-    double dy = reconstructed[i].y - reconstructed[0].y;
-    double dz = reconstructed[i].z - reconstructed[0].z;
-    box_matrix.apply_mic(dx, dy, dz);
-    reconstructed[i] = Point3{reconstructed[0].x + dx,
-                              reconstructed[0].y + dy,
-                              reconstructed[0].z + dz};
+    Point3 &atom = reconstructed[i];
+    atom.x += shift[0];
+    atom.y += shift[1];
+    atom.z += shift[2];
+    const Point3 &previous = reconstructed[i - 1];
+    const double dx = atom.x - previous.x;
+    const double dy = atom.y - previous.y;
+    const double dz = atom.z - previous.z;
+    double n[3];
+    bool moved = false;
+    for (int axis = 0; axis < 3; ++axis) {
+      n[axis] = std::round(box_matrix.inv[0][axis] * dx +
+                           box_matrix.inv[1][axis] * dy +
+                           box_matrix.inv[2][axis] * dz);
+      moved = moved || n[axis] != 0.0;
+    }
+    if (!moved)
+      continue;
+    double step[3];
+    for (int c = 0; c < 3; ++c)
+      step[c] = -(box_matrix.m[0][c] * n[0] + box_matrix.m[1][c] * n[1] +
+                  box_matrix.m[2][c] * n[2]);
+    atom.x += step[0];
+    atom.y += step[1];
+    atom.z += step[2];
+    for (int c = 0; c < 3; ++c)
+      shift[c] += step[c];
   }
   return reconstructed;
 }
@@ -583,9 +621,18 @@ OrientationFit fit_orientation(std::span<const Point3> reference,
                                                 reconstructed[i].y,
                                                 reconstructed[i].z) -
                                 mob_center;
-    weighted_d2 += weight * (align * mob - ref).squaredNorm();
+    // align = U V^T of H = sum mob ref^T maps the reference onto the frame
+    // (mob = align ref for a rigid body), so the fit residual is
+    // align^T mob - ref; align mob - ref rotated the frame twice and gave a
+    // kabsch_rmsd_A of several A for a rigid body (STR-23 follow-up).
+    weighted_d2 += weight * (align.transpose() * mob - ref).squaredNorm();
   }
   fit.valid = true;
+  // orientation = frame -> reference (R(t)^T), so the lag increment
+  // q(o) conj(q(o+lag)) of compute_lag_results is R(o)^T R(o+lag): the
+  // BODY-frame increment the Favro covariance needs. (Reversing the product,
+  // as the 21 Oct review proposed, gives the lab-frame increment and
+  // collapses D1/D2/D3 to D_iso: test/rotational_diffusion_oracle.py.)
   fit.orientation = quaternion_from_matrix(align.transpose());
   fit.rmsd_a = std::sqrt(weighted_d2 / mass_sum);
   return fit;
@@ -677,8 +724,7 @@ compute_lag_results_scalar(std::span<const Quaternion> orientations,
           2.0 * std::acos(std::clamp(std::abs(relative.w), 0.0, 1.0));
       const double cosine = std::cos(theta);
       row.rotational_msd_rad2 += theta * theta;
-      row.c1 += cosine;
-      row.c2 += 0.5 * (3.0 * cosine * cosine - 1.0);
+      accumulate_rotation_angle(row, cosine);
       row.covariance.values[0] += relative.x * relative.x;
       row.covariance.values[1] += relative.y * relative.y;
       row.covariance.values[2] += relative.z * relative.z;
@@ -694,6 +740,7 @@ compute_lag_results_scalar(std::span<const Quaternion> orientations,
       row.rotational_msd_rad2 /= denom;
       row.c1 /= denom;
       row.c2 /= denom;
+      row.mean_cos_theta /= denom;
       row.orientation_correlation = row.c1;
       row.lag_time_ps /= denom;
       for (double &value : row.covariance.values)
@@ -936,12 +983,16 @@ void Analyzer::append_frame(const MOL &frame) {
 void Analyzer::export_msd(const std::string &filename,
                           const std::vector<LagResult> &results) const {
   std::ofstream out(filename);
-  out << "lag_index lag_time_ps rotational_msd_rad2 C1 C2 samples\n";
+  // C1, C2: Legendre correlations <P1>, <P2> of a body-fixed vector averaged
+  // over its direction; mean_cos_theta: <cos> of the rotation angle (what the
+  // C1 column held before, STR-23/MDA-06).
+  out << "lag_index lag_time_ps rotational_msd_rad2 C1 C2 samples "
+         "mean_cos_theta\n";
   out << std::fixed << std::setprecision(8);
   for (const LagResult &row : results)
     out << row.lag_index << ' ' << row.lag_time_ps << ' '
         << row.rotational_msd_rad2 << ' ' << row.c1 << ' ' << row.c2 << ' '
-        << row.samples << '\n';
+        << row.samples << ' ' << row.mean_cos_theta << '\n';
 }
 
 void Analyzer::export_quaternions(const std::string &filename) const {
@@ -994,6 +1045,13 @@ void Analyzer::export_summary(const std::string &filename, const TensorFit &fit,
   out << "finite_size_note: Reported rotational diffusion is the uncorrected "
          "trajectory estimate; periodic-box finite-size correction may be "
          "needed.\n";
+  out << "correlation_note: C1 and C2 in the rotational MSD file are the "
+         "Legendre correlations of a body-fixed vector averaged over its "
+         "direction ((1 + 2 cos theta)/3 and (4 cos^2 theta + 2 cos theta - "
+         "1)/5 of the rotation angle theta), exp(-2Dt) and exp(-6Dt) for "
+         "isotropic diffusion; mean_cos_theta is <cos theta>.\n";
+  out << "rotational_msd_note: rotational_msd_rad2 is <theta^2> with theta in "
+         "[0, pi]; it saturates and follows 6 D_iso t only at short lags.\n";
   out << "pbc_policy_requested: " << pbc_ << '\n';
   out << "pbc_policy_effective: " << effective_pbc << '\n';
   if (!pbc_warning.empty())

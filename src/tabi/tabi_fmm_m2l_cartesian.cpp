@@ -74,9 +74,12 @@ CartesianJcpMoments build_cartesian_jcp_moments(
       throw std::out_of_range("Cartesian JCP source panel index is invalid");
     }
     const PrototypePanel &panel = panels[panel_index];
-    const double dx = panel.x - center_x;
-    const double dy = panel.y - center_y;
-    const double dz = panel.z - center_z;
+    // A node patch is summed as its one-point source, centroid and mean
+    // normal, as in the degree-one moments and the near loop.
+    const bool centre = panel.has_source_quadrature_center;
+    const double dx = (centre ? panel.source_x : panel.x) - center_x;
+    const double dy = (centre ? panel.source_y : panel.y) - center_y;
+    const double dz = (centre ? panel.source_z : panel.z) - center_z;
     const double area_phin = panel.area * phin_values[panel_index];
     const double area_phi = panel.area * phi_values[panel_index];
     for (std::size_t term = 0; term < indices.size(); ++term) {
@@ -87,7 +90,10 @@ CartesianJcpMoments build_cartesian_jcp_moments(
           TitanPBE::Tabi::detail::pow_int(dz, index.az);
       kahan_add(area_phin * monomial, moments.phin[term],
                 phin_compensation[term]);
-      const std::array<double, 3> normal{panel.nx, panel.ny, panel.nz};
+      const std::array<double, 3> normal =
+          centre ? std::array<double, 3>{panel.source_nx, panel.source_ny,
+                                         panel.source_nz}
+                 : std::array<double, 3>{panel.nx, panel.ny, panel.nz};
       for (std::size_t component = 0; component < normal.size(); ++component) {
         kahan_add(area_phi * normal[component] * monomial,
                   moments.phi_normal[component][term],

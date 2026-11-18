@@ -1,189 +1,135 @@
-#include<iostream>
-#include<fstream>
-#include<algorithm>
-#include<iomanip>
-#include<thread>
-#include"functions.h"
+// Engine side of -cscd; the distances and files are in impl_cscd_class.cpp.
+#include "functions.h"
 #include "titan_executor.h"
-using namespace std;
-int gen_files_for_cscd(Multi_MOL& pro_in, Multi_MOL& lig, const arguments& Arguments, fstream& log, size_t num_snap, int sc_flag, 
-	int input_name, vector<string>& list_output_name, all_cscd& out_dis, const folders& paths, vector<fstream>& out_files)
-{
-	if (num_snap == 0)
-	{
-		if (!out_files.empty())
-		{
-			for (auto& file : out_files)file.close();
-			out_files.clear();
-		}
-		if (!list_output_name.empty())list_output_name.clear();
+#include "titan_ui.h"
 
-		if (pro_in.get_mol_type() != "ligand")
-		{
-			for (size_t k{}; k < pro_in.Index.size() - 1; ++k)
-				for (size_t l{}; l < pro_in.Index[k].get_size_v(); ++l)
-				{
-					string name_out_dis{ Arguments.name_out_cal_dis + pro_in.Index[k].get_chain() + to_string(pro_in.Index[k].get_res_num_e(l)) + ".dat" };
-					list_output_name.emplace_back(name_out_dis);
+#include <algorithm>
+#include <stdexcept>
+#include <string>
 
-					if (Arguments.flag_separation_results == true)
-					{
-						if (input_name - Arguments.b_input >= paths.get_size())return 1;
-						out_files.emplace_back(fstream(paths.get_path(input_name - Arguments.b_input) + "/" + name_out_dis, ios::out));
-					}
-				}
-		}
-		else
-		{
-			for (size_t k{}; k < pro_in.Index.size() - 1; ++k)
-			{
-				string name_out_dis{ Arguments.name_out_cal_dis + pro_in.info[0].get_chain() + ".dat" };
-				list_output_name.emplace_back(name_out_dis);
+namespace {
 
-				if (Arguments.flag_separation_results == true)
-				{
-					if (input_name - Arguments.b_input >= paths.get_size())return 1;
-					out_files.emplace_back(fstream(paths.get_path(input_name - Arguments.b_input) + "/" + name_out_dis, ios::out));
-				}
-			}
-		}
-	}
-	else
-	{
-		for (size_t i{}; i < out_files.size(); ++i)
-			if(!out_files[i].is_open())
-			out_files[i].open(paths.get_path(input_name - Arguments.b_input) + "/" + list_output_name[i], ios::out|ios::app);
-	}
-	return 0;
+// MOL::take_com uses the atoms marked side chain and falls back to the whole
+// residue. The marks separate side chains from the backbone only where
+// Multi_MOL::check_side_chain() classified amino-acid residues; with
+// -side_chain_contact full-res, or without amino acids, every atom is marked
+// or none is, and all centres are whole residues.
+std::string centre_kind(const Multi_MOL &pro_in, const Multi_MOL &lig) {
+  const auto marked = [](const Multi_MOL &mol) {
+    const auto side = [](const mol_info &atom) { return atom.is_side_chain(); };
+    return std::any_of(mol.info.begin(), mol.info.end(), side) &&
+           !std::all_of(mol.info.begin(), mol.info.end(), side);
+  };
+  const bool mol1 = marked(pro_in);
+  const bool mol2 = marked(lig);
+  if (mol1 && mol2)
+    return "side chain (whole residue for glycine and non-amino-acid "
+           "residues)";
+  if (!mol1 && !mol2)
+    return "whole residue (no side chain is separated from the backbone)";
+  return std::string("molecule 1 ") + (mol1 ? "side chain" : "whole residue") +
+         ", molecule 2 " + (mol2 ? "side chain" : "whole residue");
 }
 
-int impl_cscd(Multi_MOL& pro_in, Multi_MOL& lig, const arguments& Arguments, fstream& log, TitanExecutor &executor, size_t num_snap, 
-	int sc_flag, int input_name, vector<string>& list_output_name, all_cscd& out_dis, const folders& paths, vector<fstream>& out_files)
-{
-	vector<d_min> dis_sc(Arguments.nt);
-	if (Arguments.flag_topo_1 == false)
-	{
-		executor.parallel_do(Arguments.nt, [&](size_t i) {
-			take_min(ref(pro_in.m_mol[num_snap].Com), ref(lig.m_mol[num_snap].Com), ref(dis_sc[i]),
-			         i * pro_in.m_mol[num_snap].Com.size() / Arguments.nt,
-			         (i + 1ull) * pro_in.m_mol[num_snap].Com.size() / Arguments.nt,
-			         0ull, lig.m_mol[num_snap].Com.size(), ref(Arguments), sc_flag, Arguments.limit_dis);
-		});
-	}
-	else
-	{
-		executor.parallel_do(Arguments.nt, [&](size_t i) {
-			find_d_rescom_com(ref(pro_in.m_mol[num_snap].Com), ref(lig), ref(dis_sc[i]),
-			                  i * pro_in.m_mol[num_snap].Com.size() / Arguments.nt,
-			                  (i + 1ull) * pro_in.m_mol[num_snap].Com.size() / Arguments.nt,
-			                  num_snap, lig.m_mol[num_snap].Com.size(), Arguments.force_f,
-			                  sc_flag, Arguments.limit_dis);
-		});
-	}
+// Internal residue number of each centre, through its first atom; empty when
+// a centre points outside the topology.
+std::vector<size_t> internal_residues(const Multi_MOL &mol,
+                                      const std::vector<com> &centres) {
+  std::vector<size_t> internal;
+  internal.reserve(centres.size());
+  for (const com &centre : centres) {
+    const size_t atom = centre.get_respos();
+    if (atom == 0 || atom > mol.info.size())
+      return {};
+    internal.push_back(mol.info[atom - 1].get_internal_resnr());
+  }
+  return internal;
+}
 
-	if (gen_files_for_cscd(pro_in, lig, Arguments, log, num_snap, sc_flag, input_name, list_output_name, out_dis, paths, out_files) == 1) return 1;
+} // namespace
 
-	if (Arguments.flag_topo_1 == false && Arguments.flag_topo_2 == false)
-	{
-		size_t NumberofFile{};
-		for (size_t k{};k < pro_in.Index.size() - 1;++k)
-			for (size_t l{};l < pro_in.Index[k].get_size_v();++l)
-			{
-				if (Arguments.flag_separation_results == true)
-				{
-					out_files[NumberofFile].precision(3);
-					out_files[NumberofFile] << setw(10) << fixed << pro_in.m_mol[num_snap].time_of_snap;
-				}
-				vector<double> dis_temp{};
-				for (size_t kk{}; kk < lig.Index.size() - 1; ++kk)
-					for (size_t ll{}; ll < lig.Index[kk].get_size_v(); ++ll)
-					{
-						for (size_t i{};i < Arguments.nt;++i)
-							for (size_t j{};j < dis_sc[i].base.size();++j)
-							{
-								if (dis_sc[i].base[j].chain_rec == pro_in.Index[k].get_chain()
-									&& dis_sc[i].base[j].resnr_rec == pro_in.Index[k].get_res_num_e(l)
-									&& dis_sc[i].base[j].resnr_ab == lig.Index[kk].get_res_num_e(ll)
-									&& dis_sc[i].base[j].chain_ab == lig.Index[kk].get_chain())
-								{
-									dis_temp.emplace_back(dis_sc[i].base[j].d);
-									if (Arguments.flag_separation_results == true)
-										out_files[NumberofFile] << setw(14) << fixed << dis_sc[i].base[j].d;
-								}
-							}
-					}
-				out_dis.emplace(list_output_name.size(), NumberofFile, num_snap, pro_in.m_mol[num_snap].time_of_snap, dis_temp);
-				if (Arguments.flag_separation_results == true)
-					out_files[NumberofFile] << '\n';
-				out_files[NumberofFile].close();
-				++NumberofFile;
-			}
-	}
-	else if(Arguments.flag_topo_1 == true && Arguments.flag_topo_2 == false)
-	{
-		size_t NumberofFile{};
-		for (size_t k{};k < pro_in.Index.size() - 1;++k)
-			for (size_t l{};l < pro_in.Index[k].get_size_v();++l)
-			{
-					if (Arguments.flag_separation_results == true)
-					{
-						out_files[NumberofFile].precision(3);
-						out_files[NumberofFile] << setw(10) << fixed << pro_in.m_mol[num_snap].time_of_snap;
-					}
-				vector<double> dis_temp{};
-				for (size_t kk{};kk < lig.Index.size() - 1;++kk)
-					{
-						for (size_t i{};i < Arguments.nt;++i)
-							for (size_t j{};j < dis_sc[i].base.size();++j)
-							{
-								if (dis_sc[i].base[j].chain_rec == pro_in.Index[k].get_chain()
-									&& dis_sc[i].base[j].resnr_rec == pro_in.Index[k].get_res_num_e(l))
-								{
-									dis_temp.emplace_back(dis_sc[i].base[j].d);
-									if (Arguments.flag_separation_results == true)
-										out_files[NumberofFile] << setw(14) << fixed << dis_sc[i].base[j].d;
-								}
-							}
-					}
-				out_dis.emplace(list_output_name.size(), NumberofFile, num_snap, pro_in.m_mol[num_snap].time_of_snap, dis_temp);
-				if (Arguments.flag_separation_results == true)
-					out_files[NumberofFile] << '\n';
-				out_files[NumberofFile].close();
-				++NumberofFile;
-			}
-	}
-	else if (Arguments.flag_topo_1 == true && Arguments.flag_topo_2 == true)
-	{
-		size_t NumberofFile{};
-		for (size_t k{}; k < pro_in.Index.size() - 1; ++k)
-			{
-				if (Arguments.flag_separation_results == true)
-				{
-					out_files[NumberofFile].precision(3);
-					out_files[NumberofFile] << setw(10) << fixed << pro_in.m_mol[num_snap].time_of_snap;
-				}
-				vector<double> dis_temp{};
-				for (size_t kk{}; kk < lig.Index.size() - 1; ++kk)
-				{
-					for (size_t i{}; i < Arguments.nt; ++i)
-						for (size_t j{}; j < dis_sc[i].base.size(); ++j)
-						{
-							if (dis_sc[i].base[j].chain_rec == pro_in.Index[k].get_chain())
-							{
-								dis_temp.emplace_back(dis_sc[i].base[j].d);
-								if (Arguments.flag_separation_results == true)
-									out_files[NumberofFile] << setw(14) << fixed << dis_sc[i].base[j].d;
-							}
-						}
-				}
-				out_dis.emplace(list_output_name.size(), NumberofFile, num_snap, pro_in.m_mol[num_snap].time_of_snap, dis_temp);
-				if (Arguments.flag_separation_results == true)
-					out_files[NumberofFile] << '\n';
-				out_files[NumberofFile].close();
-				++NumberofFile;
-			}
-	}
-	for (auto& file : out_files)
-		if (file.is_open())file.close();
-	return 0;
+int impl_cscd(Multi_MOL &pro_in, Multi_MOL &lig, const arguments &Arguments,
+              TitanExecutor &executor, size_t threads, size_t num_snap,
+              size_t frame, int sc_flag, all_cscd &out_dis) {
+  try {
+    if (num_snap >= pro_in.m_mol.size() || num_snap >= lig.m_mol.size())
+      throw std::runtime_error("frame " + std::to_string(frame + 1) +
+                               " is not loaded for both molecules");
+    const MOL &mol1 = pro_in.m_mol[num_snap];
+    const MOL &mol2 = lig.m_mol[num_snap];
+    if (!out_dis.configured()) {
+      all_cscd::Options options;
+      // 1 = nearest partner only (default); -act sets 0, the prompt 2.
+      options.nearest_only = sc_flag == 1;
+      options.skip_same_residue = Arguments.self_int;
+      options.file_prefix = Arguments.name_out_cal_dis;
+      options.time_unit = Arguments.tu;
+      options.centre = centre_kind(pro_in, lig);
+      if (options.centre.starts_with("whole residue"))
+        TitanUI::print_warning(
+            "-cscd: no side chain is separated from the backbone "
+            "(-side_chain_contact full-res, or no amino acids); the "
+            "distances are between whole-residue centres of mass.");
+      out_dis.configure(options, internal_residues(pro_in, mol1.Com),
+                        internal_residues(lig, mol2.Com));
+    }
+    out_dis.add_frame(frame, Arguments.output_time(mol1.time_of_snap),
+                      mol1.Com, mol2.Com, &executor, threads);
+  } catch (const std::exception &e) {
+    TitanUI::print_error(std::string("-cscd: ") + e.what());
+    return 1;
+  }
+  return 0;
+}
+
+int end_cscd_trajectory(const arguments &Arguments, all_cscd &out_dis,
+                        const folders &paths, int input_name) {
+  if (!Arguments.cal_dis_sc_contact)
+    return 0;
+  try {
+    std::string directory;
+    if (Arguments.flag_separation_results) {
+      const size_t trajectory =
+          input_name >= Arguments.b_input
+              ? static_cast<size_t>(input_name - Arguments.b_input)
+              : 0;
+      if (trajectory >= paths.get_size())
+        throw std::runtime_error("no output folder for trajectory " +
+                                 std::to_string(trajectory + 1));
+      directory = paths.get_path(trajectory);
+    }
+    out_dis.end_trajectory(directory);
+  } catch (const std::exception &e) {
+    TitanUI::print_error(std::string("-cscd: ") + e.what());
+    return 1;
+  }
+  return 0;
+}
+
+int print_cscd(const arguments &Arguments, all_cscd &out_dis, fstream &log) {
+  if (!Arguments.cal_dis_sc_contact)
+    return 1;
+  if (!out_dis.configured()) {
+    TitanUI::print_warning("-cscd: no frame reached the distance analysis; "
+                           "no output written.");
+    return 1;
+  }
+  size_t files = 0;
+  try {
+    files = out_dis.write("");
+  } catch (const std::exception &e) {
+    TitanUI::print_error(std::string("-cscd: ") + e.what());
+    return 1;
+  }
+  TitanUI::log_kv(log, "CSCD Output",
+                  std::to_string(files) + " files " +
+                      Arguments.name_out_cal_dis + "*.dat, " +
+                      std::to_string(out_dis.columns()) + " columns, " +
+                      std::to_string(out_dis.merged_rows()) + " rows");
+  if (out_dis.trajectories() > 1)
+    TitanUI::log_kv(log, "CSCD Merged Trajectories",
+                    std::to_string(out_dis.trajectories()) + " (" +
+                        std::to_string(out_dis.averaged_rows()) +
+                        " rows averaged at equal times)");
+  return 0;
 }

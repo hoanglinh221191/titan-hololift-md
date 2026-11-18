@@ -2,6 +2,7 @@
 
 #include "../titan_sha256.h"
 #include "lattice_math.h"
+#include "lattice_span.h"
 
 #include <algorithm>
 #include <cmath>
@@ -245,8 +246,18 @@ PbctopoSpatialLiftResult build_pbctopo_spatial_lift(
       result.error = "spatial lift cycle audit overflow";
       return result;
     }
-    if (!(expected == canonical_images[edge.atom_b]))
+    if (!(expected == canonical_images[edge.atom_b])) {
       ++result.cycle_residuals;
+      PbctopoLatticeSpan span;
+      span.basis = result.winding_basis;
+      span.rank = result.winding_rank;
+      const Int3 &actual = canonical_images[edge.atom_b];
+      pbctopo_lattice_span_add(span, {actual.x - expected.x,
+                                      actual.y - expected.y,
+                                      actual.z - expected.z});
+      result.winding_basis = span.basis;
+      result.winding_rank = span.rank;
+    }
   }
 
   result.atom_images.resize(atoms.size());

@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace titan_contact_geometry {
@@ -32,6 +33,12 @@ public:
 
   bool build_points(const Multi_MOL &mol, std::size_t snap_idx,
                     std::vector<ContactPoint> &points) const;
+
+  // Where each residue's points sit in the vector build_points() fills, in
+  // residues() order: {first point, number of points}. One point per residue
+  // in sidechain-com mode, one per selected atom otherwise.
+  [[nodiscard]] std::vector<std::pair<std::size_t, std::size_t>>
+  point_ranges() const;
 
   [[nodiscard]] const std::vector<ResidueSelection> &selections()
       const noexcept {

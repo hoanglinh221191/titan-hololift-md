@@ -23,6 +23,13 @@ RuntimeCutoffs resolve_runtime_cutoffs(const arguments &Arguments) {
   if (Arguments.pbc.pbctopo_continuity_cutoff_set)
     cutoffs.continuity_cutoff = Arguments.pbc.pbctopo_continuity_cutoff;
   cutoffs.vdw_clash_scale = Arguments.pbc.pbctopo_vdw_clash_scale;
+  cutoffs.steric_filter = Arguments.pbc.pbctopo_steric == "filter";
+  cutoffs.overlap_vdw_scale = cutoffs.vdw_clash_scale;
+  cutoffs.overlap_fallback_cutoff = cutoffs.clash_cutoff;
+  if (!cutoffs.steric_filter) {
+    cutoffs.vdw_clash_scale = kReportOnlyStericThresholdA;
+    cutoffs.clash_cutoff = kReportOnlyStericThresholdA;
+  }
   return cutoffs;
 }
 

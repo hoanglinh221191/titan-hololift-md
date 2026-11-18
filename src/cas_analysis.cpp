@@ -158,7 +158,8 @@ void CASAnalyzer::init(Multi_MOL &pro_in, Multi_MOL &lig,
               mol.parameters[atom_idx].get_charge(),
               mol.parameters[atom_idx].get_epsilon(),
               mol.parameters[atom_idx].get_sigma(),
-              mol.parameters[atom_idx].get_radius()});
+              mol.parameters[atom_idx].get_radius(),
+              mol.parameters[atom_idx].get_type_id()});
         }
 
         for (auto &key : unique) {
@@ -246,6 +247,7 @@ void CASAnalyzer::process_frame(Multi_MOL &pro_in, Multi_MOL &lig,
     for (const auto &atom : plan) {
       parameters[atom.atom_index].set_charge(0.0);
       parameters[atom.atom_index].set_epsilon_sigma_radius(0.0, 0.0, 0.001);
+      parameters[atom.atom_index].set_type_id(-1);
     }
   };
 
@@ -255,6 +257,7 @@ void CASAnalyzer::process_frame(Multi_MOL &pro_in, Multi_MOL &lig,
       parameters[atom.atom_index].set_charge(atom.charge);
       parameters[atom.atom_index].set_epsilon_sigma_radius(
           atom.epsilon, atom.sigma, atom.radius);
+      parameters[atom.atom_index].set_type_id(atom.type_id);
     }
   };
 
@@ -292,6 +295,7 @@ void CASAnalyzer::process_frame(Multi_MOL &pro_in, Multi_MOL &lig,
         const size_t active_lg_size_ = active_lg_mol.size();
         const MOL &worker_frame = mol.m_mol[num_snap];
         const size_t m_size = worker_frame.size();
+        const size_t partner_size = mutate_receptor ? active_lg_size_ : rec_size_;
 
         std::vector<CAS_Result> frame_results(n_res);
         for (size_t idx = 0; idx < n_res; ++idx) {
@@ -313,6 +317,7 @@ void CASAnalyzer::process_frame(Multi_MOL &pro_in, Multi_MOL &lig,
           auto &scratch = worker_scratch_[worker_id];
           scratch.mut_free_radii.resize(m_size);
           scratch.mut_complex_radii.resize(m_size);
+          scratch.partner_complex_radii.resize(partner_size);
           scratch.parameters = mol.parameters;
         }
 
@@ -353,24 +358,42 @@ void CASAnalyzer::process_frame(Multi_MOL &pro_in, Multi_MOL &lig,
 
                 // Mutant endpoints use the same rgbmax as the wild-type run,
                 // otherwise the alanine-scan difference mixes conventions.
-                cal_effective_born_radii_avx2(
-                    worker_frame, scratch.parameters.radius,
-                    mol.info, scratch.mut_free_radii, Arguments.igb, 0, m_size,
-                    nullptr, nullptr, nullptr, Arguments.gbsa_rgbmax, Arguments.gbnsr6_spacing);
-
+                // The partner's free radii are untouched by the mutation, but
+                // its complex radii are not: the deleted side-chain atoms no
+                // longer descreen it, so they are recomputed with the mutant
+                // as environment. Reusing the wild-type complex radii would
+                // leave the partner buried by atoms that are gone.
                 if (mutate_receptor && active_lg_size_ > 0) {
+                  cal_free_and_complex_born_radii_avx2(
+                      worker_frame, scratch.parameters.radius, mol.info,
+                      scratch.mut_free_radii, scratch.mut_complex_radii,
+                      Arguments.igb, 0, m_size, active_lg_mol,
+                      lig.parameters.radius, lig.info, Arguments.gbsa_rgbmax,
+                      Arguments.gbnsr6_spacing);
                   cal_effective_born_radii_avx2(
-                      worker_frame, scratch.parameters.radius,
-                      mol.info, scratch.mut_complex_radii, Arguments.igb, 0,
-                      m_size, &active_lg_mol, &lig.parameters.radius,
-                      &lig.info, Arguments.gbsa_rgbmax, Arguments.gbnsr6_spacing);
-                } else if (!mutate_receptor && rec_size_ > 0) {
-                  cal_effective_born_radii_avx2(
-                      worker_frame, scratch.parameters.radius,
-                      mol.info, scratch.mut_complex_radii, Arguments.igb, 0,
-                      m_size, &pro_in.m_mol[num_snap],
-                      &pro_in.parameters.radius, &pro_in.info,
+                      active_lg_mol, lig.parameters.radius, lig.info,
+                      scratch.partner_complex_radii, Arguments.igb, 0,
+                      active_lg_size_, &worker_frame,
+                      &scratch.parameters.radius, &mol.info,
                       Arguments.gbsa_rgbmax, Arguments.gbnsr6_spacing);
+                } else if (!mutate_receptor && rec_size_ > 0) {
+                  cal_free_and_complex_born_radii_avx2(
+                      worker_frame, scratch.parameters.radius, mol.info,
+                      scratch.mut_free_radii, scratch.mut_complex_radii,
+                      Arguments.igb, 0, m_size, pro_in.m_mol[num_snap],
+                      pro_in.parameters.radius, pro_in.info,
+                      Arguments.gbsa_rgbmax, Arguments.gbnsr6_spacing);
+                  cal_effective_born_radii_avx2(
+                      pro_in.m_mol[num_snap], pro_in.parameters.radius,
+                      pro_in.info, scratch.partner_complex_radii,
+                      Arguments.igb, 0, rec_size_, &worker_frame,
+                      &scratch.parameters.radius, &mol.info,
+                      Arguments.gbsa_rgbmax, Arguments.gbnsr6_spacing);
+                } else {
+                  cal_effective_born_radii_avx2(
+                      worker_frame, scratch.parameters.radius,
+                      mol.info, scratch.mut_free_radii, Arguments.igb, 0, m_size,
+                      nullptr, nullptr, nullptr, Arguments.gbsa_rgbmax, Arguments.gbnsr6_spacing);
                 }
 
                 GBSA_energy_snap mut_gbsa_total;
@@ -381,8 +404,8 @@ void CASAnalyzer::process_frame(Multi_MOL &pro_in, Multi_MOL &lig,
                       mut_gbsa_total, num_snap, Arguments, scratch.parameters,
                       lig.parameters, mol.lcpo_p1, mol.lcpo_p2, lig.lcpo_p1,
                       lig.lcpo_p2, scratch.mut_free_radii, lg_free_radii,
-                      scratch.mut_complex_radii, lg_complex_radii, nullptr,
-                      nullptr, false);
+                      scratch.mut_complex_radii, scratch.partner_complex_radii,
+                      nullptr, nullptr, false);
                 } else {
                   cal_energy_gbsa_avx2(
                       pro_in.m_mol[num_snap], worker_frame, pro_in.info,
@@ -390,7 +413,7 @@ void CASAnalyzer::process_frame(Multi_MOL &pro_in, Multi_MOL &lig,
                       mut_gbsa_total, num_snap, Arguments, pro_in.parameters,
                       scratch.parameters, pro_in.lcpo_p1, pro_in.lcpo_p2,
                       mol.lcpo_p1, mol.lcpo_p2, rec_free_radii,
-                      scratch.mut_free_radii, rec_complex_radii,
+                      scratch.mut_free_radii, scratch.partner_complex_radii,
                       scratch.mut_complex_radii, nullptr, nullptr, false);
                 }
 
@@ -478,13 +501,16 @@ void CASAnalyzer::export_results(const std::string &rec_file,
           const double contact_norm =
               res.contact_frames == 0 ? 1.0
                                       : static_cast<double>(res.contact_frames);
-          const double total_mean = (res.ddG_total / frame_norm) * eu_par;
-          const double total_bound = (res.ddG_total / contact_norm) * eu_par;
-          const double elec_mean = (res.ddG_elec / frame_norm) * eu_par;
-          const double vdw_mean = (res.ddG_vdw / frame_norm) * eu_par;
-          const double polar_mean = (res.ddG_polar / frame_norm) * eu_par;
+          // ddG is accumulated in kJ/mol; eu_par is kJ per output unit
+          // (4.184 for kcal/mol), so the output value is kJ / eu_par, as in
+          // every other TITAN energy file.
+          const double total_mean = (res.ddG_total / frame_norm) / eu_par;
+          const double total_bound = (res.ddG_total / contact_norm) / eu_par;
+          const double elec_mean = (res.ddG_elec / frame_norm) / eu_par;
+          const double vdw_mean = (res.ddG_vdw / frame_norm) / eu_par;
+          const double polar_mean = (res.ddG_polar / frame_norm) / eu_par;
           const double nonpolar_mean =
-              (res.ddG_nonpolar / frame_norm) * eu_par;
+              (res.ddG_nonpolar / frame_norm) / eu_par;
           const double avg_distance = res.distance_sum / contact_norm;
 
           out << csv_escape(res.key.role) << ',' << res.key.chainnum << ','
@@ -535,7 +561,7 @@ void CASAnalyzer::export_hotspot_pdb(const std::string &out_pdb_filename,
             const double occupancy =
                 static_cast<double>(res.contact_frames) / global_total_frames;
             if (occupancy >= 0.10 && status_is_mutatable(res.mutation_status))
-              b_factor = (res.ddG_total / global_total_frames) * eu_par;
+              b_factor = (res.ddG_total / global_total_frames) / eu_par;
           }
 
           const size_t cid = info[i].get_chainnum() + chain_offset;
@@ -577,6 +603,10 @@ void CASAnalyzer::export_summary(const std::string &summary_file,
   out << "occupancy_output_cutoff: 0.10\n";
   out << "mutation_policy: retain backbone and alanine atom set; zero charge, "
          "epsilon, sigma and set radius 0.001 for other side-chain atoms\n";
+  out << "born_radii_policy: per mutation, mutant free and complex radii and "
+         "partner complex radii (mutant as environment) are recomputed; "
+         "partner free radii are the wild-type ones\n";
+  out << "energy_unit: " << Arguments.eu << '\n';
   out << "limitation_note: CAS does not perform structural relaxation, side-chain "
          "repacking, or explicit mutant topology regeneration.\n";
   out << "reference_note: hotspot PDB uses first analyzed frame coordinates and "

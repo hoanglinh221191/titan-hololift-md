@@ -42,4 +42,8 @@ FrameResult Analyzer::consume_frame(
 
 void Analyzer::finalize(std::fstream &log) { impl_->finalize(log); }
 
+std::string Analyzer::failure_summary() const {
+  return impl_ ? impl_->failure_summary() : std::string();
+}
+
 } // namespace TitanPBE

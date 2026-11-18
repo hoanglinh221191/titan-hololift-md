@@ -109,6 +109,10 @@ std::string active_modules_text(const arguments &args) {
 std::vector<OutputManifestRow> build_output_manifest(const arguments &args,
                                                      const info &out_info) {
   std::vector<OutputManifestRow> rows;
+  // Energy files are written in the -eu unit (normalised to "kJ/mol" or
+  // "kcal/mol" by post_process); the MM/PBSA energy CSV instead carries both
+  // units side by side.
+  const std::string &energy_unit = args.eu;
   add(rows, "Core", "log.txt", "text", "single run",
       "Main runtime log and warnings.");
   add(rows, "Core", out_info.get_titan_run_config_summary_filename(), "text",
@@ -116,9 +120,9 @@ std::vector<OutputManifestRow> build_output_manifest(const arguments &args,
   add(rows, "Core", out_info.get_titan_outputs_manifest_filename(), "table",
       "single run", "Expected output manifest for this resolved configuration.");
   if (!args.flag_nocal) {
-    add(rows, "MM", "cal.txt", "kJ/mol", "all analyzed frames",
+    add(rows, "MM", "cal.txt", energy_unit, "all analyzed frames",
         "Electrostatic plus van der Waals energy summary.");
-    add(rows, "MM", "cal.xvg", "kJ/mol", "time series",
+    add(rows, "MM", "cal.xvg", energy_unit, "time series",
         "Electrostatic plus van der Waals energy by frame.");
   }
   if (!args.out_pdb_name.empty())
@@ -290,7 +294,7 @@ std::vector<OutputManifestRow> build_output_manifest(const arguments &args,
                 "text", "per trajectory", "Feature source resolution.");
   }
   if (args.flag_gbsa) {
-    add(rows, "GBSA", out_info.get_gbsa_snapshots_filename(), "kJ/mol",
+    add(rows, "GBSA", out_info.get_gbsa_snapshots_filename(), energy_unit,
         "snapshots", "GBSA per-snapshot components.");
     add(rows, "GBSA", out_info.get_gbsa_summary_filename(), "text",
         "all analyzed frames", "GBSA summary.");
@@ -298,44 +302,44 @@ std::vector<OutputManifestRow> build_output_manifest(const arguments &args,
   if (args.pbe.pbsa) {
     add(rows, "MM/PBSA", "mm_pbsa_summary.dat", "text",
         "all analyzed frames", "MM/PBSA solver and component summary.");
-    add(rows, "MM/PBSA", "mm_pbsa_timeseries.csv", "kJ/mol", "time series",
-        "MM/PBSA binding components by frame.");
+    add(rows, "MM/PBSA", "mm_pbsa_energy.csv", "kJ/mol and kcal/mol",
+        "time series", "MM/PBSA binding components by frame.");
   }
   if (args.edecomp.flag_edecomp) {
     const auto add_edecomp_mm = [&]() {
       add(rows, "EDecomp-MM", out_info.get_edecomp_mm_residue_matrix_total_filename(),
-          "kJ/mol", "mean over frames",
+          energy_unit, "mean over frames",
           "Direct pairwise MM elec+vdW residue matrix.");
       add(rows, "EDecomp-MM", out_info.get_edecomp_mm_residue_edges_filename(),
-          "kJ/mol", "mean over frames", "Pairwise MM residue edges.");
+          energy_unit, "mean over frames", "Pairwise MM residue edges.");
       add(rows, "EDecomp-MM", out_info.get_edecomp_mm_residue_ranking_filename(),
-          "kJ/mol", "mean over frames", "Residue interaction ranking.");
+          energy_unit, "mean over frames", "Residue interaction ranking.");
     };
     if (args.edecomp.source == "mm" || args.edecomp.source == "all")
       add_edecomp_mm();
     if (args.edecomp.source == "gbsa" || args.edecomp.source == "all") {
       add(rows, "EDecomp-MMGBSA",
-          out_info.get_edecomp_mmgbsa_residue_map_filename(), "kJ/mol",
+          out_info.get_edecomp_mmgbsa_residue_map_filename(), energy_unit,
           "mean over frames",
           "MM/GBSA endpoint entity decomposition, not a pair matrix.");
       add(rows, "EDecomp-MMGBSA",
-          out_info.get_edecomp_mmgbsa_residue_ranking_filename(), "kJ/mol",
+          out_info.get_edecomp_mmgbsa_residue_ranking_filename(), energy_unit,
           "mean over frames", "MM/GBSA entity ranking.");
     }
     if (args.edecomp.source == "pbsa" || args.edecomp.source == "all") {
       add(rows, "EDecomp-MMPBSA",
-          out_info.get_edecomp_mmpbsa_residue_map_filename(), "kJ/mol",
+          out_info.get_edecomp_mmpbsa_residue_map_filename(), energy_unit,
           "mean over frames",
           "MM/PBSA endpoint entity decomposition, not a pair matrix.");
       add(rows, "EDecomp-MMPBSA",
-          out_info.get_edecomp_mmpbsa_residue_ranking_filename(), "kJ/mol",
+          out_info.get_edecomp_mmpbsa_residue_ranking_filename(), energy_unit,
           "mean over frames", "MM/PBSA entity ranking.");
     }
     add(rows, "EDecomp", out_info.get_edecomp_summary_filename(), "text",
         "all analyzed frames", "Unified energy decomposition summary.");
   }
   if (args.flag_cas) {
-    add(rows, "CAS", out_info.get_cas_receptor_filename(), "kJ/mol",
+    add(rows, "CAS", out_info.get_cas_receptor_filename(), energy_unit,
         "mean over frames", "GBSA alanine-like receptor scan.");
     add(rows, "CAS", out_info.get_cas_summary_filename(), "text",
         "all analyzed frames", "CAS method and limitation summary.");

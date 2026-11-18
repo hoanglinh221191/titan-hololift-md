@@ -21,6 +21,7 @@
 #include <Eigen/Dense>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <limits>
 #include <mutex>
@@ -161,6 +162,8 @@ public:
   double lag_time_ns() const { return dt_ns_ * msm_lag_time_; }
   bool is_clustered() const { return clustered_; }
   bool is_built() const { return msm_built_; }
+  // KIN-06: eigenvalues of the TPM within 1e-8 of 1 (> 1: not ergodic)
+  int unit_eigenvalue_count() const { return unit_eigenvalue_count_; }
   // Fix 3: n_frames reads n_proj_frames_ (proj_mat_ actual row count)
   int64_t n_frames() const { return n_proj_frames_; }
   int64_t pending_feature_frames() const { return n_raw_frames_; }
@@ -198,6 +201,9 @@ private:
   std::vector<int> traj_break_indices_; // segment boundary frame indices
   std::vector<int> discrete_traj_;      // [N_frames] cluster assignments
   int n_threads_ = 1;                   // C++ thread count for K-Means assign
+  // KIN-08: -msm-seed (set by train_kmeans), also the start block of the
+  // partial ITS subspace iteration
+  std::uint64_t random_seed_ = 42;
   bool last_added_was_raw_ = false;
 
   // DHAM replica tracking
@@ -248,6 +254,7 @@ private:
   mutable Eigen::VectorXcd cached_eigenvalues_;
   mutable Eigen::MatrixXcd cached_eigenvectors_;
   mutable bool eigen_solved_ = false;
+  int unit_eigenvalue_count_ = 0;
 };
 
 // =======================================================================

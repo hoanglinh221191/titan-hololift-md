@@ -530,7 +530,8 @@ std::string normalize_leaf_near_policy(const std::string &policy) {
 }
 
 std::string normalize_leaf_panel_kernel(const std::string &kernel) {
-  if (kernel == "tile" || kernel == "tile-scalar" || kernel == "tile-avx2")
+  if (kernel == "tile" || kernel == "tile-scalar" || kernel == "tile-avx2" ||
+      kernel == "auto")
     return kernel;
   if (kernel == "avx2-gather" || kernel == "avx2")
     return "avx2-gather";

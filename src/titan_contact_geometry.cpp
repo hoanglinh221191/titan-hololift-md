@@ -47,6 +47,23 @@ bool ContactGeometryCache::build(const Multi_MOL &mol, std::uint8_t molecule,
                        }),
         selections_.end());
   } else {
+    // MDB-16. Glycine has no side chain: every GLY atom carries the side-chain
+    // flag (MOL_info), so its "side-chain COM" was the COM of the whole
+    // residue. It is the CA, as in the cb and sidechain-heavy modes; a GLY
+    // without a CA (coarse-grained input) keeps the whole-residue COM.
+    for (ResidueSelection &selection : selections_) {
+      if (selection.atoms.empty() ||
+          !is_glycine_residue_name(
+              mol.info[selection.atoms.front()].get_original_res_name()))
+        continue;
+      for (const std::size_t atom_idx : selection.atoms) {
+        if (titan_contact::uppercase_copy(titan_contact::trim_copy(
+                mol.info[atom_idx].get_atom())) == "CA") {
+          selection.selected_atoms.assign(1, atom_idx);
+          break;
+        }
+      }
+    }
     for (ResidueSelection &selection : selections_) {
       const auto &indices = selection.selected_atoms.empty()
                                 ? selection.atoms
@@ -77,6 +94,22 @@ bool ContactGeometryCache::build(const Multi_MOL &mol, std::uint8_t molecule,
     residues_.push_back(selection.residue);
 
   return true;
+}
+
+std::vector<std::pair<std::size_t, std::size_t>>
+ContactGeometryCache::point_ranges() const {
+  std::vector<std::pair<std::size_t, std::size_t>> ranges;
+  ranges.reserve(selections_.size());
+  std::size_t begin = 0;
+  for (const ResidueSelection &selection : selections_) {
+    const std::size_t count =
+        mode_ == titan_contact::ContactMode::SidechainCOM
+            ? 1
+            : selection.selected_atoms.size();
+    ranges.emplace_back(begin, count);
+    begin += count;
+  }
+  return ranges;
 }
 
 bool ContactGeometryCache::build_points(

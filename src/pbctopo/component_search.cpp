@@ -5,9 +5,12 @@
 #include "component_search_pair_table.h"
 #include "component_shift_domain.h"
 #include "component_shift_geometry.h"
+#include "lattice_math.h"
 #include "reference_strain.h"
 #include "required_contacts.h"
 #include "steric_clash.h"
+
+#include "../titan_executor.h"
 
 #include <algorithm>
 #include <chrono>
@@ -20,6 +23,34 @@
 
 namespace titan_pbctopo {
 namespace {
+
+// The counters score_component_assignment (solve/components.cpp) writes,
+// added from a speculative score at its commit.  A counter the score starts
+// writing must be added here too, or the parallel rescoring drops it.
+void add_component_score_timing(PbctopoTimingStats &into,
+                                const PbctopoTimingStats &from) {
+  into.component_score_calls += from.component_score_calls;
+  into.component_score_s += from.component_score_s;
+  into.component_score_continuity_rejects +=
+      from.component_score_continuity_rejects;
+  into.component_score_continuity_s += from.component_score_continuity_s;
+  into.component_score_anchor_rejects += from.component_score_anchor_rejects;
+  into.component_score_anchor_s += from.component_score_anchor_s;
+  into.component_score_stats_principal_s +=
+      from.component_score_stats_principal_s;
+  into.component_score_component_metrics_s +=
+      from.component_score_component_metrics_s;
+  into.component_score_prefix_prunes_after_continuity +=
+      from.component_score_prefix_prunes_after_continuity;
+  into.component_score_prefix_prunes_after_anchor +=
+      from.component_score_prefix_prunes_after_anchor;
+  into.component_score_prefix_prunes_after_principal +=
+      from.component_score_prefix_prunes_after_principal;
+  into.component_score_prefix_prunes_after_component_metrics +=
+      from.component_score_prefix_prunes_after_component_metrics;
+  into.component_score_prefix_prunes_after_final +=
+      from.component_score_prefix_prunes_after_final;
+}
 
 std::size_t saturating_size_add(std::size_t lhs, std::size_t rhs) {
   return rhs > std::numeric_limits<std::size_t>::max() - lhs
@@ -1338,30 +1369,119 @@ PbctopoComponentCandidate search_component_shift_candidate_beam(
     timing->component_large_mode_beam_final_rescored += exact_rescore_count;
     ++timing->component_large_mode_beam_final_rescore_all_frames;
   }
-  for (std::size_t state_idx = 0; state_idx < exact_rescore_count;
-       ++state_idx) {
-    double candidate_shift_norm2 = 0.0;
-    if (!build_component_points_from_selected_shifts(
-            atoms, components, shifts,
-            beam_states[state_idx].selected_shift, placed_points,
-            candidate_shift_norm2)) {
-      continue;
+  // With more than two components (fewer write debug lines from inside the
+  // score) and an executor, the assignments are scored speculatively on the
+  // executor, a window at a time, against the incumbent at the window's
+  // start, and committed in order exactly as the serial loop does.  The
+  // incumbent changes only at a commit that improves it; the scores after
+  // that one used a stale incumbent, so they are dropped and the next window
+  // starts there.  Every committed score was therefore computed with the
+  // incumbent the serial loop would pass, and its timing counters and
+  // lattice-query audit are added only at its commit.
+  const bool speculative_rescore =
+      callbacks.executor != nullptr && callbacks.executor->capacity() > 1 &&
+      components.size() > 2 && exact_rescore_count > 1;
+  if (!speculative_rescore) {
+    for (std::size_t state_idx = 0; state_idx < exact_rescore_count;
+         ++state_idx) {
+      double candidate_shift_norm2 = 0.0;
+      if (!build_component_points_from_selected_shifts(
+              atoms, components, shifts,
+              beam_states[state_idx].selected_shift, placed_points,
+              candidate_shift_norm2)) {
+        continue;
+      }
+      PbctopoComponentCandidate candidate = callbacks.score_assignment(
+          atoms, placed_points, components, beam_states[state_idx].min_pair_d2,
+          beam_states[state_idx].clash_atom_a,
+          beam_states[state_idx].clash_atom_b, continuity_pairs,
+          anchor_indices, cutoffs.continuity_cutoff, candidate_shift_norm2,
+          best.valid ? &best : nullptr, timing, anchor_backend, anchor_context);
+      annotate_search_domain_witness(candidate,
+                                     beam_states[state_idx].selected_shift,
+                                     shifts, shift_shell_radius);
+      record_component_search_survivor(
+          candidate, beam_states[state_idx].selected_shift, shifts, callbacks,
+          survivors_out, survivor_limit);
+      if (callbacks.better_candidate(candidate, best)) {
+        best = candidate;
+        best_points_out = placed_points;
+      }
     }
-    PbctopoComponentCandidate candidate = callbacks.score_assignment(
-        atoms, placed_points, components, beam_states[state_idx].min_pair_d2,
-        beam_states[state_idx].clash_atom_a,
-        beam_states[state_idx].clash_atom_b, continuity_pairs, anchor_indices,
-        cutoffs.continuity_cutoff, candidate_shift_norm2,
-        best.valid ? &best : nullptr, timing, anchor_backend, anchor_context);
-    annotate_search_domain_witness(candidate,
-                                   beam_states[state_idx].selected_shift,
-                                   shifts, shift_shell_radius);
-    record_component_search_survivor(
-        candidate, beam_states[state_idx].selected_shift, shifts, callbacks,
-        survivors_out, survivor_limit);
-    if (callbacks.better_candidate(candidate, best)) {
-      best = candidate;
-      best_points_out = placed_points;
+  } else {
+    struct RescoreTask {
+      bool built = false;
+      double shift_norm2 = 0.0;
+      std::vector<Vec3> points;
+      PbctopoComponentCandidate candidate;
+      PbctopoTimingStats score_timing;
+      PbctopoLatticeQueryAudit audit;
+    };
+    TitanExecutor &executor = *callbacks.executor;
+    const std::size_t workers = executor.capacity();
+    const std::size_t window_limit = 2 * workers;
+    std::vector<RescoreTask> tasks(
+        std::min(window_limit, exact_rescore_count));
+    std::size_t first = 0;
+    while (first < exact_rescore_count) {
+      const std::size_t window =
+          std::min(window_limit, exact_rescore_count - first);
+      const PbctopoComponentCandidate incumbent_snapshot = best;
+      const PbctopoComponentCandidate *incumbent =
+          incumbent_snapshot.valid ? &incumbent_snapshot : nullptr;
+      executor.parallel_for(
+          window, workers, 1,
+          [&](std::size_t, std::size_t begin, std::size_t end) {
+            for (std::size_t t = begin; t < end; ++t) {
+              RescoreTask &task = tasks[t];
+              const auto &state = beam_states[first + t];
+              // Whichever thread runs the task, its lattice queries are
+              // carried in task.audit and the thread's audit is restored.
+              const PbctopoLatticeQueryAudit audit_before =
+                  pbctopo_lattice_query_audit();
+              task.score_timing = PbctopoTimingStats{};
+              task.shift_norm2 = 0.0;
+              task.built = build_component_points_from_selected_shifts(
+                  atoms, components, shifts, state.selected_shift,
+                  task.points, task.shift_norm2);
+              if (task.built) {
+                task.candidate = callbacks.score_assignment(
+                    atoms, task.points, components, state.min_pair_d2,
+                    state.clash_atom_a, state.clash_atom_b, continuity_pairs,
+                    anchor_indices, cutoffs.continuity_cutoff,
+                    task.shift_norm2, incumbent,
+                    timing != nullptr ? &task.score_timing : nullptr,
+                    anchor_backend, anchor_context);
+              }
+              task.audit = pbctopo_lattice_query_audit_delta(
+                  audit_before, pbctopo_lattice_query_audit());
+              pbctopo_reset_lattice_query_audit();
+              pbctopo_add_lattice_query_audit(audit_before);
+            }
+          });
+      std::size_t committed = 0;
+      for (std::size_t t = 0; t < window; ++t) {
+        RescoreTask &task = tasks[t];
+        const std::size_t state_idx = first + t;
+        ++committed;
+        pbctopo_add_lattice_query_audit(task.audit);
+        if (!task.built)
+          continue;
+        if (timing != nullptr)
+          add_component_score_timing(*timing, task.score_timing);
+        annotate_search_domain_witness(task.candidate,
+                                       beam_states[state_idx].selected_shift,
+                                       shifts, shift_shell_radius);
+        record_component_search_survivor(
+            task.candidate, beam_states[state_idx].selected_shift, shifts,
+            callbacks, survivors_out, survivor_limit);
+        if (callbacks.better_candidate(task.candidate, best)) {
+          best = task.candidate;
+          best_points_out = task.points;
+          break;
+        }
+      }
+      first += committed;
     }
   }
 

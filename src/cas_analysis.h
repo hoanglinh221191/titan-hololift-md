@@ -47,11 +47,16 @@ struct CASMutationAtom {
   double epsilon{};
   double sigma{};
   double radius{};
+  // The atom type id selects pair-specific [ nonbond_params ]; a deleted
+  // atom gets -1 so an override cannot give it LJ again (ENE-11).
+  int32_t type_id{-1};
 };
 
 struct CASWorkerScratch {
   AlignedDoubleVector mut_free_radii;
   AlignedDoubleVector mut_complex_radii;
+  // Complex radii of the unmutated partner, descreened by the mutant.
+  AlignedDoubleVector partner_complex_radii;
   Multi_MOL_parameters parameters;
 };
 

@@ -2,6 +2,7 @@
 
 #include "info.h"
 #include "titan_executor.h"
+#include "titan_ui.h"
 
 #include <algorithm>
 #include <cctype>
@@ -63,6 +64,65 @@ void log_qnative_value(std::fstream &log, const std::string &key,
     log << key << ": " << value << '\n';
 }
 
+constexpr std::size_t kUnresolved = std::numeric_limits<std::size_t>::max();
+constexpr std::size_t kAmbiguous = kUnresolved - 1;
+
+// Protonation and disulfide variants name the same residue.
+std::string canonical_residue_name(const std::string &name) {
+  std::string upper = titan_contact::trim_copy(name);
+  std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) {
+    return static_cast<char>(std::toupper(c));
+  });
+  static const std::unordered_map<std::string, std::string> aliases{
+      {"HSD", "HIS"},  {"HSE", "HIS"},  {"HSP", "HIS"},  {"HID", "HIS"},
+      {"HIE", "HIS"},  {"HIP", "HIS"},  {"HISD", "HIS"}, {"HISE", "HIS"},
+      {"HISH", "HIS"}, {"HISA", "HIS"}, {"HISB", "HIS"}, {"HIS1", "HIS"},
+      {"HIS2", "HIS"}, {"CYX", "CYS"},  {"CYM", "CYS"},  {"CYS2", "CYS"},
+      {"ASH", "ASP"},  {"ASPP", "ASP"}, {"GLH", "GLU"},  {"GLUP", "GLU"},
+      {"LYN", "LYS"},  {"LSN", "LYS"}};
+  const auto found = aliases.find(upper);
+  return found == aliases.end() ? upper : found->second;
+}
+
+std::string residue_match_key(const titan_contact::ResidueKey &residue) {
+  return std::to_string(residue.molecule) + '|' +
+         titan_contact::trim_copy(residue.chain) + '|' +
+         std::to_string(residue.resnr) + '|' +
+         canonical_residue_name(residue.resname);
+}
+
+// (molecule, chain, resnr, resname) -> position in a residue list; a key
+// shared by several residues (blank chain IDs) is settled by the chain number.
+class ResidueLookup {
+public:
+  explicit ResidueLookup(const std::vector<titan_contact::ResidueKey> &residues)
+      : residues_(residues) {
+    for (std::size_t i = 0; i < residues.size(); ++i)
+      by_key_[residue_match_key(residues[i])].push_back(i);
+  }
+
+  [[nodiscard]] std::size_t find(const titan_contact::ResidueKey &key) const {
+    const auto found = by_key_.find(residue_match_key(key));
+    if (found == by_key_.end())
+      return kUnresolved;
+    if (found->second.size() == 1)
+      return found->second.front();
+    std::size_t match = kUnresolved;
+    for (const std::size_t index : found->second) {
+      if (residues_[index].chainnum != key.chainnum)
+        continue;
+      if (match != kUnresolved)
+        return kAmbiguous;
+      match = index;
+    }
+    return match == kUnresolved ? kAmbiguous : match;
+  }
+
+private:
+  const std::vector<titan_contact::ResidueKey> &residues_;
+  std::unordered_map<std::string, std::vector<std::size_t>> by_key_;
+};
+
 } // namespace
 
 void TitanQNativeAnalyzer::configure(const QNativeArgs &args) {
@@ -88,7 +148,7 @@ void TitanQNativeAnalyzer::reset_trajectory_state() {
   warned_invalid_box_ = false;
   total_frames_seen_ = 0;
   valid_frames_ = 0;
-  skipped_invalid_box_frames_ = 0;
+  no_box_frames_ = 0;
   skipped_incomplete_frames_ = 0;
   occupancy_.clear();
   occupancy_.reserve(native_contacts_.size());
@@ -101,7 +161,7 @@ void TitanQNativeAnalyzer::reset_trajectory_state() {
 void TitanQNativeAnalyzer::accumulate_pooled_state() {
   pooled_total_frames_seen_ += total_frames_seen_;
   pooled_valid_frames_ += valid_frames_;
-  pooled_skipped_invalid_box_frames_ += skipped_invalid_box_frames_;
+  pooled_no_box_frames_ += no_box_frames_;
   pooled_skipped_incomplete_frames_ += skipped_incomplete_frames_;
   if (pooled_occupancy_.size() != occupancy_.size())
     pooled_occupancy_.assign(occupancy_.size(), ContactOccupancy{});
@@ -119,9 +179,11 @@ void TitanQNativeAnalyzer::accumulate_pooled_state() {
                           q_values_.end());
 }
 
+// MDB-13: a box is used for the minimum image only when it is a real cell
+// (lengths > 0 and angles that give a finite, non-degenerate matrix); the
+// old a/b/c > 0 test let degenerate angles through to a NaN BoxMatrix (Q = 0).
 bool TitanQNativeAnalyzer::has_valid_box(const box &frame_box) const noexcept {
-  return frame_box.get_a() > 0.0 && frame_box.get_b() > 0.0 &&
-         frame_box.get_c() > 0.0;
+  return BoxMatrix::valid_box(frame_box);
 }
 
 bool TitanQNativeAnalyzer::pair_allowed(
@@ -144,30 +206,6 @@ bool TitanQNativeAnalyzer::pair_allowed(
       return false;
   }
   return true;
-}
-
-double TitanQNativeAnalyzer::native_pair_distance(
-    const std::vector<titan_contact_geometry::ContactPoint> &row_points,
-    const std::vector<titan_contact_geometry::ContactPoint> &col_points,
-    const titan_contact::ResiduePairKey &key,
-    const BoxMatrix &box_matrix) const {
-  double nearest_sq = std::numeric_limits<double>::infinity();
-  for (const titan_contact_geometry::ContactPoint &lhs : row_points) {
-    if (!(lhs.residue == key.first))
-      continue;
-    for (const titan_contact_geometry::ContactPoint &rhs : col_points) {
-      if (!(rhs.residue == key.second))
-        continue;
-      double dx = lhs.x - rhs.x;
-      double dy = lhs.y - rhs.y;
-      double dz = lhs.z - rhs.z;
-      box_matrix.apply_mic(dx, dy, dz);
-      const double distance_sq = dx * dx + dy * dy + dz * dz;
-      nearest_sq = std::min(nearest_sq, distance_sq);
-    }
-  }
-  return std::isfinite(nearest_sq) ? std::sqrt(nearest_sq)
-                                   : std::numeric_limits<double>::infinity();
 }
 
 void TitanQNativeAnalyzer::build_native_contacts_from_reference(
@@ -246,11 +284,56 @@ void TitanQNativeAnalyzer::build_native_contacts_from_reference(
                 return false;
               return residue_less(lhs.key.second, rhs.key.second);
             });
+}
+
+void TitanQNativeAnalyzer::resolve_native_pairs_in_trajectory() {
+  native_pair_indices_.clear();
+  native_pair_ranges_.clear();
+  native_single_point_ = true;
+  const auto &traj_row_residues = trajectory_row_geometry_.residues();
+  const auto &traj_col_residues = trajectory_col_geometry_.residues();
+  const auto traj_row_ranges = trajectory_row_geometry_.point_ranges();
+  const auto traj_col_ranges = trajectory_col_geometry_.point_ranges();
+  const ResidueLookup row_lookup(traj_row_residues);
+  const ResidueLookup col_lookup(traj_col_residues);
+  std::vector<std::size_t> row_map(row_residues_.size(), kUnresolved);
+  std::vector<std::size_t> col_map(col_residues_.size(), kUnresolved);
+
+  auto resolve = [&](const ResidueLookup &lookup,
+                     const std::vector<titan_contact::ResidueKey> &reference,
+                     std::vector<std::size_t> &map, std::size_t ref_index) {
+    if (map[ref_index] == kUnresolved) {
+      const titan_contact::ResidueKey &key = reference[ref_index];
+      const std::size_t found = lookup.find(key);
+      if (found == kUnresolved || found == kAmbiguous) {
+        std::ostringstream message;
+        message << "QNative: native residue " << residue_label(key)
+                << (found == kAmbiguous
+                        ? " matches more than one residue"
+                        : " has no residue with the same chain, number and name")
+                << " in the trajectory structure.";
+        throw std::invalid_argument(message.str());
+      }
+      map[ref_index] = found;
+    }
+    return map[ref_index];
+  };
+
   native_pair_indices_.reserve(native_contacts_.size());
+  native_pair_ranges_.reserve(native_contacts_.size());
   for (const NativeContact &contact : native_contacts_) {
+    const std::size_t row =
+        resolve(row_lookup, row_residues_, row_map, contact.row_index);
+    const std::size_t col =
+        resolve(col_lookup, col_residues_, col_map, contact.col_index);
+    const auto [row_begin, row_count] = traj_row_ranges[row];
+    const auto [col_begin, col_count] = traj_col_ranges[col];
+    native_single_point_ =
+        native_single_point_ && row_count == 1 && col_count == 1;
     native_pair_indices_.push_back(
-        titan_contact_kernel::NativePairIndex{contact.row_index,
-                                              contact.col_index});
+        titan_contact_kernel::NativePairIndex{row_begin, col_begin});
+    native_pair_ranges_.push_back(titan_contact_kernel::NativePairRange{
+        row_begin, row_count, col_begin, col_count});
   }
 }
 
@@ -291,6 +374,7 @@ void TitanQNativeAnalyzer::init(const Multi_MOL &mol1, const Multi_MOL *mol2,
   } else {
     trajectory_col_geometry_ = trajectory_row_geometry_;
   }
+  resolve_native_pairs_in_trajectory();
   initialized_ = true;
   enabled_ = requested_ && !row_residues_.empty() && !col_residues_.empty();
   reset_trajectory_state();
@@ -321,12 +405,23 @@ std::string TitanQNativeAnalyzer::residue_label(
   return out.str();
 }
 
-double TitanQNativeAnalyzer::contact_contribution(double distance_a) const {
+// MDB-14: the soft contact is the Best-Hummer switch (PNAS 110, 17874, 2013)
+// 1/(1 + exp(beta (r - lambda r0))) around each pair's own reference distance
+// r0, beta = 5 A^-1 (50 nm^-1) by default, lambda = 1.8 (atomistic points) or
+// 1.5 (one CA per residue). The old switch sat at the global cutoff for every
+// pair, so a pair formed at 4 A in the reference counted as fully formed up to
+// the cutoff and Q did not measure the loss of native distances.
+double TitanQNativeAnalyzer::soft_lambda() const noexcept {
+  return mode_ == titan_contact::ContactMode::CA ? 1.5 : 1.8;
+}
+
+double TitanQNativeAnalyzer::contact_contribution(double distance_a,
+                                                  double reference_a) const {
   if (!std::isfinite(distance_a))
     return 0.0;
   if (!soft_)
     return distance_a <= cutoff_a_ ? 1.0 : 0.0;
-  const double exponent = beta_ * (distance_a - cutoff_a_);
+  const double exponent = beta_ * (distance_a - soft_lambda() * reference_a);
   if (exponent > 60.0)
     return 0.0;
   if (exponent < -60.0)
@@ -342,10 +437,19 @@ void TitanQNativeAnalyzer::process_frame(const Multi_MOL &mol1,
     return;
   ++total_frames_seen_;
   const MOL &frame = mol1.m_mol[snap_idx];
-  if (!has_valid_box(frame.Box)) {
-    ++skipped_invalid_box_frames_;
-    warned_invalid_box_ = true;
-    return;
+  // MDB-13: a frame without a usable periodic box (vacuum run, PDB without
+  // CRYST1, degenerate cell) is measured with plain distances, as the
+  // dihedral module does, instead of being dropped without a word (which left
+  // Q empty for every PDB input).
+  const bool periodic = has_valid_box(frame.Box);
+  if (!periodic) {
+    ++no_box_frames_;
+    if (!warned_invalid_box_) {
+      warned_invalid_box_ = true;
+      TitanUI::print_warning(
+          "QNative: frame(s) without a valid periodic box; their contact "
+          "distances are taken without the minimum image.");
+    }
   }
   if (scope_ == "interface" &&
       (mol2 == nullptr || snap_idx >= mol2->m_mol.size())) {
@@ -365,7 +469,8 @@ void TitanQNativeAnalyzer::process_frame(const Multi_MOL &mol1,
   }
 
   ++valid_frames_;
-  const BoxMatrix box_matrix(frame.Box);
+  const BoxMatrix box_matrix =
+      periodic ? BoxMatrix(frame.Box) : titan_contact_kernel::open_boundary_matrix();
   auto &row_soa = row_soa_scratch_;
   auto &col_soa = col_soa_scratch_;
   row_soa.x.clear();
@@ -399,12 +504,18 @@ void TitanQNativeAnalyzer::process_frame(const Multi_MOL &mol1,
   executor.parallel_for(native_contacts_.size(), worker_count, 64,
                         [&](std::size_t worker_id, std::size_t begin,
                             std::size_t end) {
-    titan_contact_kernel::native_distances_optimized(
-        row_soa, col_soa, native_pair_indices_, begin, end, box_matrix,
-        distances);
+    if (native_single_point_)
+      titan_contact_kernel::native_distances_optimized(
+          row_soa, col_soa, native_pair_indices_, begin, end, box_matrix,
+          distances);
+    else
+      titan_contact_kernel::native_min_distances_ranges(
+          row_soa, col_soa, native_pair_ranges_, begin, end, box_matrix,
+          distances);
     double local_formed = 0.0;
     for (std::size_t i = begin; i < end; ++i) {
-      const double contribution = contact_contribution(distances[i]);
+      const double contribution = contact_contribution(
+          distances[i], native_contacts_[i].reference_distance_a);
       local_formed += contribution;
       occupancy_[i].formed_sum += contribution;
       if (distances[i] <= cutoff_a_)
@@ -471,9 +582,14 @@ void TitanQNativeAnalyzer::export_summary(const std::string &filename,
   }
   out << "soft: " << (soft_ ? "true" : "false") << '\n';
   out << "beta: " << beta_ << '\n';
+  if (soft_) {
+    out << "soft_lambda: " << soft_lambda() << '\n';
+    out << "soft_definition: 1/(1+exp(beta*(r-lambda*r0))), r0 = reference "
+           "distance of the pair\n";
+  }
   out << "frames_seen: " << total_frames_seen_ << '\n';
   out << "valid_frames: " << valid_frames_ << '\n';
-  out << "skipped_invalid_box_frames: " << skipped_invalid_box_frames_ << '\n';
+  out << "frames_without_box_plain_distances: " << no_box_frames_ << '\n';
   out << "skipped_incomplete_frames: " << skipped_incomplete_frames_ << '\n';
   out << "total_native_contacts: " << native_contacts_.size() << '\n';
   out << "mean_Q: " << mean_q() << '\n';
@@ -575,14 +691,14 @@ void TitanQNativeAnalyzer::finalize_all(const std::string &base_dir,
     return;
   const auto saved_valid_frames = valid_frames_;
   const auto saved_total_frames = total_frames_seen_;
-  const auto saved_skipped_box = skipped_invalid_box_frames_;
+  const auto saved_skipped_box = no_box_frames_;
   const auto saved_skipped_incomplete = skipped_incomplete_frames_;
   const auto saved_occupancy = occupancy_;
   const auto saved_timeseries = timeseries_;
   const auto saved_q_values = q_values_;
   total_frames_seen_ = pooled_total_frames_seen_;
   valid_frames_ = pooled_valid_frames_;
-  skipped_invalid_box_frames_ = pooled_skipped_invalid_box_frames_;
+  no_box_frames_ = pooled_no_box_frames_;
   skipped_incomplete_frames_ = pooled_skipped_incomplete_frames_;
   occupancy_ = pooled_occupancy_;
   timeseries_ = pooled_timeseries_;
@@ -604,7 +720,7 @@ void TitanQNativeAnalyzer::finalize_all(const std::string &base_dir,
                    log);
   total_frames_seen_ = saved_total_frames;
   valid_frames_ = saved_valid_frames;
-  skipped_invalid_box_frames_ = saved_skipped_box;
+  no_box_frames_ = saved_skipped_box;
   skipped_incomplete_frames_ = saved_skipped_incomplete;
   occupancy_ = saved_occupancy;
   timeseries_ = saved_timeseries;

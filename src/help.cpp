@@ -241,8 +241,9 @@ IMPORTANT NOTES
     The v1 implementation uses CPU double precision, a two-dielectric model,
     VDW/SAS/SES/DelPhi-like SES/DelPhi-like VDW surface classification,
     Stern-aware linear ion screening, selectable Coulombic/dipolar/zero
-    boundaries, linear PB by default, optional nonlinear PB Picard/SOR
-    polishing on the fine grid, and reaction-field energy reporting.
+    boundaries, linear PB by default, optional nonlinear PB (damped Newton
+    by default, Picard/SOR on request) on the fine grid, and reaction-field
+    energy reporting.
     `-pbsa` wraps this path for production two-molecule MM/PBSA: it enables
     PBE deltaG_solv endpoint solves, force-field elec/vdw interaction energy,
     SASA nonpolar energy, optional interaction entropy, and per-frame binding
@@ -300,7 +301,8 @@ IMPORTANT NOTES
     -pbe-gaussian-exp, -pbe-gaussian-sigma, -pbe-density-cutoff,
     -pbe-surface-cutoff, -pbe-gap-diel
     -pbe-focus, -pbe-multigrid, -pbe-focus-levels, -pbe-focus-margin
-    -pbe-mg-levels, -pbe-mg-pre, -pbe-mg-post, -pbe-mg-coarse-iter
+    -pbe-mg-levels, -pbe-mg-pre, -pbe-mg-post, -pbe-mg-coarse-iter,
+    -pbe-mg-accel
     -pbe-map, -pbe-map-frames, -pbe-max-grid, -pbe-kernel
     BIE advanced/debug: -pbe-bie-sum=auto|direct|treecode,
       -pbe-bie-geometry=triangle|point-panel,
@@ -308,6 +310,10 @@ IMPORTANT NOTES
       -pbe-bie-surface-points=<8..4096>,
       -pbe-bie-sphere-mesh=auto|latlong|icosphere,
         auto: icosphere for triangle/vdw, legacy latlong for SAS.
+      -pbe-bie-sphere-patch-clip=on|off (default on): clip each atom's
+        sphere-patch triangles at its neighbours' caps; off keeps each
+        whole triangle unless its centroid or all three corners are buried
+        (the v0.5 rule).
         Default 96 is coarse; check energy convergence with resolution.
         Latlong saturates by 3969 points (16128 triangles/atom), even with
         -pbe-bie-highres-surface=true. Use icosphere for further refinement.
@@ -330,7 +336,32 @@ IMPORTANT NOTES
         coarse-galerkin-probe|fmm-block-jacobi|fmm-overlap-schwarz|
         fmm-nearfield-ilu0|fmm-nearfield-ilu0-coarse|
         distance-knn-overlap-schwarz|
-        distance-knn-ilu0,
+        distance-knn-ilu0|classic-nearfield-ilu0,
+        classic-nearfield-ilu0 is ILU(0) on the classic treecode's own near
+        list, capped by -pbe-bie-precond-ilu-neighbor-cap. It needs
+        -pbe-bie-sum=treecode and salt, but not the FMM M2L path, so it is
+        the ILU for curved node-patch.
+      -pbe-bie-energy-far-eta=<0|2..1000> (default 32): curved node-patch
+        reaction energy sums a cell farther than eta cell radii from an atom
+        as one point (centroid, area, mean normal) instead of all its
+        samples. 0 keeps the exact sample sum. The error falls as
+        (1/eta)^2; report the value used.
+      -pbe-bie-curved-sample-order=<2|3|4> (default 2): Gauss order per
+        direction of the samples each curved dual cell stores, about
+        12*order^2 per cell. They dominate curved node-patch memory.
+      -pbe-bie-ses-charge-refine=<off|alpha in (0,4]> (default off):
+        patch-ray-resolution remeshing grades the target edge towards
+        shallow charges, edge(x) = clamp(alpha * distance to the nearest
+        charge with |q| >= 0.1 e, min edge, uniform edge). A charge d below
+        the surface needs edges of order d near its foot point.
+      -pbe-bie-ses-charge-refine-min-edge=<0.05..2.0> (default 0.2 A):
+        the smallest target edge the charge refinement may ask for.
+      -pbe-bie-ses-charge-refine-min-charge=<0..2> (default 0.1 e): charges
+        smaller in magnitude do not shape the mesh.
+      -pbe-bie-curved-near-zone=<1..16> (default 8): p1 FMM route only.
+        Self, one-ring and pairs within this many cell radii of the source
+        vertex are integrated over the curved node-patch cell; every other
+        pair uses one point per cell, as the multipole far field does.
       -pbe-bie-precond-ilu-neighbor-cap=<32..1024>,
       -pbe-bie-precond-ilu-drop-tol=<0..1e-2>,
       -pbe-bie-precond-ilu-regularization=adaptive|off (default adaptive),
@@ -364,7 +395,7 @@ IMPORTANT NOTES
         -pbe-bie-expansion-audit=off|sampled|full-small,
         -pbe-bie-expansion-audit-sample-count=<64..2048>,
         -pbe-bie-expansion-audit-max-panels=<128..8192>,
-        -pbe-bie-matvec-audit=off|sampled|sampled-detail|full-small,
+        -pbe-bie-matvec-audit=off|sampled|sampled-detail|targets|full-small,
         -pbe-bie-matvec-audit-sample-count=<128..4096>,
         -pbe-bie-node-patch-operator-audit=on|off,
       -pbe-bie-progress=off|auto|detail,
@@ -373,8 +404,9 @@ IMPORTANT NOTES
       -pbe-bie-true-residual-probe=restart|interval|off,
       -pbe-bie-true-residual-probe-interval=<1..128>
       -pbe-bie-primary-surface=sphere-patch|grid-ses|analytic-ses,
-      -pbe-bie-analytic-ses-engine=patch-ray-experimental|current|
-        current-dense (default patch-ray-experimental),
+      -pbe-bie-analytic-ses-engine=patch-ray-experimental|
+        patch-ray-resolution|current|current-dense
+        (default patch-ray-experimental),
       -pbe-bie-ses-grid-spacing=<0.25..4.0> (default 0.75)
     grid-ses is an opt-in watertight solvent-excluded surface. It applies a
     probe-radius morphological closing to the VDW volume on a Cartesian grid,
@@ -439,11 +471,38 @@ IMPORTANT NOTES
     is a throughput setting, not a universal energy-accuracy guarantee;
     quantitative work should report an h-refinement check and reduce the
     spacing until the observable is stable.
+    patch-ray-resolution uses the same certified ray-parity signs and
+    marching tetrahedra, then accepts the surface at the resolution of the
+    grid instead of certifying every patch. Odd ray rows and fallback signs
+    are reported, not refused. Each vertex moves onto its closest analytic
+    patch point unless that turns or flattens an incident triangle; any
+    triangle pair that still intersects has its vertices returned to their
+    marching positions, which cannot intersect. Solvent slabs and molecular
+    plates one grid cell thick are merged, so features thinner than h do not
+    reach the solver as two facing sheets. The mesh is then remeshed
+    isotropically onto the analytic SES (edge split, collapse, Delaunay flip
+    and tangential relaxation; any operation behind an intersecting pair is
+    undone), which gives well-shaped elements, about half the nodes at the
+    same spacing, and much faster GMRES convergence on large proteins. The
+    result stays closed, oriented and free of self-intersections.
+      -pbe-bie-ses-remesh-edge=off|0|<0.25..4.0> (default 0 = the SES grid
+        spacing): target edge of that remeshing in A; off keeps the
+        marching-tetrahedra mesh.
+      -pbe-bie-ses-remesh-iterations=<1..12> (default 6): passes of split,
+        collapse, flip and tangential relaxation in that remeshing.
+    Large complexes that patch-ray-experimental refuses should use this
+    engine and report an h-refinement check.
     Node-patch treecode runs a fail-closed, spatially stratified pre-GMRES
     operator audit by default. It starts at 64 targets and expands to 256 or
     512 only when the sampled error is ambiguous. Advanced production runs
     may set -pbe-bie-node-patch-operator-audit=off to remove this guard;
     convergence then no longer certifies agreement with sampled direct rows.
+    -pbe-bie-matvec-audit=targets compares the solved operator with direct
+    rows after GMRES, on every surface and cell: m = min(sample count, N)
+    targets at the panel indices floor((2k+1)N/(2m)), both equations (2m
+    rows), giving the sampled operator discrepancy ||[(A_acc - A_dir) u]_S|| /
+    ||(A_dir u)_S|| and the sampled direct residual ||b_S - (A_dir u)_S|| /
+    ||b_S|| of the solution u.
     fmm-nearfield-ilu0-coarse is an opt-in balanced two-level
     preconditioner. It reuses adaptive occupied octree nodes for an
     area-weighted coarse space and combines the coarse correction with the
@@ -872,8 +931,11 @@ IMPORTANT NOTES
 
   Notes:
     - sidechain-com is the default mode: mass-weighted side-chain COM at
-      distance <= 6.5 A, using legacy fallback semantics.
+      distance <= 6.5 A; glycine (no side chain) uses its CA.
     - sidechain-heavy remains an explicit atom-pair mode with default 4.5 A.
+    - Distances use the minimum image when the frame has a valid periodic
+      box, plain distances otherwise (counted in the summary as
+      frames_without_box_plain_distances).
     - interface produces a rectangular mol1 x mol2 matrix and works in -nocal.
     - backbone is accepted as an alias for bb.
     - Canonical syntax:
@@ -946,8 +1008,14 @@ IMPORTANT NOTES
 
   Notes:
     - sidechain-com is the default mode: mass-weighted side-chain COM at
-      distance <= 6.5 A, using the same fallback semantics as CMap.
+      distance <= 6.5 A (glycine: CA), as CMap.
     - sidechain-heavy remains an explicit atom-pair mode with default 4.5 A.
+    - -qnative-soft=true uses the Best-Hummer switch per native pair,
+      1/(1+exp(beta*(r - lambda*r0))) with r0 its reference distance,
+      beta = 5 A^-1 (50 nm^-1) by default, lambda = 1.5 for ca mode and 1.8
+      for the other modes; the hard count (r <= cutoff) is unchanged.
+    - Frames without a valid periodic box use plain distances (summary:
+      frames_without_box_plain_distances).
     - interface produces a bipartite mol1 x mol2 native-contact set and works
       in -nocal.
     - TPT accepts qnative_range:min,max, qnative_lt:x, and qnative_gt:x.
@@ -1001,6 +1069,7 @@ IMPORTANT NOTES
     -msd-pbc <auto|unwrap|mic>
     -msd-rot <true|false>
     -msd-rot-fit-window <auto|tmin,tmax>
+    -msd-memory-limit <auto|MB>
 
   Typical outputs:
     msd_timeseries.dat
@@ -1014,6 +1083,15 @@ IMPORTANT NOTES
   Notes:
     - `-msd-mode` defaults to com; atom mode averages MSD over selected atoms.
     - `-msd-maxlag=auto` uses min(frames - 1, 1000).
+    - `-msd-fit-window=auto` fits 20-80 % of the lags that keep at least half
+      of the frames as time origins (lag <= frames/2; at least the first
+      three lags), so the fit ends at <= 40 % of the trajectory. gmx msd
+      fits 10-90 % of all lags by default.
+    - Every frame of the selection is kept (multiple time origins, time
+      blocks): 24 B per atom and frame in atom mode (and again for
+      -msd-rot). `-msd-memory-limit=<auto|MB>` stops the run with a message
+      before the storage passes the limit; auto = half the free RAM at
+      start, at least 1024 MB. The limit in frames is printed at start.
     - `-msd-pbc=auto` unwraps by consecutive-frame MIC when all used frames
       have valid boxes; otherwise it reports raw-coordinate policy.
     - `-msd-rot=true` is supported with `-msd=true`.
@@ -1093,6 +1171,15 @@ IMPORTANT NOTES
       order, curvature, contact-probability, and leaflet-composition deltas
       using per-frame protein-lipid contacts.
     - membrane_summary.dat records a reference note for interpretation.
+    - membrane_order_parameters.csv: mean_P2_bond = <0.5*(3cos^2(theta)-1)>
+      of the vector between consecutive tail sites and the bilayer normal.
+      For MARTINI beads this is the usual bond order parameter; for all-atom
+      tail carbons (-membrane-tail=atomname:...) it is S_CC of the C-C bonds,
+      not the NMR S_CD of the C-H bonds.
+    - membrane_curvature_map.csv (-membrane-curvature=grid):
+      height_dev_over_cell_edge = (mean head height in the cell - leaflet
+      mean height)/sqrt(cell area), averaged over the leaflets in the cell;
+      a dimensionless height map, not a mean (H) or Gaussian (K) curvature.
     - arg.in uses the equals syntax shown above; terminal `-membrane true`
       enables the analyzer.
 
@@ -1169,6 +1256,8 @@ IMPORTANT NOTES
     pca_zts_path.csv        (when -zts -zts-domain pca is enabled)
 
   Notes:
+    - FES files (pca/tica/mbar/umap *_fes_2d.dat) write "nan" for bins
+      without samples; sampled bins hold -kT ln(P/P_max) in the output unit.
     - Without DHAM, FES is built from uniform frame counts.
     - With converged DHAM, FES and basin populations are reweighted to
       -dham-target-temp automatically.
@@ -1216,6 +1305,11 @@ IMPORTANT NOTES
       neighborhood size, while `-allostery-knn` still means pair-pruning top-k.
     - `-allostery-bins` and `-allostery-kde-bandwidth` are ignored in
       knn mode and TITAN logs that decision.
+    - hist/kde: every MI and TE entropy term is the plug-in estimate of the
+      binned counts with the Miller-Madow correction (m - 1)/(2N) (m occupied
+      bins, N samples); kde smooths the MI joint histogram and then uses
+      plug-in entropies. Residual bias remains when the B^3 bins of the TE
+      histogram are sparsely filled (N not >> B^3).
 
 2.6a Mutual Information / Generalized Correlation
 
@@ -1406,21 +1500,42 @@ IMPORTANT NOTES
     changing the embedding fit itself. KNN mode defaults to `auto` so large
     embeddings can select the approximate path.
 
-2.10 DHAM Reweighting
+2.10 DHAM Reweighting (TRAM estimator)
 
   Purpose:
-    Reweight MSM state populations using per-replica temperatures and energy
-    time-series from GROMACS .xvg energy outputs.
+    Combine MSM trajectories run at several temperatures into the stationary
+    distribution, free energies, frame weights and (when a replica runs at
+    the target temperature) the transition matrix at -dham-target-temp.
+    The estimator is TRAM, the transition-based reweighting analysis method:
+    every frame with an energy is a sample whose own energy (U, or U + P V
+    in NPT) sets its weight at each temperature, and transitions are counted
+    inside one replica. The option keeps its name; the earlier small-bias
+    DHAM approximation with state-mean energies is not used any more, since
+    for temperature ensembles the bias depends on each configuration's
+    energy, not on the Markov state (KIN-13).
+    Please cite: Wu, Paul, Wehmeyer, Noe, Proc. Natl. Acad. Sci. USA 113,
+    E3221 (2016), doi:10.1073/pnas.1525092113 (TRAM); Wu, Mey, Rosta, Noe,
+    J. Chem. Phys. 141, 214106 (2014), doi:10.1063/1.4902240 (dTRAM);
+    Shirts, Chodera, J. Chem. Phys. 129, 124105 (2008),
+    doi:10.1063/1.2978177 (MBAR); for replica exchange also Stelzl, Hummer,
+    J. Chem. Theory Comput. 13, 3927 (2017), doi:10.1021/acs.jctc.7b00372.
+    The same lines are written into every -dham output.
 
   Main inputs:
     -dham
     -dham-temps <temps.txt>
     -dham-segment-map <metadata.txt>
-      Audited segment/exchange metadata, TITAN_DHAM_SEGMENTS_V1 format.
-      Mutually exclusive with -dham-ener. Writes candidate counts/decisions
-      only; requires exact endpoint energies and excludes closed intervals
-      touching exchanges or segment boundaries. Does not run the estimator.
+      Audited segment/exchange metadata, TITAN_DHAM_SEGMENTS_V1 format, for
+      replica exchange. Mutually exclusive with -dham-ener. Samples are the
+      frames with an exact energy; transitions are the lag windows inside one
+      segment with no accepted exchange and exact energies at both ends
+      (dham_segment_counts.csv, dham_segment_decisions.csv). Dropping the
+      windows that hold an exchange is a selection TRAM does not correct, so
+      rates need lag times well below the time between accepted exchanges.
     -dham-ener <energy_list.txt>
+      One .xvg per replica; each replica trajectory is taken as continuous at
+      its temperature (independent runs at several temperatures). Replica-
+      exchange data need -dham-segment-map instead.
     optional:
       -dham-target-temp <K>
       -dham-ensemble <nvt|npt>
@@ -1445,7 +1560,9 @@ IMPORTANT NOTES
   Typical outputs:
     dham_stationary_distribution.dat
     dham_free_energy_profile.dat
-    dham_unbiased_tpm.dat
+    dham_unbiased_tpm.dat   (transition matrix of the replica at the target
+                             temperature; none if no replica runs there)
+    dham_tram_summary.dat   (counts, convergence, notes and references)
     dham_window_audit.dat
 
   Integration note:
@@ -1494,8 +1611,19 @@ IMPORTANT NOTES
     `-mbar-demux-map` is the authoritative state-assignment route for raw
     replica outputs; if it is omitted, TITAN maps each frame to the nearest
     inferred ladder temperature using the XVG temperature column.
+    Demux map rows: `time_ps r_0 r_1 ...` (GROMACS replica_index.xvg; r_s is
+    the replica at state s). States are resolved by time from the nearest
+    row (within half the row spacing), never by row or frame index. Without
+    the time column the map must have exactly one row per energy-file row,
+    all energy files sharing one time axis. Samples the map cannot resolve
+    stop MBAR.
     `-mbar-ensemble nvt` treats the XVG observable as energy.
-    `-mbar-ensemble npt` treats the XVG observable as enthalpy-like.
+    `-mbar-ensemble npt` reweights with beta (U + p V): p from
+    `-mbar-pressure-bar` (default 1 bar), V from the trajectory boxes, U the
+    XVG column (the potential energy); <H> and Cp are then those of
+    H = U + p V. Without box volumes (energy-only input) or with a pressure
+    <= 0 the p V term is not added and the XVG column is used as it is;
+    mbar_summary.dat states which ("MBAR pV Term").
     `-mbar-domain tica` reuses the TICA/MSM frame metadata path.
     `-mbar-domain pca` reuses PCA trajectory metadata and the standard
     `pca_fel.csv` projection export.
@@ -1616,6 +1744,8 @@ IMPORTANT NOTES
     Run metadata and diagnostics are written into the central TITAN log
     (`log.txt`) under LLPS Run Context / Output Audit sections; TITAN does not
     create a separate LLPS manifest sidecar.
+    LLPS runs in the energy frame loop: `-llps` cannot be combined with
+    `-nocal` and needs two groups in `-g`.
 
   Main inputs:
     -llps
@@ -1666,6 +1796,16 @@ IMPORTANT NOTES
     llps_density_protein.dx
     llps_density_rna.dx
     polymer_scaling.dat
+
+  C(t) note (llps_autocorr.dat):
+    C(k) = sum_t |d(t) and d(t+k)| / sum_t |d(t)|, d(t) = macro-node
+    adjacency xor the persistent pattern (pairs in contact in at least half of
+    the window). The window is every frame from the percolation frame on
+    (the whole run without percolation), for the pattern and for the time
+    origins; lags run to min(-llps-maxlag, window/2) frames; the lag time
+    uses the median frame step. When the stored window exceeds a quarter of
+    the free RAM (at least 256 MB), one frame in 2, 4, ... is kept
+    (llps_summary.dat: ct_frame_stride).
 
   Contact-map note:
     llps_contact_map.dat keeps the legacy residue-index matrix schema.
@@ -2190,19 +2330,33 @@ IMPORTANT NOTES
   -mol2 <N>             Starting residue/atom index for molecule 2
   -n_wat <N>            Zero-based water index-group number; -1 disables
 
-  -b <time>             Begin time (ps)
-  -e <time>             End time (ps)
-  -dt <N>               Frame step interval
+  -b <time>             Begin time (ps, or ns with -tu=ns)
+  -e <time>             End time (ps, or ns with -tu=ns)
+  -dt <N>               Time between analysed frames (ps, or whole ns with
+                        -tu=ns)
+  -tu <ps|ns>           Time unit of -b/-e/-dt and of the times written in
+                        the outputs. Default: ps
   -nt <N>               Number of threads
 
 4.3 Energy / Solvation / Entropy
 
   -gbsa                 Enable GBSA solvation analysis
+                        With -common_topo, the Coulomb/LJ part applies the
+                        topology's exclusions and listed (1-4) pairs between
+                        the two groups (groups joined by covalent bonds); the
+                        GB polar term keeps every pair, as in Amber. Bonded
+                        terms across such a junction are not computed.
+                        Without a topology, covalently joined groups are
+                        refused (invalid_bonded_groups).
   -alpb                 Enable Sigalov ALPB (per-frame A_Det) and imply -gbsa
   -gbsa-perf <mode>     off, summary, or detail. Default: summary.
                         Reports a fused GBSA energy-kernel timing bucket.
   -gbsa-sasa-points <N> Shrake-Rupley points/atom. Default: 96; perform a
                         convergence check (for example 96, 384, 1536).
+                        The SASA (and the ALPB size) uses each atom's LJ
+                        radius r_min/2, which is 0 for LJ-less polar H in
+                        AMBER/OPLS; the Born radii use the GB intrinsic
+                        radii (mbondi/mbondi2/mbondi3, Bondi for igb 66).
   -gbsa-rgbmax <A>|off  Cutoff in Angstrom on the HCT descreening integral for
                         the effective Born radii. Default: off (uncut sum).
                         25 matches Amber's egb default and is much faster on
@@ -2230,7 +2384,8 @@ IMPORTANT NOTES
   -ext_diel <val>       External dielectric. Default: 78.5
   -int_diel <val>       Internal dielectric. Default: 1.0
   -saltcon <val>        Salt concentration (M). Default: 0.15
-  -gbsa-temp <val>      GB/IE temperature (K). Default: 298.15
+  -temperature <val>    Analysis temperature (K) for Debye screening, GB salt
+                        and interaction entropy (alias -gbsa-temp). Default: 298.15
   -gbsa-ie-block <N>    auto or positive block size. Default: auto
   -gbsa-ie-min-samples <N>
                         Minimum frames before IE is valid. Default: 10
@@ -2246,8 +2401,9 @@ IMPORTANT NOTES
                         manuscript production fast operator. Default: auto
   -pbe-model <mode>     linear or nonlinear. Default: linear
                         nonlinear uses the current linear off/focus/vcycle
-                        solve as a seed, then runs Picard/SOR or damped Newton
-                        on the final fine grid. Vacuum endpoints remain linear.
+                        solve as a seed, then runs damped Newton (default) or
+                        Picard/SOR on the final fine grid. Vacuum endpoints
+                        remain linear.
   -pbe-biomodel <mode>  pbe or rpbe. Default: pbe
   -pbe-dielectric <m>   two-dielectric or gaussian. Default: two-dielectric
   -pbe-scale <val>      Grid scale in points/A. Default: 2.0
@@ -2332,7 +2488,16 @@ IMPORTANT NOTES
                         Shrake-Rupley points/atom. Default: 96; perform a
                         convergence check (for example 96, 384, 1536).
   -pbsa-ie-filter-sigma <val>
-                        Sigma filter for IE samples. Default: 2.0
+                        Sigma filter for IE samples. Default: 3.0 (the
+                        cutoff of Sun et al., J. Chem. Phys. 2017; was 2.0).
+                        Samples with |dE - <dE>| > val*sigma(dE) are dropped
+                        before the exponential average (truncated IE). This
+                        lowers -TdS for broad distributions: Gaussian dE at
+                        298 K, sigma 5 kJ/mol gives 5.04 untruncated, 4.61
+                        at 3.0, 3.41 at 2.0 kJ/mol. 0 = untruncated
+                        estimator (Duan et al., JACS 2016). Ekberg and Ryde,
+                        JCTC 2021, discuss the bias of truncation.
+                        mm_pbsa_summary.dat records the value and these notes.
   -pbsa-perf <mode>     off, summary, or detail. Default: summary
   -pbe-max-iter <N>     SOR iteration cap. Default: 10000
   -pbe-rms <val>        SOR RMS convergence tolerance. Default: 1e-6
@@ -2358,10 +2523,20 @@ IMPORTANT NOTES
                         off or auto. Default: auto
   -pbe-nl-residual <val>
                         Nonlinear residual tolerance. Default: 1e-5
-  -pbe-nl-solver <mode> picard or newton. Default: picard
-  -pbe-nl-inner <mode>  auto, sor, or vcycle. Default: auto
+                        A nonlinear solve reports status ok only when its
+                        final RMS nonlinear residual is at or below this
+                        value (DelPhi NWT parity rows keep the DelPhi block
+                        stop); otherwise not_converged.
+  -pbe-nl-solver <mode> auto, picard or newton. Default: auto (= newton)
+                        picard stops when the potential stops changing and
+                        stalls above the residual tolerance on proteins
+                        (1A63, 0.5 A: dG_solv 9.3 kJ/mol off), so it reports
+                        not_converged there. The DelPhi NWT parity path needs
+                        an explicit newton.
+  -pbe-nl-inner <mode>  auto, sor, or vcycle. Default: auto (vcycle; sor for
+                        the DelPhi NWT fixture: test PQR with delphi-vdw)
                         newton solves a stencil Jacobian correction with SOR
-                        or geometric V-cycle and appends correction residual,
+                        or Galerkin V-cycle and appends correction residual,
                         inner levels/cycles, Jacobian, lambda, and stop-reason
                         diagnostics. In DelPhi PQR parity rows, auto keeps the
                         strict Newton path on SOR first; if line search rejects
@@ -2422,17 +2597,32 @@ IMPORTANT NOTES
                         path and exposes hidden probe/focus fixture
                         diagnostics.
   -pbe-multigrid <mode> off, focus, auto, or vcycle. Default: off
-                        focus/auto keep the nested focusing path; vcycle runs
-                        a geometric V-cycle correction before final fine-grid
-                        convergence polish.
+                        focus/auto keep the nested focusing path; vcycle
+                        solves the fine grid with Galerkin multigrid: coarse
+                        operators P^T A P of the fine operator (no coarse
+                        re-discretisation), Gauss-Seidel smoothing, CG
+                        acceleration; fine-grid SOR polishes a solve that
+                        has not converged within -pbe-max-iter. The nonlinear
+                        Newton correction (-pbe-nl-inner=vcycle, the auto
+                        choice) uses the same
+                        hierarchy. References: Alcouffe, Brandt, Dendy,
+                        Painter, SIAM J. Sci. Stat. Comput. 2, 430 (1981);
+                        Holst, Saied, J. Comput. Chem. 14, 105 (1993).
   -pbe-focus-levels <N> Number of nested grids, 1..4. Values >1 imply auto.
                         Default effective value: 1 when off, 2 when auto.
   -pbe-focus-margin <A> Extra coarse-grid outer margin in Angstrom. Default: 8.0
-  -pbe-mg-levels <N>    auto or 1..4. Default: auto
+  -pbe-mg-levels <N>    auto or 1..16. Default: auto (coarsen until the
+                        coarsest level has at most 1000 unknowns, which are
+                        then solved directly)
   -pbe-mg-pre <N>       V-cycle pre-smoothing sweeps. Default: 2
-  -pbe-mg-post <N>      V-cycle post-smoothing sweeps. Default: 2
+  -pbe-mg-post <N>      V-cycle post-smoothing sweeps. Default: 2. CG needs
+                        -pbe-mg-pre equal to -pbe-mg-post.
   -pbe-mg-coarse-iter <N>
-                        Coarsest-grid SOR iterations per cycle. Default: 200
+                        Symmetric Gauss-Seidel sweeps on a coarsest level
+                        too large for the direct solve (only when
+                        -pbe-mg-levels caps the hierarchy). Default: 200
+  -pbe-mg-accel <m>     cg or none. Default: cg (CG preconditioned by one
+                        V-cycle per iteration); none repeats V-cycles.
   Hidden PQR parity diagnostics:
   -pbe-parity-dump <m>  off, summary, points, or all. Requires -pbe-test-pqr.
                         Writes pbe_parity_stage.csv and optionally
@@ -2590,8 +2780,16 @@ IMPORTANT NOTES
   -denfo <val>          Distance-energy cutoff
   -dsc <val>            Standard distance cutoff. Default: 6.5 A
 
-  -entropy              Interaction entropy
-  -entropy-quasi <com> <lig> <rec>
+  -entropy              Interaction entropy (Duan-Zhang), -TdS = kT ln
+                        <exp(beta (E - <E>))>, E = E_elec + E_vdW, at the
+                        -temperature (default 298.15 K)
+  -entropy-filter-sigma <x>
+                        Drop samples farther than x standard deviations from
+                        the mean before the exponential average. Default: 0
+                        (no trimming; a 2-sigma cut removes the tail that
+                        decides the average: -33 % for Gaussian sigma = 5
+                        kJ/mol). Written to entropy_result.dat.
+  -entropy-quasi <com>,<lig>,<rec>
   -qha-temp=<K>                 Quasi-harmonic temperature (default: 300 K).
   -ml-predict-experimental=true  No effect. The bundled affinity model is closed
                         pending a model card (training set, feature units,
@@ -2608,6 +2806,7 @@ IMPORTANT NOTES
   -pbca <chain_ref>     Aggressive PBC mode
   -pbcn                 FixBox-style PBC mode
   -pbctopo              pbctopo (VIBE): Virtual Intact Block Extraction PBC mode
+                        (short reference: -vibe-help)
   -pbctopo-mode=<name>  vibe | llps-local. Default: vibe
   -pbctopo-llps-local   Alias for -pbctopo -pbctopo-mode=llps-local
   -pbctopo-search-policy=<name>
@@ -2627,7 +2826,13 @@ IMPORTANT NOTES
                         greedy | viterbi | hololift. Default: greedy
                         viterbi is experimental/diagnostic and is not part of
                         the framewise VIBE observation contract.
-                        hololift runs HoloLift-MD after VIBE: the relative
+)MANUAL"
+#ifdef TITAN_WITHOUT_HOLOLIFT
+        R"MANUAL(                        hololift is not available in this build (HOLOLIFT=0).
+)MANUAL"
+#else
+        R"MANUAL(                        hololift runs HoloLift after VIBE (short reference:
+                        -hololift-help): the relative
                         periodic images of the components are selected for the
                         whole trajectory by exact dynamic programming, with a
                         charge on selections that lack contact evidence, and
@@ -2637,7 +2842,9 @@ IMPORTANT NOTES
                         translation with the displacement-preserving (toroidal)
                         scheme, so they serve transport under constant pressure.
                         Requires -traj <file.xtc>; uses -nt threads.
-  -pbctopo-temporal-k=<N>
+)MANUAL"
+#endif
+        R"MANUAL(  -pbctopo-temporal-k=<N>
                         Top-K virtual candidates for experimental Viterbi.
                         Range: 1..32; default: 4
   -pbctopo-temporal-penalty=<value>
@@ -2645,13 +2852,19 @@ IMPORTANT NOTES
   -pbctopo-evidence-export[=<bool>]
                         Opt-in Paper-2 candidate evidence summary/relation
                         sidecars. Default: false
+  -pbctopo-steric=<report|filter>
+                        report (default): overlaps between parts do not affect the
+                        placement; the frame report counts the overlaps in the input
+                        (input_overlap_*). filter: the 1.0.x rule, which rejects a
+                        candidate whose placed parts overlap.
   -pbctopo-vdw-clash-scale=<value>
                         Severe-overlap threshold lambda*(ri+rj). Range: (0,1]; default: 0.55
                         Explicit zero-LJ sites have no LJ hard core.
   -pbctopo-bond-cutoff=<A>
                         Local topology bond cutoff. Default: 2.15 A; MARTINI: 5.5 A
   -pbctopo-clash-cutoff=<A>
-                        Clash cutoff for VIBE candidate rejection. Default: 1.05 A; MARTINI: 3.5 A
+                        Overlap cutoff for atoms without radii (input scan; candidate
+                        rejection with -pbctopo-steric=filter). Default: 1.05 A; MARTINI: 3.5 A
   -pbctopo-contact-cutoff=<A>
                         Owner/contact cutoff for split guards. Default: 4.5 A; MARTINI: 8.0 A
   -pbctopo-required-contacts=<file>
@@ -2762,8 +2975,10 @@ IMPORTANT NOTES
   -qnative-domain <m>   intra | inter | both. Default: both
   -qnative-min-seqsep <N>
                         Minimum intra-chain sequence separation. Default: 3
-  -qnative-soft <bool>  Use soft logistic native contacts. Default: false
-  -qnative-beta <val>   Soft-contact beta; valid only when soft=true
+  -qnative-soft <bool>  Best-Hummer soft contacts 1/(1+exp(beta(r-lambda r0))),
+                        lambda 1.5 (ca) or 1.8. Default: false
+  -qnative-beta <val>   Soft-contact beta in 1/A (5 = 50 nm^-1); only with
+                        soft=true. Default: 5
   -dihedral             Dihedral analysis: phi/psi/omega and chi1/chi2
   -dihedral-kind <mode> backbone | sidechain | both. Default: backbone
   -dihedral-residues <s>
@@ -2775,8 +2990,12 @@ IMPORTANT NOTES
                         residue:10,12-20,A:30. Default: mol1
   -msd-mode <mode>      com or atom. Default: com
   -msd-maxlag <N|auto>  Maximum lag index. Default: auto=min(frames-1,1000)
-  -msd-fit-window <w>   auto or tmin,tmax in ps. Default: auto
+  -msd-fit-window <w>   auto or tmin,tmax in ps. Default: auto (20-80 % of
+                        the lags <= frames/2)
   -msd-pbc <policy>     auto, unwrap, or mic. Default: auto
+  -msd-memory-limit <auto|MB>
+                        Stop before the kept frames pass this size.
+                        Default: auto (half the free RAM, >= 1024 MB)
   -msd-rot <bool>       Enable rotational MSD with -msd=true. Default: false
   -msd-rot-fit-window <w>
                         Rotational fit window: auto or tmin,tmax in ps
@@ -2801,7 +3020,8 @@ IMPORTANT NOTES
   -membrane-enrichment=<bool>
                         Lipid resname/leaflet enrichment near mol1 protein
   -membrane-curvature=<off|grid>
-                        Headgroup-grid curvature proxy. Default: off
+                        Headgroup-grid height-deviation map (not H or K).
+                        Default: off
 
   -s2                   Enable Phase 6 NMR order-parameter analysis
   -s2=<bool>            true or false. Default: false
@@ -2880,6 +3100,9 @@ IMPORTANT NOTES
   -msm-nts <N>          Number of implied timescales. Default: 3
   -msm-kmeans-iter <N>  K-means iterations. Default: 300
   -msm-seed <N>         Random seed. Default: 42
+                        Seeds k-means++, the partial ITS and partial PCA
+                        start blocks and the randomized TICA sketch, so
+                        repeated runs give identical results.
   -msm-macrostates <N>  Number of macrostates. Default: -1 (auto)
   -msm-no-boundary-split
                         Disable boundary splitting
@@ -2938,11 +3161,16 @@ IMPORTANT NOTES
                         Default: 2
   -mbar-demux-map <file>
                         Optional per-frame state-assignment map for raw
-                        replica outputs
+                        replica outputs: rows `time_ps r_0 r_1 ...`
+                        (replica_index.xvg), resolved by time
   -mbar-pressure-bar <bar>
-                        Target/reporting pressure for NPT MBAR. Default: 1.0
+                        Pressure of the NPT p V term. Default: 1.0
   -mbar-dt-energy <ps>  Energy sampling interval in ps; 0 = auto
   -mbar-bootstrap <N>   Bootstrap replicates for Cv/<E> uncertainty. Default: 0
+                        Moving-block resampling per replica series, block
+                        length ceil(4 g) (g = statistical inefficiency);
+                        replicates whose MBAR solve fails are dropped and
+                        counted in mbar_summary.dat
   -mbar-scan-points <N> Number of temperature scan points; >1 writes mbar_cv.dat
                         Raw MBAR .xvg input also honors global -b/-e/-dt
 
@@ -2980,7 +3208,11 @@ IMPORTANT NOTES
   -llps-sticker <beads> Sticker bead names
   -llps-voxel <val>     Voxel size for acceleration. Default: 0.5
   -llps-lineage-overlap <val>
-                        Jaccard threshold for lineage matching. Default: 0.30
+                        Lineage containment share: a previous droplet belongs
+                        to a new one when >= val of its chains are in it
+                        (2+ = fusion); a new droplet descends from a previous
+                        one when >= val of its chains were in it (2+ =
+                        fission). Default: 0.5
   -llps-prna-rcut <val> Protein-RNA chain contact cutoff (nm). Default: llps-rcut
   -llps-density=<auto|full|projection|off>
                         Density accumulation policy. Default: auto
@@ -3045,6 +3277,21 @@ IMPORTANT NOTES
                         Number of Rg bins for RNA information states. Default: 16
   -llps-rna-info-longrange-bins <N>
                         Number of long-range-contact bins for RNA information states. Default: 16
+  -llps-rna-segment-beads <n|none>
+        Backbone beads per RNA membership/MSD segment (default 150 = 50 nt at
+        3 Martini backbone beads per nucleotide). A long RNA is one
+        moleculetype, so a whole-molecule dense/dilute majority vote flickers
+        and its COM is not the coordinate of a mobile body. 'none' restores
+        whole-molecule behaviour.
+  -llps-msd-drift-correct <true|false>
+        Subtract the cumulative translation of the dense phase before the
+        single-chain MSD (default true).
+  -llps-mobile-displacement-nm <val>
+        Displacement threshold (nm) for the FRAP-comparable mobile fraction
+        (default 2.0).
+  -llps-mobile-lag-ns <val|auto>
+        Lag at which the displacement mobile fraction is reported
+        (default auto = 0.25 x analysed window).
   -llps-msd-fit-start-ns <val|auto>
                         Dense-phase MSD fit window start. Default: auto
   -llps-msd-fit-end-ns <val|auto>
@@ -3155,16 +3402,21 @@ IMPORTANT NOTES
   -water-type <type>    Water mode: surface or sphere
   -dis-water <val>      Water distance cutoff. Default: 3.5
 
-  -charged_atom_dis [N] Charged-atom distance distribution
+  -charged_atom_dis [N] -nocal: distribution of the distances from mol1's
+                        centre of mass to its charged atoms, per input
+                        (<input>_distributionChargedAtoms.dat); N bins (400)
   -charged_distances_min <val>
                         Min charged distance
   -charged_distances_max <val>
                         Max charged distance
   -angle_dipole_efield [N]
-                        Dipole-electric-field angle distribution
+                        -nocal: distribution of the cosine between each water
+                        dipole and the solute field there, per input; N bins
   -cal-mindis           Minimum distance per frame
-  -resdis2com           Residue-to-COM distance analysis
-  -com-dis <axis>       x, y, z, or default euclidean
+  -resdis2com           -nocal: distance from each residue's centre of mass
+                        to mol1's, mean and SD per input
+  -com-dis <axis>       mol1-mol2 centre-of-mass distance per frame
+                        (out_dis_com.dat): x, y, z, or xyz (default)
 
 4.7 Miscellaneous
 
@@ -3175,24 +3427,32 @@ IMPORTANT NOTES
                         LJ in this mode analyzes molecule 1 only
                         RMSD/RMSF in this mode analyzes molecule 1 only
                         GBSA/ALPB are ignored in this mode
-  -cscd                 Side-chain contact distances
+  -cscd                 Side-chain centre-of-mass distance from each mol1
+                        residue to the nearest mol2 residue, one file per
+                        residue (out_cal_dis_com_<chain><resnr>.dat);
+                        -act gives one column per mol2 residue. Glycine,
+                        non-amino-acid residues and -side_chain_contact
+                        full-res use whole-residue centres; the file header
+                        says which
   -pqr                  Write PQR-style output
   -cal-force            Calculate atomic forces
-  -cal-volume           Molecular volume
+  -cal-volume           -nocal: box volume per frame (volume.dat) and its
+                        mean, SD and 95% CI (stat_volumes.dat)
   -max-force            Report maximum force
   -cache                Enable cache
   -cache -no            Disable cache
   -use-CI               Use confidence intervals
   -elec-screening       Debye-Huckel screening for aqueous 1:1 electrolyte at
                         298.15 K (kappa=3.291*sqrt(I) nm^-1).
-  -dipole-moment        Dipole moment analysis
+  -dipole-moment        -nocal: mol1 dipole moment per frame
+                        (<input>_dipole_moment.dat)
   -split                Split results per trajectory
   -all-subfolders       Process all subfolders and split outputs
   -cat-result           Concatenate results from multiple inputs
   -all-respair          Output all residue pairs
   -contact-map yes      Deprecated alias for interface sidechain-com CMap
   -contact-map no       Disable the deprecated alias only
-  -act                  Use all side-chain contacts
+  -act                  -cscd: every mol2 residue, not only the nearest
   -new_al               New alignment in single-PDB mode
   -new-al               Alias of -new_al
   -side_chain_contact <mode>
@@ -3313,8 +3573,12 @@ IMPORTANT NOTES
                         Ablation: rank feasible targets by geometry/progress only.
   -de-pathway-group <N> Legacy residue-group auto-builder (subset of g1)
   -de-pathway-radius <A>
-                        Compatibility alias setting graph, recovery-enter and
-                        recovery-exit radii together. Prefer the split options.
+                        Compatibility alias: graph edge cutoff = A, recovery
+                        enter = A, recovery exit = 0.75 x enter (the default
+                        3/4 ratio, so the hysteresis band keeps a width).
+                        Explicit -pathway-graph-edge-cutoff and
+                        -pathway-recovery-enter/-exit win in any order.
+                        Prefer the split options.
                         In pathway mode TITAN writes pull_direction_status.txt
                         for the external TITAN/GROMACS controller.
                         Pathway mode supports DE-family plus direct and
@@ -3340,6 +3604,8 @@ IMPORTANT NOTES
 4.9 Help / Version
 
   -h, --help            Print help message
+  -vibe-help            Short reference for VIBE (-pbctopo) and its frame report
+  -hololift-help        Short reference for HoloLift (-pbctopo-temporal=hololift)
   -v, --version         Print build number
 
 ================================================================================
@@ -3348,4 +3614,162 @@ IMPORTANT NOTES
 )MANUAL";
     return 0;
   }
+}
+
+void arguments::vibe_help_print() {
+  cout << R"VIBE(
+TITAN-VIBE quick reference                  (all TITAN options: titan.exe -h)
+
+VIBE places every part of a periodic frame (a molecule, or a chain of a
+complex) at the lattice image that keeps the contacts it makes in the
+simulation, and labels how far the contacts determine that placement.
+Run it with an argument file, one option per line:  titan.exe -a arg.in
+
+Input
+  -f=frames.pdb             multi-model PDB, a CRYST1 record in every model
+  -s=ref.pdb                reference PDB, with
+  -traj=run.xtc             an XTC or TRR trajectory
+  -1pdb=true                read -f as one multi-model PDB
+  -n=index.ndx -g=0-0       index file; group 0 is reconstructed
+  -common_topo=topol.top    GROMACS topology; its bonds define the parts
+  -ff=<name>                force field of the topology (CHARMM36, AMBER99SB,
+                            MARTINI, ...); -path-a/-path-n point at lib_ff
+  -b=<ps> -e=<ps> -dt=<ps>  frame window and stride of a trajectory
+  -nt=<N>                   threads
+
+VIBE
+  -pbctopo=true             turn VIBE on
+  -nocal=true               coordinates only, no energy terms
+  -opdb=out.pdb             output coordinates, one model per frame
+  -pbctopo-mode=llps-local  phase-separated systems: make each molecule whole
+                            where it is, without placing molecules relative to
+                            each other
+  -pbctopo-search-policy=fast-certified|audit-exact
+  -pbctopo-contact-cutoff=<A>
+                            contact distance; 4.5 A, MARTINI 8.0 A
+  -pbctopo-steric=report|filter
+                            report (default): overlaps between parts do not
+                            change the placement, they are counted in the input;
+                            filter: the 1.0.x candidate rejection
+
+Output files, in the working directory
+  out.pdb                   placed coordinates
+  pbctopo_frame_report.csv  one row per frame
+
+Frame report: evidence_state
+  supported_connected  the contacts connect all parts and every cycle of
+                       contacts closes: the frame fixes the placement up to
+                       one common lattice translation
+  weak_disconnected    some parts are joined to the rest by no contact path;
+                       the frame does not fix their relative images
+  extended_periodic    the contact network closes through the boundary (a pair
+                       in contact at two images, a part touching its own image,
+                       or a longer ring): no finite placement keeps every
+                       contact.  contact_cycle_rank is 1 for a filament, 2 for
+                       a sheet, 3 for a network; contact_cycle_b* are its
+                       generators in cell vectors
+  weak_ambiguous       the contacts close, but the selected placement leaves
+                       a contact relation unsupported
+  contradicted         the selected placement loses an observed contact
+  not_evaluated        no placement was certified (status fallback)
+  not_applicable       llps-local frames
+
+Frame report: other columns
+  status               certified | weak_observation | contradicted | fallback
+                       | local_unwrap
+  input_overlap_pairs  atom pairs of two parts closer than lambda*(ri+rj) in
+                       the input; under periodic boundary conditions they are
+                       present for every placement
+  self_image_units     parts within the contact distance of their own image
+  bonded_winding_rank  > 0 when a bonded cycle itself runs through the boundary
+                       (fallback_reason bonded_winding)
+)VIBE";
+}
+
+void arguments::hololift_help_print() {
+#ifdef TITAN_WITHOUT_HOLOLIFT
+  cout << "HoloLift is not part of this build (HOLOLIFT=0).\n";
+#else
+  cout << R"HOLOLIFT(
+HoloLift quick reference                    (all TITAN options: titan.exe -h)
+
+What it does
+  In a periodic simulation every molecule has many copies, one per cell.  For
+  each frame VIBE lists the placements of the molecules that the frame allows,
+  ranked, and keeps its first choice; that choice is made for one frame at a
+  time.  HoloLift chooses one placement per frame for the whole trajectory at
+  once, so that the molecules move continuously: it moves a molecule to
+  another copy of its partner only where the contacts in the frames call for
+  it.  The answer is exact on VIBE's candidate lists.
+
+Run it
+  Write the options into a file, one per line, and run
+      titan.exe -a arg.in
+  in the folder that should receive the output.
+
+    -s=reference.pdb        a structure in the atom order of the trajectory;
+                            its atom records name the atoms of the output PDB
+    -traj=run.xtc           the trajectory (XTC)
+    -n=index.ndx  -g=0-0    index file; group 0 holds the molecules to follow
+    -common_topo=topol.top  GROMACS topology of the system; its bonds define
+                            the molecules
+    -ff=charmm36            force field of the topology, with
+    -path-a=<folder>        -path-a and -path-n pointing at the forcefields
+    -path-n=<folder>        folder of the release
+    -pbctopo=true           VIBE, the reconstruction of each frame
+    -pbctopo-temporal=hololift
+                            HoloLift after VIBE
+    -nocal=true             coordinates only, no energy terms
+    -no-dssp=true  -noprint-side_chain_contact=true
+                            skip TITAN's structure analyses
+    -nt=8                   threads (no thread count changes a result)
+    -b=<ps> -e=<ps> -dt=<ps>
+                            optional: first and last time, and stride
+
+  A worked example with known answer: examples/01_separation, explained step
+  by step in docs/TUTORIAL.md.
+
+The line to look at
+  A run ends with one line on the screen; for examples/01_separation
+    PASS system=hololift frames=250 ... evidence_unsupported=0 ...
+         changed=60 gaps=0 ...
+  frames                frames read
+  changed               frames where HoloLift chose differently from VIBE's
+                        first choice for that frame
+  evidence_unsupported  frames where HoloLift kept a placement without contact
+                        evidence although another placement had it; 0 means
+                        every frame keeps the contacts it shows
+  gaps                  frames VIBE could not reconstruct; the path is solved
+                        separately on each side of a gap
+  Any line other than PASS, and any exit code other than 0, is an error; its
+  class (TRAJECTORY_ERROR, SOLVE_ERROR, ...) is printed on standard error.
+
+Output files, in the working directory
+  hololift_coordinates.xtc  the reconstructed trajectory of the -g group (nm)
+  hololift_coordinates.pdb  its first frame: load it, then the XTC, in VMD,
+                            PyMOL or ChimeraX
+  hololift_frame_results.csv
+                            one row per frame:
+                              framewise_* = VIBE's first choice
+                              temporal_*  = HoloLift's choice
+                              *_component_images = the cell shift (a:b:c) of
+                                each molecule, separated by |
+                              changed_from_framewise = 1 where they differ
+  hololift_system_summary.csv
+                            the totals of the run and the settings used
+  hololift_segment_results.csv, hololift_coordinates.csv,
+  hololift_policy_admissions.csv
+                            details: see docs/TUTORIAL.md
+  pbctopo_*.csv             the VIBE results HoloLift read (see -vibe-help)
+
+Settings
+  titan.exe runs HoloLift with its default settings: only placements that VIBE
+  certified are used, rank weight 1, transition weight 1, and a charge of 1000
+  on a placement without contact evidence when another one has it.  The
+  written coordinates keep HoloLift's relative placements and follow the
+  motion of the whole assembly across cells, also when the box changes size.
+  The standalone runner (tools/hololift_temporal_value_runner.cpp) takes other
+  settings as environment variables; see README.md.
+)HOLOLIFT";
+#endif
 }

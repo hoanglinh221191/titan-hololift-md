@@ -385,6 +385,10 @@ struct PrototypePanel {
   double source_x = 0.0;
   double source_y = 0.0;
   double source_z = 0.0;
+  // Mean normal of a node patch, which goes with its centroid (Panel).
+  double source_nx = 0.0;
+  double source_ny = 0.0;
+  double source_nz = 1.0;
   bool has_source_quadrature_center = false;
 };
 
@@ -428,8 +432,10 @@ public:
   [[nodiscard]] std::vector<FmmM2lOverlapPanelGroup>
   distance_knn_overlap_panel_groups(std::size_t owned_block_size,
                                     std::size_t overlap_panel_cap) const;
+  // executor (optional): the rows are built in parallel, each as before.
   [[nodiscard]] std::vector<std::vector<std::size_t>>
-  near_panel_graph(std::size_t neighbor_cap) const;
+  near_panel_graph(std::size_t neighbor_cap,
+                   TitanExecutor *executor = nullptr) const;
   [[nodiscard]] std::vector<std::vector<std::size_t>>
   distance_knn_panel_graph(std::size_t neighbor_cap) const;
 

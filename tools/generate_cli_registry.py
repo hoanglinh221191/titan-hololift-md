@@ -173,12 +173,14 @@ def write_if_changed(path: Path, content: str) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--parser", type=Path, required=True)
+    # parse_arguments() is split over src/cli/parse_*.cpp: pass every file,
+    # in a fixed order (the order only changes the recorded source hash).
+    parser.add_argument("--parser", type=Path, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
 
-    source = args.parser.read_text(encoding="utf-8-sig")
+    source = "\n".join(path.read_text(encoding="utf-8-sig") for path in args.parser)
     content = render_header(source)
     if args.check:
         if not args.output.exists() or args.output.read_text(encoding="utf-8") != content:

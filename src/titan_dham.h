@@ -1,10 +1,11 @@
 // ============================================================================
-// TitanDHAM — Dynamic Histogram Analysis Method
-// Reweights REMD/H-REMD MSM to a target temperature using energy information.
+// TitanDHAM - input helpers of the -dham reweighting: GROMACS .xvg energy
+// parsing, trajectory/energy window matching, file lists and temperatures.
 //
-// Explicit small-bias DHAM approximation: Rosta & Hummer, JCTC 2015.
-// State-mean energies approximate thermodynamic biases relative to target T;
-// arbitrary H-REMD and cross-temperature physical rates require more information.
+// KIN-13: the estimator is TRAM (titan_tram.h); the small-bias DHAM
+// approximation with state-mean energies (Rosta & Hummer, JCTC 2015) that
+// this class implemented before is gone: for temperature ensembles the bias
+// depends on each configuration's energy, not on the Markov state.
 //
 // Dependencies: Eigen/Dense, TitanUI, parse_xvg.h
 // ============================================================================
@@ -58,71 +59,13 @@ public:
         std::size_t dropped_outside_overlap{0};
         std::size_t unmatched_in_overlap{0};
         bool overlap_found{false};
+        // KIN-21: one trajectory frame per energy row. Frames whose nearest
+        // row lies within tolerance but is nearer to another frame keep the
+        // frame (kept_indices) and get NaN (no energy sample); counted here.
+        std::size_t duplicate_energy_matches{0};
+        double inferred_dt_traj_ps{0.0};       // median trajectory spacing
+        bool energy_coarser_than_traj{false};  // energy dt > trajectory dt
     };
-
-    // -------------------------------------------------------------------------
-    // Constructor
-    //   n_states:   number of microstates (K-means clusters)
-    //   n_replicas: number of REMD replicas
-    //   temps:      temperature of each replica (K), length = n_replicas
-    //   target_temp: temperature to reweight to (K)
-    // -------------------------------------------------------------------------
-    TitanDHAM(int n_states, int n_replicas,
-               const std::vector<double>& temps,
-               double target_temp = 300.0);
-
-    // -------------------------------------------------------------------------
-    // Data loading
-    // -------------------------------------------------------------------------
-
-    // Accumulate one transition i→j for replica k (called after K-means)
-    void accumulate_counts(int replica_k, int state_i, int state_j);
-
-    // Set the mean potential energy (kJ/mol) of microstate i at replica k
-    void set_state_energy(int replica_k, int state_i, double mean_energy_kJ);
-
-    // -------------------------------------------------------------------------
-    // Solve self-consistent equations (WHAM-like iteration)
-    //   max_iter:  maximum number of iterations
-    //   tol:       convergence tolerance on free energy shifts f_k
-    // Returns true if converged.
-    // -------------------------------------------------------------------------
-    bool solve(int max_iter = 5000, double tol = 1e-6);
-
-    // -------------------------------------------------------------------------
-    // Results
-    // -------------------------------------------------------------------------
-
-    // Stationary distribution at target temperature (length = n_states)
-    const Eigen::VectorXd& get_stationary_distribution() const { return p_i_; }
-
-    // Unbiased transition matrix at target temperature (n_states × n_states)
-    Eigen::MatrixXd get_unbiased_transition_matrix() const;
-
-    // Free energy per microstate at target temperature (kJ/mol, relative to min)
-    Eigen::VectorXd get_free_energy_profile() const;
-
-    // Per-replica free energy shifts f_k (dimensionless)
-    const Eigen::VectorXd& get_free_energy_shifts() const { return f_k_; }
-
-    // Compute per-frame weights W_t = p_i / N_i for each replica trajectory.
-    std::unordered_map<int, std::vector<double>>
-    get_frame_weights(
-        const std::unordered_map<int, std::vector<int>>& per_replica_dtrajs) const;
-
-    // Flatten per-replica frame weights in replica order 0..n_replicas-1.
-    std::vector<double>
-    get_flattened_frame_weights(
-        const std::unordered_map<int, std::vector<int>>& per_replica_dtrajs,
-        int n_replicas) const;
-
-    // Export results to files
-    // eu_par: energy unit divisor (1.0 = kJ/mol, 4.184 = kcal/mol)
-    void write_results(const std::string& pi_file,
-                       const std::string& fes_file,
-                       const std::string& tpm_file,
-                       std::fstream& log,
-                       double eu_par = 1.0) const;
 
     // -------------------------------------------------------------------------
     // Static helpers — public so postproc code can call them
@@ -132,6 +75,11 @@ public:
     // Uses high-perf TitanIO::parse_xvg_time_value under the hood
     static std::vector<std::pair<double,double>>
     parse_xvg(const std::string& path);
+
+    // Median of the positive, finite differences between consecutive times
+    // (ps); 0 when there is none. Robust to a repeated frame (difference 0)
+    // or an atypical first spacing.
+    static double median_positive_spacing(const std::vector<double>& times_ps);
 
     static WindowMatchResult
     window_match_energy_to_dtraj(
@@ -166,34 +114,6 @@ public:
     static std::vector<double>
     read_temps(const std::string& temps_path);
 
-private:
-    int n_states_;
-    int n_replicas_;
-    double beta_target_;               // 1 / (kB * T_target)
-    std::vector<double> betas_;        // 1 / (kB * T_k) for each replica
-
-    // Sparse count maps — one per replica:
-    // C_k_sparse_[k][i * n_states_ + j] = transitions i→j in replica k
-    // This avoids storing dense n_states x n_states matrices for every replica.
-    std::vector<std::unordered_map<std::uint64_t, double>> C_k_sparse_;
-
-    // c_out_(i,k) = sum_j C_k(i,j) = row sums (outgoing counts)
-    // Maintained online during accumulate_counts() and rebuilt from sparse maps
-    // before solve() as a consistency check.
-    MatrixXdRM  c_out_;              // [n_states × n_replicas]  RowMajor
-
-    // u_ik_(i,k) = beta_k * U_k(i)  — dimensionless reduced potential
-    MatrixXdRM  u_ik_;               // [n_states × n_replicas]  RowMajor
-
-    Eigen::MatrixXd target_tpm_;      // accepted DHAM transition matrix
-    Eigen::VectorXd f_k_;             // bias normalization; NaN if energies incomplete
-    Eigen::VectorXd p_i_;             // stationary distribution at target T
-
-    bool solved_ = false;
-
-    // Rebuild c_out_ from C_k_ row sums
-    void rebuild_c_out();
-
 };
 
 // ============================================================================
@@ -208,6 +128,25 @@ TitanDHAM::parse_xvg(const std::string& path) {
         return {};
     }
     return std::move(result.value());
+}
+
+inline double
+TitanDHAM::median_positive_spacing(const std::vector<double>& times_ps)
+{
+    std::vector<double> deltas;
+    deltas.reserve(times_ps.size() > 1 ? times_ps.size() - 1 : 0);
+    for (std::size_t i = 1; i < times_ps.size(); ++i) {
+        const double dt = times_ps[i] - times_ps[i - 1];
+        if (std::isfinite(dt) && dt > 0.0)
+            deltas.push_back(dt);
+    }
+    if (deltas.empty())
+        return 0.0;
+    const std::size_t mid = deltas.size() / 2;
+    std::nth_element(deltas.begin(),
+                     deltas.begin() + static_cast<std::ptrdiff_t>(mid),
+                     deltas.end());
+    return deltas[mid];
 }
 
 inline TitanDHAM::WindowMatchResult
@@ -275,6 +214,9 @@ TitanDHAM::window_match_energy_to_dtraj(
     result.aligned_values.reserve(dtraj_times_ps.size());
 
     const double nan_val = std::numeric_limits<double>::quiet_NaN();
+    constexpr std::size_t no_row = static_cast<std::size_t>(-1);
+    // KIN-21: kept position that holds each energy row (the nearest frame)
+    std::vector<std::size_t> row_owner(xvg_data.size(), no_row);
     std::size_t j = 0;
     for (std::size_t i = 0; i < dtraj_times_ps.size(); ++i) {
         const double t_target = dtraj_times_ps[i];
@@ -286,17 +228,40 @@ TitanDHAM::window_match_energy_to_dtraj(
 
         if (j > 0 && xvg_data[j].first > t_target + result.match_tolerance_ps)
             j = 0;
+        // KIN-19: a repeated energy row (two concatenated .xvg parts that both
+        // hold t = 0) must not stop the scan: step over rows of equal time.
         while (j + 1 < xvg_data.size() &&
-               std::abs(xvg_data[j + 1].first - t_target) <
-               std::abs(xvg_data[j].first - t_target)) {
+               (std::abs(xvg_data[j + 1].first - t_target) <
+                    std::abs(xvg_data[j].first - t_target) ||
+                xvg_data[j + 1].first == xvg_data[j].first)) {
             ++j;
         }
 
         result.kept_indices.push_back(i);
         result.kept_dtraj_times_ps.push_back(t_target);
-        if (std::abs(xvg_data[j].first - t_target) <= result.match_tolerance_ps) {
-            result.aligned_values.push_back(xvg_data[j].second);
-            ++result.matched_frames;
+        const double distance = std::abs(xvg_data[j].first - t_target);
+        if (distance <= result.match_tolerance_ps) {
+            // KIN-21: an energy row is one sample. When the energy grid is
+            // coarser than the trajectory grid several frames fall within
+            // tolerance of the same row; the nearest keeps it (the earlier on
+            // a tie), the others get no energy.
+            const std::size_t pos = result.kept_indices.size() - 1;
+            const std::size_t owner = row_owner[j];
+            if (owner == no_row) {
+                row_owner[j] = pos;
+                result.aligned_values.push_back(xvg_data[j].second);
+                ++result.matched_frames;
+            } else if (distance <
+                       std::abs(xvg_data[j].first -
+                                result.kept_dtraj_times_ps[owner])) {
+                result.aligned_values[owner] = nan_val;
+                row_owner[j] = pos;
+                result.aligned_values.push_back(xvg_data[j].second);
+                ++result.duplicate_energy_matches;
+            } else {
+                result.aligned_values.push_back(nan_val);
+                ++result.duplicate_energy_matches;
+            }
         } else {
             result.aligned_values.push_back(nan_val);
             ++result.unmatched_in_overlap;
@@ -304,6 +269,11 @@ TitanDHAM::window_match_energy_to_dtraj(
     }
 
     result.kept_frames = result.kept_indices.size();
+    result.inferred_dt_traj_ps = median_positive_spacing(dtraj_times_ps);
+    result.energy_coarser_than_traj =
+        result.inferred_dt_traj_ps > 0.0 &&
+        result.inferred_dt_energy_ps >
+            result.inferred_dt_traj_ps * (1.0 + 1e-6);
     return result;
 }
 
@@ -374,21 +344,53 @@ TitanDHAM::read_file_list(const std::string& list_path) {
     return result;
 }
 
+// KIN-23: lines that are blank or start with '#' or '@' (comments, xvg
+// directives) are skipped; any other line must hold only temperatures
+// (finite, > 0 K), separated by blanks or commas. Anything else stops the
+// read with the file and line, and the result is empty (the callers then
+// refuse to run). The old `f >> t` loop stopped silently at the first
+// header or comment and returned the temperatures read so far.
 inline std::vector<double>
 TitanDHAM::read_temps(const std::string& temps_path) {
     std::vector<double> temps;
     std::ifstream f(temps_path);
     if (!f.is_open()) {
-        TitanUI::print_error("DHAM: Cannot open temps file: " + temps_path);
+        TitanUI::print_error("Cannot open temperature file: " + temps_path);
         return temps;
     }
-    double t;
-    while (f >> t) {
-        if (t <= 0.0) {
-            TitanUI::print_error("DHAM: Invalid temperature <= 0: " + std::to_string(t));
+    std::string line;
+    int line_no = 0;
+    while (std::getline(f, line)) {
+        ++line_no;
+        const size_t first = line.find_first_not_of(" \t\r");
+        if (first == std::string::npos || line[first] == '#' || line[first] == '@')
             continue;
+        std::replace(line.begin(), line.end(), ',', ' ');
+        std::istringstream iss(line);
+        std::string token;
+        while (iss >> token) {
+            double t = 0.0;
+            size_t used = 0;
+            bool ok = true;
+            try {
+                t = std::stod(token, &used);
+            } catch (const std::exception&) {
+                ok = false;
+            }
+            if (!ok || used != token.size()) {
+                TitanUI::print_error("Temperature file " + temps_path + ":" +
+                                     std::to_string(line_no) + ": '" + token +
+                                     "' is not a number");
+                return {};
+            }
+            if (!std::isfinite(t) || t <= 0.0) {
+                TitanUI::print_error("Temperature file " + temps_path + ":" +
+                                     std::to_string(line_no) + ": temperature " +
+                                     token + " must be finite and > 0 K");
+                return {};
+            }
+            temps.push_back(t);
         }
-        temps.push_back(t);
     }
     return temps;
 }

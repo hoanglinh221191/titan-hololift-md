@@ -502,6 +502,8 @@ void apply_jcp_treecode_operator_impl(const std::vector<Panel> &panels,
       panels, unknowns, coupled, tree, taylor_order, jcp_moments);
   const double moment_ms =
       elapsed_ms(moment_begin, std::chrono::steady_clock::now());
+  const JcpFarEvaluator far_evaluator =
+      make_jcp_far_evaluator(taylor_order, coupled, tree.derivative_mode);
 
   if (tree.interaction_mode == "onthefly") {
     const auto interaction_begin = std::chrono::steady_clock::now();
@@ -1283,10 +1285,12 @@ void apply_jcp_treecode_operator_impl(const std::vector<Panel> &panels,
                     }
                   }
                   if (!leaf_mac_fallback_to_direct) {
-                    const JcpAccum far = taylor_jcp_node_sum(
+                    const JcpAccum far = far_evaluator(
                         target, node, jcp_moments.phin[node_index],
-                        normal_moments, eps_ratio, kappa, coupled,
-                        taylor_order, tree.derivative_mode);
+                        jcp_moments.phi_normal[0][node_index],
+                        jcp_moments.phi_normal[1][node_index],
+                        jcp_moments.phi_normal[2][node_index], eps_ratio,
+                        kappa);
                     if (should_audit_far_expansion(
                             tree, n, node, expansion_audit_candidates)) {
                       std::size_t direct_panel_count = 0;
@@ -2409,14 +2413,11 @@ void apply_jcp_treecode_operator_impl(const std::vector<Panel> &panels,
             const std::size_t node_index =
                 interactions.smooth_leaf_node_indices[pos];
             const TreeNode &node = tree.nodes[node_index];
-            const std::array<NodeMoments, 3> normal_moments = {
+            const JcpAccum smooth = far_evaluator(
+                target, node, jcp_moments.phin[node_index],
                 jcp_moments.phi_normal[0][node_index],
                 jcp_moments.phi_normal[1][node_index],
-                jcp_moments.phi_normal[2][node_index]};
-            const JcpAccum smooth = taylor_jcp_node_sum(
-                target, node, jcp_moments.phin[node_index], normal_moments,
-                eps_ratio, kappa, coupled, taylor_order,
-                tree.derivative_mode);
+                jcp_moments.phi_normal[2][node_index], eps_ratio, kappa);
             sum_phi[i] += smooth.phi;
             if (coupled)
               sum_phin[i] += smooth.phin;
@@ -2450,8 +2451,7 @@ void apply_jcp_treecode_operator_impl(const std::vector<Panel> &panels,
   std::atomic_size_t far_expansion_audit_candidates{0};
 
   const auto far_begin = std::chrono::steady_clock::now();
-  executor.parallel_for(
-      n, workers, 8,
+  const auto far_targets =
       [&](std::size_t worker, std::size_t begin, std::size_t end) {
         std::size_t far_count = 0;
         for (std::size_t i = begin; i < end; ++i) {
@@ -2459,19 +2459,46 @@ void apply_jcp_treecode_operator_impl(const std::vector<Panel> &panels,
           const std::size_t far_begin_pos = interactions.far_offsets[i];
           const std::size_t far_count_i =
               interactions.far_offsets[i + 1] - far_begin_pos;
-          for (std::size_t pos = far_begin_pos;
-               pos < far_begin_pos + far_count_i; ++pos) {
+          std::size_t pos = far_begin_pos;
+          // Four far nodes at a time; each node's term is the one the loop
+          // below would compute, added in the same list order.
+          if (far_evaluator.fast4 != nullptr && !far_audits_active) {
+            for (; pos + 4 <= far_begin_pos + far_count_i; pos += 4) {
+              const TreeNode *nodes4[4];
+              const double *density4[16];
+              for (std::size_t lane = 0; lane < 4; ++lane) {
+                const std::size_t node_index =
+                    interactions.far_node_indices[pos + lane];
+                nodes4[lane] = &tree.nodes[node_index];
+                density4[4 * lane] = jcp_moments.phin[node_index].values.data();
+                for (std::size_t c = 0; c < 3; ++c)
+                  density4[4 * lane + 1 + c] =
+                      jcp_moments.phi_normal[c][node_index].values.data();
+              }
+              JcpAccum far4[4];
+              far_evaluator.fast4(target, nodes4, density4, eps_ratio, kappa,
+                                  far4);
+              for (const JcpAccum &far : far4) {
+                sum_phi[i] += far.phi;
+                if (coupled)
+                  sum_phin[i] += far.phin;
+              }
+              far_count += 4;
+            }
+          }
+          for (; pos < far_begin_pos + far_count_i; ++pos) {
             const std::size_t node_index = interactions.far_node_indices[pos];
             const TreeNode &node = tree.nodes[node_index];
-            const std::array<NodeMoments, 3> normal_moments = {
+            const JcpAccum far = far_evaluator(
+                target, node, jcp_moments.phin[node_index],
                 jcp_moments.phi_normal[0][node_index],
                 jcp_moments.phi_normal[1][node_index],
-                jcp_moments.phi_normal[2][node_index]};
-            const JcpAccum far = taylor_jcp_node_sum(
-                target, node, jcp_moments.phin[node_index], normal_moments,
-                eps_ratio, kappa, coupled, taylor_order,
-                tree.derivative_mode);
+                jcp_moments.phi_normal[2][node_index], eps_ratio, kappa);
             if (far_audits_active) {
+              const std::array<NodeMoments, 3> normal_moments = {
+                  jcp_moments.phi_normal[0][node_index],
+                  jcp_moments.phi_normal[1][node_index],
+                  jcp_moments.phi_normal[2][node_index]};
               const double dx = target.x - node.cx;
               const double dy = target.y - node.cy;
               const double dz = target.z - node.cz;
@@ -2554,7 +2581,34 @@ void apply_jcp_treecode_operator_impl(const std::vector<Panel> &panels,
                 sum_phin[i];
         }
         local_far[worker] += far_count;
+      };
+  if (far_audits_active) {
+    executor.parallel_for(n, workers, 8, far_targets);
+  } else {
+    // Targets go out from a shared counter in shrinking chunks (a guided
+    // schedule) instead of one equal block per worker: on a hybrid CPU the
+    // equal split waits for the slowest core. The early chunks stay large and
+    // contiguous, because neighbouring targets share most of their far nodes
+    // and a worker's cache keeps them. Each target's sum is still formed by
+    // one worker in list order, so the result does not depend on the
+    // schedule. The audits keep the static split above.
+    constexpr std::size_t kFarTargetChunkMin = 32;
+    std::atomic_size_t next_target{0};
+    executor.parallel_for(
+        workers, workers, 1,
+        [&](std::size_t worker, std::size_t, std::size_t) {
+          std::size_t begin = next_target.load(std::memory_order_relaxed);
+          while (begin < n) {
+            const std::size_t chunk =
+                std::max(kFarTargetChunkMin, (n - begin) / (2 * workers));
+            if (next_target.compare_exchange_weak(begin, begin + chunk,
+                                                  std::memory_order_relaxed)) {
+              far_targets(worker, begin, std::min(n, begin + chunk));
+              begin = next_target.load(std::memory_order_relaxed);
+            }
+          }
         });
+  }
   const double far_ms = elapsed_ms(far_begin, std::chrono::steady_clock::now());
   const double traversal_ms = singular_ms + leaf_ms + smooth_leaf_ms + far_ms;
 

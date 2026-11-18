@@ -1263,6 +1263,29 @@ void AnalyzerImpl::write_pbsa_summary(std::fstream &log) {
       << "\n";
   out << "interaction_entropy_filter_sigma "
       << format_fixed(args_.pbsa_ie_filter_sigma) << "\n";
+  // KIN-24 (23/10/2026): the default filter is 3 sigma (Sun et al. 2017;
+  // it was 2), by the user's decision; the summary says what it does and
+  // where the practice comes from, so the number is not read as the
+  // untruncated estimator.
+  if (args_.pbsa_ie_filter_sigma > 0.0)
+    out << "interaction_entropy_filter_note samples with |dE - <dE>| > "
+        << format_fixed(args_.pbsa_ie_filter_sigma)
+        << " sigma(dE) are dropped before the exponential average "
+           "(truncated IE). The dropped tail weighs most in that average, so "
+           "-TdS is lower than the untruncated value for broad energy "
+           "distributions (Gaussian dE at 298 K, sigma = 5 kJ/mol: 5.04 "
+           "untruncated, 4.61 with 3 sigma, 3.41 with 2 sigma; sigma = 10 "
+           "kJ/mol: 20.17, 15.48, 10.71 kJ/mol). Use "
+           "-pbsa-ie-filter-sigma=0 for the untruncated estimator.\n";
+  else
+    out << "interaction_entropy_filter_note no samples dropped "
+           "(untruncated exponential average).\n";
+  out << "interaction_entropy_references IE: Duan, Liu, Zhang, J. Am. Chem. "
+         "Soc. 138, 5722 (2016), doi:10.1021/jacs.6b02682; sigma cutoff "
+         "(3 sigma): Sun, Yan, Yang, Zhang, J. Chem. Phys. 146, 124124 "
+         "(2017), doi:10.1063/1.4978893; truncation bias: Ekberg, Ryde, "
+         "J. Chem. Theory Comput. 17, 5379 (2021), "
+         "doi:10.1021/acs.jctc.1c00374\n";
   out << "interaction_entropy_block_config " << args_.pbsa_ie_block << "\n";
   out << "interaction_entropy_source E_MM_elec_plus_vdw\n";
   out << "interaction_entropy_samples " << entropy.samples

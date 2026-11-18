@@ -68,7 +68,9 @@
 /**********************************************************************************************************************/
 #include "functions.h"
 #include "cli/option_validation.h"
+#ifndef TITAN_WITHOUT_HOLOLIFT
 #include "hololift/temporal_runner.h"
+#endif
 #include "titan_ui.h"
 #include <algorithm>
 #include <filesystem>
@@ -87,6 +89,10 @@ static int run_engine(arguments &Arguments) {
   const int status = engine(Arguments);
   if (status != 0 || !Arguments.pbc.solv_pbctopo || Arguments.pbc.pbctopo_temporal != "hololift")
     return status;
+#ifdef TITAN_WITHOUT_HOLOLIFT
+  // Built with HOLOLIFT=0; arguments.cpp refuses -pbctopo-temporal=hololift.
+  return 1;
+#else
   titan_hololift::HoloLiftRunOptions options;
   options.system_label = "hololift";
   options.package_directory = std::filesystem::current_path();
@@ -101,6 +107,7 @@ static int run_engine(arguments &Arguments) {
   options.reference_pdb = Arguments.pdb_name;
   TitanUI::print_info("HoloLift-MD: temporal selection of periodic images on the VIBE package");
   return titan_hololift::run_hololift_temporal_value(options);
+#endif
 }
 
 int main(int argc, char **argv) {

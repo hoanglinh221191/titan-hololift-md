@@ -1,5 +1,7 @@
 #include "titan_markov_estimator.h"
+#include "titan_its.h"
 #include "titan_validation_core.h"
+#include "titan_tram.h"
 
 #include "titan_ui.h"
 
@@ -473,68 +475,74 @@ bool build_dham_model_from_context(const DhamRebuildContext &context,
     return false;
   }
 
-  const auto state_observables = TitanDHAM::compute_state_energies(
-      context.per_replica_dtrajs, context.per_replica_observables,
-      context.n_states, context.n_replicas, 1);
-  TitanDHAM dham(context.n_states, context.n_replicas, context.temps_k,
-                 context.target_temp_k);
-  std::vector<std::vector<unsigned char>> valid_observable(
-      static_cast<std::size_t>(context.n_replicas),
-      std::vector<unsigned char>(static_cast<std::size_t>(context.n_states), 0));
-
+  // KIN-13: TRAM, as in run_dham_postproc: frames with an observable are
+  // samples, transitions at this lag inside one replica between two samples
+  // and not across a trajectory break.
+  TitanTram tram(context.n_states, context.temps_k, context.target_temp_k);
+  if (tram.target_ensemble() < 0) {
+    error_message = "no replica at the DHAM target temperature: TRAM has no "
+                    "target transition matrix to validate";
+    return false;
+  }
   for (int replica = 0; replica < context.n_replicas; ++replica) {
-    for (int state = 0; state < context.n_states; ++state) {
-      const double value = state_observables(state, replica);
-      if (!std::isfinite(value))
-        continue;
-      valid_observable[static_cast<std::size_t>(replica)]
-                      [static_cast<std::size_t>(state)] = 1;
-      dham.set_state_energy(replica, state, value);
-    }
+    auto it_dtraj = context.per_replica_dtrajs.find(replica);
+    auto it_obs = context.per_replica_observables.find(replica);
+    if (it_dtraj == context.per_replica_dtrajs.end() ||
+        it_obs == context.per_replica_observables.end())
+      continue;
+    const auto &dtraj = it_dtraj->second;
+    const auto &obs = it_obs->second;
+    for (std::size_t t = 0; t < dtraj.size() && t < obs.size(); ++t)
+      if (dtraj[t] >= 0 && dtraj[t] < context.n_states && std::isfinite(obs[t]))
+        tram.add_sample(replica, dtraj[t], obs[t]);
   }
 
   Eigen::MatrixXd counts = Eigen::MatrixXd::Zero(context.n_states, context.n_states);
   for (int replica = 0; replica < context.n_replicas; ++replica) {
     auto it_dtraj = context.per_replica_dtrajs.find(replica);
     auto it_time = context.per_replica_timestamps_ps.find(replica);
+    auto it_obs = context.per_replica_observables.find(replica);
     if (it_dtraj == context.per_replica_dtrajs.end() ||
-        it_time == context.per_replica_timestamps_ps.end()) {
+        it_time == context.per_replica_timestamps_ps.end() ||
+        it_obs == context.per_replica_observables.end()) {
       continue;
     }
     const auto &dtraj = it_dtraj->second;
     const auto &times = it_time->second;
+    const auto &obs = it_obs->second;
     if (dtraj.size() <= static_cast<std::size_t>(lag_frames) ||
-        times.size() != dtraj.size()) {
+        times.size() != dtraj.size() || obs.size() != dtraj.size()) {
       continue;
     }
 
     double expected_gap = static_cast<double>(lag_frames);
     if (times.size() > 1) {
-      const double dt = times[1] - times[0];
-      expected_gap = dt * lag_frames;
+      // KIN-19: median positive spacing, as in run_dham_postproc (a repeated
+      // first frame gave dt = 0 and made every transition a break).
+      const double dt = TitanDHAM::median_positive_spacing(times);
+      expected_gap = dt > 0.0 ? dt * lag_frames
+                              : std::numeric_limits<double>::quiet_NaN();
     }
+    if (!std::isfinite(expected_gap))
+      continue; // no increasing timestamps: every transition is a break
 
     for (std::size_t i = 0; i + static_cast<std::size_t>(lag_frames) < dtraj.size();
          ++i) {
-      const double actual_gap = times[i + static_cast<std::size_t>(lag_frames)] -
-                                times[i];
+      const std::size_t j_frame = i + static_cast<std::size_t>(lag_frames);
+      const double actual_gap = times[j_frame] - times[i];
       if (std::abs(actual_gap - expected_gap) >
           0.1 * std::max(1e-12, std::abs(expected_gap))) {
         continue;
       }
       const int state_i = dtraj[i];
-      const int state_j = dtraj[i + static_cast<std::size_t>(lag_frames)];
+      const int state_j = dtraj[j_frame];
       if (state_i < 0 || state_i >= context.n_states || state_j < 0 ||
           state_j >= context.n_states) {
         continue;
       }
-      if (!valid_observable[static_cast<std::size_t>(replica)]
-                           [static_cast<std::size_t>(state_i)] ||
-          !valid_observable[static_cast<std::size_t>(replica)]
-                           [static_cast<std::size_t>(state_j)]) {
+      if (!std::isfinite(obs[i]) || !std::isfinite(obs[j_frame]))
         continue;
-      }
-      dham.accumulate_counts(replica, state_i, state_j);
+      tram.add_transition(replica, state_i, state_j);
       counts(state_i, state_j) += 1.0;
       ++out_transition_count;
     }
@@ -544,12 +552,18 @@ bool build_dham_model_from_context(const DhamRebuildContext &context,
     error_message = "DHAM rebuild context contains no lag-valid transitions";
     return false;
   }
-  if (!dham.solve(context.max_iter, context.tolerance)) {
-    error_message = "DHAM solve() did not converge during validation rebuild";
+  const TitanTram::Report report = tram.solve(context.max_iter, context.tolerance);
+  if (!report.converged) {
+    error_message = "TRAM did not converge during validation rebuild: " + report.message;
     return false;
   }
-  out_tpm = dham.get_unbiased_transition_matrix();
-  out_pi = dham.get_stationary_distribution();
+  out_tpm = tram.transition_matrix(tram.target_ensemble());
+  if (!out_tpm.allFinite()) {
+    error_message = "the target replica has states without transitions at this lag";
+    out_tpm.resize(0, 0);
+    return false;
+  }
+  out_pi = tram.target_stationary();
   if (out_counts)
     *out_counts = counts;
   return true;
@@ -1255,28 +1269,13 @@ std::vector<double> compute_implied_timescales_from_tpm(const Eigen::MatrixXd &t
   if (solver.info() != Eigen::Success)
     return timescales;
 
-  std::vector<double> lambdas;
-  lambdas.reserve(static_cast<std::size_t>(tpm.rows()));
-  for (int i = 0; i < solver.eigenvalues().size(); ++i) {
-    const auto lambda = solver.eigenvalues()[i];
-    if (std::abs(lambda.imag()) > 1e-8)
-      continue;
-    lambdas.push_back(lambda.real());
-  }
-  std::sort(lambdas.begin(), lambdas.end(), std::greater<double>());
-  for (double lambda : lambdas) {
-    if (lambda >= 1.0 - 1e-12 || lambda <= 0.0)
-      continue;
-    const double its = -lag_time_ns / std::log(lambda);
-    if (std::isfinite(its) && its > 0.0)
-      timescales.push_back(its);
-    if (static_cast<int>(timescales.size()) >= n_timescales)
-      break;
-  }
-  while (static_cast<int>(timescales.size()) < n_timescales) {
-    timescales.push_back(std::numeric_limits<double>::quiet_NaN());
-  }
-  return timescales;
+  // KIN-06: the convention of TitanMSM::compute_implied_timescales (the
+  // reference these bootstrap timescales are compared with): rank by |lambda|
+  // after the stationary mode, NaN at its own rank for lambda within 1e-8 of
+  // 1, |lambda| >= 1 or complex lambda. Skipping those (and lambda <= 0, as
+  // before) shifted the later timescales one rank up.
+  return titan_its::implied_timescales(solver.eigenvalues(), lag_time_ns,
+                                       n_timescales, /*pad=*/true);
 }
 
 bool run_msm_bootstrap(const StateSegments &base_segments, int n_states,

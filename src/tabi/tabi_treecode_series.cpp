@@ -1,5 +1,6 @@
 #include "tabi_treecode_internal.h"
 #include "tabi_near.h"
+#include "tabi_radial_taylor.h"
 #include "tabi_node_patch_curved.h"
 
 #include "../titan_executor.h"
@@ -45,14 +46,17 @@ const std::vector<MomentIndex> &moment_indices(int order) {
     }
     return out;
   }();
-  const int clamped = std::clamp(order, 0, kTaylorOrderMax);
-  static thread_local std::vector<MomentIndex> active;
-  active.clear();
-  for (const MomentIndex &index : indices) {
-    if (index.ax + index.ay + index.az <= clamped)
-      active.push_back(index);
-  }
-  return active;
+  // One list per order, built once. The far field asks for it on every
+  // (target, node) pair, so it must not be rebuilt per call.
+  static const auto by_order = [] {
+    std::array<std::vector<MomentIndex>, kTaylorOrderMax + 1> out;
+    for (int p = 0; p <= kTaylorOrderMax; ++p)
+      for (const MomentIndex &index : indices)
+        if (index.ax + index.ay + index.az <= p)
+          out[static_cast<std::size_t>(p)].push_back(index);
+    return out;
+  }();
+  return by_order[static_cast<std::size_t>(std::clamp(order, 0, kTaylorOrderMax))];
 }
 
 double pow_int(double value, int power) noexcept {
@@ -908,6 +912,9 @@ void accumulate_jcp_panel_moments(
     std::array<double, kTaylorMomentMax> *phin_comp,
     std::array<std::array<double, kTaylorMomentMax>, 3> *normal_comp) {
   if (const auto*cell=curved_dual_cell(panel)) {
+    // The curved cell builds its moments only off the FMM route.
+    if(cell->moments.size()!=4)
+      throw std::runtime_error("curved_dual_cell_moments_not_built");
     const double phi=panel_index<unknowns.size()?unknowns[panel_index]:0.0;
     const double phin=coupled&&panel_count+panel_index<unknowns.size()?unknowns[panel_count+panel_index]:0.0;
     const double ox=cell->center[0]-node.cx,oy=cell->center[1]-node.cy,oz=cell->center[2]-node.cz;
@@ -1330,12 +1337,50 @@ MomentAuditSummary audit_jcp_moment_translation(
 
 
 
+// Orders 2-5 with analytic derivatives take the radial-derivative coefficients
+// of tabi_radial_taylor.h: one pass per (target, node) instead of building a
+// truncated power series of every kernel (sixteen per coupled pair). The
+// series functions below remain the reference, the finite-difference debug
+// mode and the path for other orders.
+static bool use_radial_taylor(int order,
+                              const std::string &derivative_mode) noexcept {
+  return derivative_mode != "finite-diff-debug" && order >= 2 &&
+         order <= kTaylorOrderMax;
+}
+
+JcpFarEvaluator make_jcp_far_evaluator(
+    int order, bool coupled, const std::string &derivative_mode) noexcept {
+  JcpFarEvaluator out;
+  out.order = order;
+  out.coupled = coupled;
+  out.derivative_mode = &derivative_mode;
+  if (use_radial_taylor(order, derivative_mode) &&
+      !titan_simd_dispatch::runtime_simd_forced_scalar()) {
+    out.fast = radial_jcp_far_kernel(order, coupled);
+    out.fast4 = radial_jcp_far_kernel4(order, coupled);
+  }
+  return out;
+}
+
 JcpAccum taylor_jcp_node_sum(const Panel &target, const TreeNode &node,
                              const NodeMoments &phin_scalar,
                              const std::array<NodeMoments, 3> &phi_normal,
                              double eps_ratio, double kappa, bool coupled,
                              int order,
                              const std::string &derivative_mode) noexcept {
+  if (use_radial_taylor(order, derivative_mode))
+    return radial_jcp_node_sum(target, node, phin_scalar, phi_normal,
+                               eps_ratio, kappa, coupled, order);
+  return taylor_jcp_node_sum_series(target, node, phin_scalar, phi_normal,
+                                    eps_ratio, kappa, coupled, order,
+                                    derivative_mode);
+}
+
+JcpAccum taylor_jcp_node_sum_series(
+    const Panel &target, const TreeNode &node, const NodeMoments &phin_scalar,
+    const std::array<NodeMoments, 3> &phi_normal, double eps_ratio,
+    double kappa, bool coupled, int order,
+    const std::string &derivative_mode) noexcept {
   JcpAccum acc;
   const double inv_eps_ratio = 1.0 / std::max(1.0e-12, eps_ratio);
   const double poisson_scale = eps_ratio - 1.0;
@@ -1437,6 +1482,19 @@ JcpAccum taylor_jcp_node_sum(const Panel &target, const TreeNode &node,
 }
 
 JcpChannelAccum taylor_jcp_node_channel_sum(
+    const Panel &target, const TreeNode &node, const NodeMoments &phin_scalar,
+    const std::array<NodeMoments, 3> &phi_normal, double eps_ratio,
+    double kappa, bool coupled, int order,
+    const std::string &derivative_mode) noexcept {
+  if (use_radial_taylor(order, derivative_mode))
+    return radial_jcp_node_channel_sum(target, node, phin_scalar, phi_normal,
+                                       eps_ratio, kappa, coupled, order);
+  return taylor_jcp_node_channel_sum_series(target, node, phin_scalar,
+                                            phi_normal, eps_ratio, kappa,
+                                            coupled, order, derivative_mode);
+}
+
+JcpChannelAccum taylor_jcp_node_channel_sum_series(
     const Panel &target, const TreeNode &node, const NodeMoments &phin_scalar,
     const std::array<NodeMoments, 3> &phi_normal, double eps_ratio,
     double kappa, bool coupled, int order,

@@ -47,8 +47,11 @@ struct LagResult {
   std::size_t lag_index{0};
   double lag_time_ps{0.0};
   double rotational_msd_rad2{0.0};
+  // Direction-averaged Legendre correlations of a body vector (see
+  // accumulate_rotation_angle); mean_cos_theta is <cos> of the rotation angle.
   double c1{0.0};
   double c2{0.0};
+  double mean_cos_theta{0.0};
   double orientation_correlation{0.0};
   std::uint64_t samples{0};
   Covariance3 covariance{};

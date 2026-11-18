@@ -16,6 +16,50 @@
 
 namespace {
 
+// Makes each chain of the CA trace whole before the Kabsch fit (STR-24):
+// walking a chain in order, each CA takes the periodic image nearest to the
+// CA placed before it (consecutive CA are 3.8 A apart). A chain split by a
+// box face otherwise gives a meaningless rotation, and every bond vector is
+// rotated by it. The first CA of each chain keeps its image: how the chains
+// of a complex sit together is the job of the PBC treatment (-pbci, -pbcn,
+// -pbctopo), not of a walk from one chain's end to the next chain's start.
+// A trace that needs no image shift is left bit for bit.
+void make_trace_whole(titan::algebra::Matrix3Buffer &trace,
+                      const std::vector<bool> &chain_start,
+                      const box &frame_box) {
+  if (trace.rows() < 2 || !BoxMatrix::valid_box(frame_box))
+    return;
+  const BoxMatrix matrix(frame_box);
+  double carried[3] = {0.0, 0.0, 0.0};
+  for (std::size_t i = 1; i < trace.rows(); ++i) {
+    if (i < chain_start.size() && chain_start[i]) {
+      carried[0] = carried[1] = carried[2] = 0.0;
+      continue;
+    }
+    for (std::size_t c = 0; c < 3; ++c)
+      trace(i, c) += carried[c];
+    const double d[3] = {trace(i, 0) - trace(i - 1, 0),
+                         trace(i, 1) - trace(i - 1, 1),
+                         trace(i, 2) - trace(i - 1, 2)};
+    double n[3];
+    bool moved = false;
+    for (int axis = 0; axis < 3; ++axis) {
+      n[axis] = std::round(matrix.inv[0][axis] * d[0] +
+                           matrix.inv[1][axis] * d[1] +
+                           matrix.inv[2][axis] * d[2]);
+      moved = moved || n[axis] != 0.0;
+    }
+    if (!moved)
+      continue;
+    for (std::size_t c = 0; c < 3; ++c) {
+      const double step = -(matrix.m[0][c] * n[0] + matrix.m[1][c] * n[1] +
+                            matrix.m[2][c] * n[2]);
+      trace(i, c) += step;
+      carried[c] += step;
+    }
+  }
+}
+
 constexpr double kEpsilon = 1.0e-12;
 
 std::string join_output_path(const std::string &base_dir,
@@ -278,10 +322,17 @@ bool TitanS2Analyzer::wants_ca_c() const noexcept {
 
 void TitanS2Analyzer::build_alignment_trace() {
   alignment_atoms_.clear();
+  alignment_chain_start_.clear();
+  const Residue *previous = nullptr;
   for (const Residue &residue : residues_) {
     const auto ca = residue.atom_by_name.find("CA");
-    if (ca != residue.atom_by_name.end())
+    if (ca != residue.atom_by_name.end()) {
       alignment_atoms_.push_back(ca->second);
+      alignment_chain_start_.push_back(
+          previous == nullptr || previous->chainnum != residue.chainnum ||
+          previous->chain != residue.chain);
+      previous = &residue;
+    }
   }
   alignment_reference_matrix_.resize(alignment_atoms_.size());
   alignment_mobile_matrix_.resize(alignment_atoms_.size());
@@ -301,6 +352,8 @@ void TitanS2Analyzer::ensure_alignment_reference(const MOL &frame) {
     alignment_reference_matrix_(i, 1) = frame.pos.y[atom];
     alignment_reference_matrix_(i, 2) = frame.pos.z[atom];
   }
+  make_trace_whole(alignment_reference_matrix_, alignment_chain_start_,
+                   frame.Box);
   titan::algebra::Vec3 centroid{};
   for (std::size_t i = 0; i < alignment_reference_matrix_.rows(); ++i) {
     centroid.x += alignment_reference_matrix_(i, 0);
@@ -331,6 +384,8 @@ void TitanS2Analyzer::append_vectors(const MOL &frame) {
       alignment_mobile_matrix_(i, 1) = frame.pos.y[atom];
       alignment_mobile_matrix_(i, 2) = frame.pos.z[atom];
     }
+    make_trace_whole(alignment_mobile_matrix_, alignment_chain_start_,
+                     frame.Box);
     TitanAlignment::align_frame_inplace(alignment_reference_matrix_.const_view(),
                                         alignment_mobile_matrix_.view(),
                                         alignment_rotation_);
@@ -464,11 +519,22 @@ double TitanS2Analyzer::weighted_fit_r2(
 
 std::vector<TitanS2Analyzer::OrderParameterRow>
 TitanS2Analyzer::compute_order_parameters(TitanExecutor &executor) const {
+  std::vector<std::vector<titan_s2_kernel::CorrelationRow>> correlations;
+  return compute_order_parameters(executor, correlations);
+}
+
+std::vector<TitanS2Analyzer::OrderParameterRow>
+TitanS2Analyzer::compute_order_parameters(
+    TitanExecutor &executor,
+    std::vector<std::vector<titan_s2_kernel::CorrelationRow>> &all_correlations)
+    const {
   std::vector<OrderParameterRow> results(plans_.size());
+  all_correlations.assign(plans_.size(), {});
   const std::size_t maxlag = resolve_maxlag();
   for (std::size_t i = 0; i < plans_.size(); ++i) {
-    const auto correlations = titan_s2_kernel::compute_correlation(
+    all_correlations[i] = titan_s2_kernel::compute_correlation(
         vectors_[i], time_ps_, maxlag, executor);
+    const auto &correlations = all_correlations[i];
     const auto selected_rows = fit_rows(correlations);
     const auto fit = titan_s2_kernel::fit_single_exp_plateau(selected_rows);
     double fit_window_start = std::numeric_limits<double>::quiet_NaN();
@@ -539,17 +605,16 @@ void TitanS2Analyzer::export_order_csv(
   }
 }
 
-void TitanS2Analyzer::export_correlation_dat(const std::string &filename,
-                                             TitanExecutor &executor) const {
+void TitanS2Analyzer::export_correlation_dat(
+    const std::string &filename,
+    const std::vector<std::vector<titan_s2_kernel::CorrelationRow>>
+        &correlations) const {
   std::ofstream out(filename);
   out << "residue chain resnr resname vector_type lag_index lag_time_ps "
          "correlation samples\n";
   out << std::fixed << std::setprecision(8);
-  const std::size_t maxlag = resolve_maxlag();
-  for (std::size_t i = 0; i < plans_.size(); ++i) {
-    const auto rows = titan_s2_kernel::compute_correlation(
-        vectors_[i], time_ps_, maxlag, executor);
-    for (const auto &row : rows)
+  for (std::size_t i = 0; i < plans_.size() && i < correlations.size(); ++i) {
+    for (const auto &row : correlations[i])
       out << residue_label(plans_[i]) << ' ' << plans_[i].chain << ' '
           << plans_[i].resnr << ' ' << plans_[i].resname << ' '
           << plans_[i].kind << ' ' << row.lag_index << ' ' << row.lag_time_ps
@@ -690,6 +755,8 @@ bool TitanS2Analyzer::accumulate_trajectory(
     aggregate.s2.sum += row.s2;
     aggregate.s2.sum_sq += row.s2 * row.s2;
     ++aggregate.s2.count;
+    if (row.used_tail_fallback)
+      ++aggregate.tail_fallback;
     aggregate_plans_.try_emplace(key, plan);
   }
   ++aggregate_trajectories_;
@@ -717,9 +784,11 @@ void TitanS2Analyzer::export_average(const std::string &base_dir,
   std::map<std::string, double> averages;
   {
     std::ofstream out(join_output_path(base_dir, files.average_csv));
+    // tail_fallback_replicates: replicates whose value is the mean of the
+    // correlation tail, not a fitted plateau (MDA-11); they are in the mean
     out << "residue,chain,resnr,resname,vector_type,mean_plateau_C_raw,"
            "sem_plateau_C_raw,mean_S2_clipped,sem_S2_clipped,"
-           "valid_replicates\n";
+           "valid_replicates,tail_fallback_replicates\n";
     out << std::fixed << std::setprecision(8);
     for (const auto &[key, aggregate] : aggregate_results_) {
       const auto plan = aggregate_plans_.find(key);
@@ -731,7 +800,8 @@ void TitanS2Analyzer::export_average(const std::string &base_dir,
       out << residue_label(plan->second) << ',' << plan->second.chain << ','
           << plan->second.resnr << ',' << plan->second.resname << ','
           << plan->second.kind << ',' << raw_mean << ',' << raw_sem << ','
-          << s2_mean << ',' << s2_sem << ',' << aggregate.s2.count << '\n';
+          << s2_mean << ',' << s2_sem << ',' << aggregate.s2.count << ','
+          << aggregate.tail_fallback << '\n';
     }
   }
   {
@@ -752,10 +822,11 @@ void TitanS2Analyzer::finalize_trajectory(
     bool export_average_files, TitanExecutor &executor, std::fstream &log) {
   if (!enabled_)
     return;
-  const auto rows = compute_order_parameters(executor);
+  std::vector<std::vector<titan_s2_kernel::CorrelationRow>> correlations;
+  const auto rows = compute_order_parameters(executor, correlations);
   export_order_csv(join_output_path(base_dir, files.order_csv), rows);
   export_correlation_dat(join_output_path(base_dir, files.correlation_dat),
-                         executor);
+                         correlations);
   export_summary(join_output_path(base_dir, files.summary_dat), rows);
   std::map<std::string, double> trajectory_s2;
   for (const auto &row : rows) {

@@ -48,6 +48,9 @@ public:
                                 nullptr);
 
   void finalize(std::fstream &log);
+  // Non-empty when a BIE frame did not succeed: the run wrote its outputs
+  // but must not report success.
+  [[nodiscard]] std::string failure_summary() const;
 
 private:
   struct Atom {
@@ -1143,6 +1146,8 @@ private:
     std::string tabi_surface_generator{"off"};
     std::string tabi_discretization{"off"};
     std::string tabi_node_patch_representation{"n/a"};
+    std::string tabi_node_patch_normal_source{"n/a"};
+    std::string tabi_node_patch_certificate{"n/a"};
     double tabi_rhs_scale{1.0};
     double tabi_dielectric_contrast{0.0};
     double tabi_operator_contrast{0.0};
@@ -1623,9 +1628,9 @@ private:
     std::string status{"off"};
   };
 
+  // Fine level of the Galerkin V-cycle; the operator itself is in grid_.
   struct MultigridLevel {
     GridShape shape{};
-    GridWorkspace workspace;
     AlignedDoubleVector rhs;
     ChargeDiagnostics charge_diag{};
     BoundaryDiagnostics boundary_diag{};
@@ -1650,19 +1655,6 @@ private:
     std::uint64_t medium_cache_hits{0};
     std::uint64_t medium_cache_misses{0};
     std::uint64_t medium_cache_stores{0};
-  };
-
-  struct NewtonCorrectionLevel {
-    GridShape shape{};
-    AlignedDoubleVector delta;
-    AlignedDoubleVector rhs;
-    AlignedDoubleVector eps_x;
-    AlignedDoubleVector eps_y;
-    AlignedDoubleVector eps_z;
-    AlignedDoubleVector diag;
-    AlignedDoubleVector screen;
-    AlignedDoubleVector base_phi;
-    double max_correction{1.0};
   };
 
   void collect_atoms(const MOL &mol, const Multi_MOL_parameters &params,
@@ -1764,7 +1756,8 @@ private:
                           TitanExecutor &executor);
   BoundaryDiagnostics set_boundary(const GridShape &shape,
                                    const std::vector<Atom> &atoms,
-                                   double eps_out, double kappa);
+                                   double eps_out, double kappa,
+                                   TitanExecutor &executor);
   SolveStats solve_sor(const GridShape &shape, TitanExecutor &executor,
                        int iteration_limit = -1);
   SolveStats solve_sor_half_packed(const GridShape &shape,
@@ -1817,7 +1810,8 @@ private:
                                  double residual_rms, double alpha,
                                  double clip, double screen_scale,
                                  AlignedDoubleVector &delta,
-                                 int max_cycles) const;
+                                 int max_cycles,
+                                 TitanExecutor &executor) const;
   NewtonCorrectionStats
   solve_newton_correction(const GridShape &shape,
                           const AlignedDoubleVector &residual,
@@ -1868,41 +1862,7 @@ private:
                                double eps_out, double kappa,
                                bool physical_rhs, bool physical_boundary,
                                TitanExecutor &executor);
-  void copy_level_to_workspace(const MultigridLevel &level);
-  SolveStats smooth_multigrid_level(MultigridLevel &level, int iterations,
-                                    bool stop_on_convergence) const;
-  double compute_multigrid_residual(const MultigridLevel &level,
-                                    AlignedDoubleVector &residual) const;
-  void restrict_residual_to_coarse(const MultigridLevel &fine,
-                                   const AlignedDoubleVector &fine_residual,
-                                   MultigridLevel &coarse) const;
-  void prolongate_add_correction(const MultigridLevel &coarse,
-                                 MultigridLevel &fine) const;
-  void run_multigrid_vcycle(std::vector<MultigridLevel> &levels,
-                            std::size_t level_index);
-  void prepare_newton_correction_hierarchy(
-      const GridShape &shape, const AlignedDoubleVector &residual,
-      double alpha, double clip, double screen_scale,
-      std::vector<NewtonCorrectionLevel> &levels) const;
-  SolveStats smooth_newton_correction_level(NewtonCorrectionLevel &level,
-                                            int iterations,
-                                            bool stop_on_convergence) const;
-  double compute_newton_correction_level_residual(
-      const NewtonCorrectionLevel &level,
-      AlignedDoubleVector &residual) const;
-  void restrict_newton_correction_residual(
-      const NewtonCorrectionLevel &fine,
-      const AlignedDoubleVector &fine_residual,
-      NewtonCorrectionLevel &coarse) const;
-  void prolongate_add_newton_correction(
-      const NewtonCorrectionLevel &coarse, NewtonCorrectionLevel &fine) const;
-  void run_newton_correction_vcycle(
-      std::vector<NewtonCorrectionLevel> &levels,
-      std::size_t level_index) const;
-  GridShape coarsen_shape(const GridShape &fine) const;
-  [[nodiscard]] int effective_vcycle_levels(const GridShape &fine_shape) const;
-  [[nodiscard]] std::size_t
-  multigrid_memory_bytes(const std::vector<MultigridLevel> &levels) const;
+  [[nodiscard]] int vcycle_level_cap() const;
   ReactionSolve solve_reaction_field(const std::vector<Atom> &atoms,
                                      TitanExecutor &executor,
                                      const FrameResult *map_result);
@@ -2229,6 +2189,9 @@ private:
   std::size_t frames_total_{0};
   std::size_t frames_converged_{0};
   std::size_t frames_failed_{0};
+  // Frames whose energy entered energy_mean_ and friends: every grid frame,
+  // and the BIE frames that have a finite energy.
+  std::size_t energy_frames_{0};
   std::size_t max_grid_points_seen_{0};
   std::size_t max_memory_bytes_seen_{0};
   std::size_t max_tabi_surface_panels_seen_{0};

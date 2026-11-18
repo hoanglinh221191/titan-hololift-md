@@ -76,7 +76,10 @@ void gather_fes_field(const TitanPCA::FES2DResult &fes, AlignedDoubleVector &fie
   for (size_t idx = 0; idx < fes.bins.size(); ++idx) {
     const auto &bin = fes.bins[idx];
     const bool visited = (bin.count_w > 0.0 || bin.count > 0);
-    field[idx] = bin.free_energy;
+    // KIN-11: the FES holds NaN in empty bins; the string method keeps its
+    // 20 kJ/mol wall there, as before
+    field[idx] = std::isfinite(bin.free_energy) ? bin.free_energy
+                                                : kDefaultFreeEnergy;
     visited_mask[idx] = visited ? 1 : 0;
   }
 }

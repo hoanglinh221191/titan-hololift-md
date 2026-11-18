@@ -7,6 +7,7 @@
 #include <array>
 #include <cctype>
 #include <cstddef>
+#include <cstdlib>
 #include <iterator>
 #include <limits>
 #include <sstream>
@@ -46,6 +47,36 @@ inline std::string &active_option_token() {
 inline constexpr int kNoArgumentFile = 1;
 inline constexpr int kHandledAndExit = 2;
 inline constexpr int kInvalidArguments = 3;
+
+// CLI-02 (22/10/2026): a non-negative integer option value (counts, seeds,
+// group numbers). std::stoull alone reads "-5" as 2^64 - 5 and reports
+// garbage as a bare "stoull" exception; this names the flag and refuses both.
+[[nodiscard]] inline unsigned long long
+parse_unsigned_option(const std::string &value, const char *flag_name,
+                      unsigned long long max_value =
+                          std::numeric_limits<unsigned long long>::max()) {
+  bool ok = !value.empty() &&
+            std::all_of(value.begin(), value.end(), [](unsigned char c) {
+              return std::isdigit(c) != 0;
+            });
+  unsigned long long parsed = 0;
+  if (ok) {
+    try {
+      parsed = std::stoull(value);
+    } catch (...) {
+      ok = false;
+    }
+  }
+  if (!ok || parsed > max_value) {
+    TitanUI::print_error(std::string(flag_name) +
+                         " must be a non-negative integer" +
+                         (ok ? " <= " + std::to_string(max_value)
+                             : std::string()) +
+                         " (got '" + value + "').");
+    std::exit(EXIT_FAILURE);
+  }
+  return parsed;
+}
 
 enum class DiagnosticSeverity { warning, error };
 

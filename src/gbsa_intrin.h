@@ -155,6 +155,34 @@ void cal_effective_born_radii_parallel_avx2(
     double rgbmax_angstrom = std::numeric_limits<double>::infinity(),
     double nsr6_spacing = 0.5);
 
+// The free radius of an atom integrates over its own molecule; the complex
+// radius continues that same sum over the partner's atoms in index order.
+// The two functions below therefore return, bit for bit, what separate free
+// and complex cal_effective_born_radii_*() calls return, while integrating
+// each molecule's own pairs once instead of twice.
+//
+// Free and complex radii of `mol` over [begin, end), with `env_mol` as the
+// partner. GBNSR6 (igb 66) falls back to the two separate calls.
+void cal_free_and_complex_born_radii_avx2(
+    const MOL &mol, const AlignedDoubleVector &vdw_radii,
+    const std::vector<mol_info> &atom_info, AlignedDoubleVector &free_radii,
+    AlignedDoubleVector &complex_radii, int igb, size_t begin, size_t end,
+    const MOL &env_mol, const AlignedDoubleVector &env_vdw_radii,
+    const std::vector<mol_info> &env_atom_info,
+    double rgbmax_angstrom = std::numeric_limits<double>::infinity(),
+    double nsr6_spacing = 0.5);
+
+// All four binding endpoints at once. Not for GBNSR6, whose radii come from
+// calculate_gbnsr6_binding_radii().
+void cal_binding_born_radii_parallel_avx2(
+    const MOL &rec, const AlignedDoubleVector &rec_vdw_radii,
+    const std::vector<mol_info> &rec_info, const MOL &lg,
+    const AlignedDoubleVector &lg_vdw_radii,
+    const std::vector<mol_info> &lg_info, int igb, TitanExecutor &executor,
+    double rgbmax_angstrom, AlignedDoubleVector &rec_free_radii,
+    AlignedDoubleVector &lg_free_radii, AlignedDoubleVector &rec_complex_radii,
+    AlignedDoubleVector &lg_complex_radii);
+
 int cal_energy_gbsa_avx2(
     const MOL &rec, const MOL &lg, const std::vector<mol_info> &info_rec,
     const std::vector<mol_info> &info_lg, cache_sigma_epsilon &CachedData,
@@ -172,7 +200,10 @@ int cal_energy_gbsa_avx2(
     const AlignedDoubleVector &lg_complex_radii, GBSA_Aggregator *aggregator,
     const GBSASasaCache *sasa_cache = nullptr,
     bool write_pair_cache = true, bool include_rec_onebody = true,
-    bool include_lig_onebody = true);
+    bool include_lig_onebody = true,
+    // ENE-22: topology exclusions/listed pairs between the groups, by local
+    // index; ignored unless the sizes match rec and lg.
+    const titan_gbsa::TopologyPairs *topology_pairs = nullptr);
 
 #endif // __AVX__
 

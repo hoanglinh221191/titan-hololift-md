@@ -593,7 +593,7 @@ bool better_component_graph_edge(const PbctopoGraphEdge &lhs,
 static PbctopoPairShiftScore score_component_pair_shift(
     const PbctopoShiftedComponent &lhs, const PbctopoShiftedComponent &rhs,
     const PbctopoShift &shift, double hard_cutoff, double contact_cutoff,
-    const vector<PbctopoAtom> &atoms,
+    const vector<PbctopoAtom> &atoms, bool soft_overlap,
     PbctopoTimingStats *timing) {
   PbctopoPairShiftScore score;
   score.shift_index = shift.shift_index;
@@ -653,7 +653,9 @@ static PbctopoPairShiftScore score_component_pair_shift(
               }
               if (d2 <= contact_cutoff2)
                 ++score.contact_pairs;
-              if (lhs_atom_idx < atoms.size() &&
+              // Under the report steric policy overlaps do not rank shifts:
+              // an overlap at this image is in the input for every placement.
+              if (soft_overlap && lhs_atom_idx < atoms.size() &&
                   rhs_atom_idx < atoms.size()) {
                 score.soft_penalty += pbctopo_pair_soft_overlap_penalty(
                     d2, atoms[lhs_atom_idx], atoms[rhs_atom_idx], hard_cutoff);
@@ -1255,7 +1257,7 @@ vector<PbctopoGraphEdge> build_component_graph_edge_candidates(
                 shifted_components.materialize(lhs, identity_shift_pos),
                 shifted_components.materialize(rhs, shift_idx), shift,
                 cutoffs.clash_cutoff, cutoffs.pair_contact_cutoff, atoms,
-                timing);
+                cutoffs.steric_filter, timing);
           }
           accept_score(shift_idx, score);
         }
@@ -1294,7 +1296,7 @@ vector<PbctopoGraphEdge> build_component_graph_edge_candidates(
                 shifted_components.materialize(lhs, identity_shift_pos),
                 shifted_components.materialize(rhs, shift_idx), shift,
                 cutoffs.clash_cutoff, cutoffs.pair_contact_cutoff, atoms,
-                timing);
+                cutoffs.steric_filter, timing);
           }
           accept_score(shift_idx, score);
         }

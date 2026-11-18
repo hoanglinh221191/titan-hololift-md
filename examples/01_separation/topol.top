@@ -1,0 +1,10 @@
+; Two amyloid-beta(1-42) chains of the peptide-pair frames (CHARMM36m), water and ions removed.
+#include "topol_Protein_chain_A.itp"
+#include "topol_Protein_chain_A2.itp"
+
+[ system ]
+peptide pair
+
+[ molecules ]
+Protein_chain_A     1
+Protein_chain_A2    1

@@ -57,6 +57,7 @@ public:
     double randomized_svd_seconds = 0.0;
     double reduced_solve_replay_seconds = 0.0;
     double reduced_eigensolve_seconds = 0.0;
+    double dense_eigensolve_seconds = 0.0; // KIN-25: D x D generalized solve
     double projection_replay_seconds = 0.0;
 
     int64_t cache_write_frames = 0;
@@ -149,6 +150,10 @@ public:
   bool is_solved() const { return solved_; }
   int retained_components() const { return retained_components_; }
   int randomized_rank() const { return randomized_rank_; }
+  // KIN-08/X-06: seed of the randomized backend's Gaussian sketch (-msm-seed;
+  // 42 when not set). It was a hard-coded 12345.
+  void set_random_seed(std::uint64_t seed) { random_seed_ = seed; }
+  std::uint64_t random_seed() const { return random_seed_; }
   TicaBackend backend() const { return backend_; }
   TicaBackend requested_backend() const { return requested_backend_; }
   int64_t raw_feature_cache_rows() const { return frame_cache_.rows(); }
@@ -169,6 +174,7 @@ private:
   TicaBackend requested_backend_;
   TicaBackend backend_;
   int randomized_rank_;
+  std::uint64_t random_seed_ = 42;
   int retained_components_ = 0;
   size_t hard_memory_cap_bytes_ = 0;
   bool enforce_hard_memory_cap_ = false;
@@ -216,7 +222,9 @@ private:
                                  const std::string &label);
 
   Eigen::MatrixXd build_exact_dual_basis_();
+  Eigen::MatrixXd build_spool_dual_basis_();
   Eigen::MatrixXd build_randomized_basis_();
+  void apply_eigenvector_sign_convention_();
 };
 
 #endif // TITAN_KINETICS_H

@@ -1,5 +1,9 @@
 #include "gbsa_intrin.h"
+#include "gbsa/gb_intramolecular_delta.h"
+#include "gbsa/gb_topology_pairs.h"
 #include "charmm_nonbonded.h"
+#include "gromos_nonbonded.h"
+#include "titan_lj_pair_override.h"
 #include "titan_electrostatics.h"
 #include "titan_gb_model.h"
 #include "titan_gbn2.h"
@@ -7,6 +11,7 @@
 #include "titan_interaction_entropy.h"
 #include "titan_executor.h"
 #include "titan_simd_dispatch.h"
+#include "titan_avx2_math.h"
 #include "titan_sasa.h"
 #include "titan_ui.h"
 #include <algorithm>
@@ -19,11 +24,12 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <set>
 #include <span>
+#include <tuple>
 #include <sstream>
 
 #ifdef __AVX__
-#include "avx_math.h"
 #include <immintrin.h>
 
 static inline __m256d charmm_lj_energy_gbsa_avx(__m256d sigma_vec,
@@ -97,11 +103,27 @@ public:
     element_.resize(count_);
     for (size_t atom = 0; atom < count_; ++atom)
       element_[atom] = gb_element(atom_info[atom]);
+    // ENE-17(d) (22/10/2026): residues carrying an OXT, found once; igb 8
+    // used to rescan every atom for each backbone O (O(N_res * N)).
+    std::set<std::tuple<size_t, size_t, std::string>> with_oxt;
+    for (const auto &other : atom_info)
+      if (other.get_atom() == "OXT")
+        with_oxt.emplace(other.get_resnr(), other.get_chainnum(), other.get_chain());
+    residue_has_oxt_.resize(atom_info.size(), 0);
+    if (!with_oxt.empty())
+      for (size_t atom = 0; atom < atom_info.size(); ++atom)
+        residue_has_oxt_[atom] = with_oxt.contains({atom_info[atom].get_resnr(),
+                                                    atom_info[atom].get_chainnum(),
+                                                    atom_info[atom].get_chain()});
     build_grid(mol);
   }
 
   char element(size_t atom) const {
     return atom < count_ ? element_[atom] : '\0';
+  }
+
+  bool residue_has_oxt(size_t atom) const {
+    return atom < residue_has_oxt_.size() && residue_has_oxt_[atom] != 0;
   }
 
   char nearest_heavy_element(const MOL &mol, size_t atom_index) const {
@@ -244,6 +266,7 @@ private:
 
   size_t count_{0};
   std::vector<char> element_;
+  std::vector<char> residue_has_oxt_;
   std::vector<size_t> heavy_;
   std::vector<size_t> cell_start_;
   std::vector<size_t> cell_items_;
@@ -294,13 +317,8 @@ double gb_intrinsic_radius_angstrom(const MOL &mol,
          (res == "GLU" && name.starts_with("OE")) ||
          name == "OXT" || name == "OT1" || name == "OT2" ||
          a.get_atom_type() == "O2")) return 1.4;
-    if (element == 'O' && name == "O") {
-      for (const auto &other : atom_info)
-        if (other.get_resnr() == a.get_resnr() &&
-            other.get_chainnum() == a.get_chainnum() && other.get_chain() == a.get_chain() &&
-            other.get_atom() == "OXT")
-          return 1.4;
-    }
+    if (element == 'O' && name == "O" && index.residue_has_oxt(atom_index))
+      return 1.4;
     if (element == 'H' && res == "ARG" &&
         (name.starts_with("HH") || name.starts_with("HE"))) return 1.17;
   }
@@ -325,12 +343,24 @@ double gb_intrinsic_radius_angstrom(const MOL &mol,
   return partner == 'N' ? 1.30 : 1.20;
 }
 
+// CAS marks deleted side-chain atoms with this exact radius (A). They keep a
+// slot in the arrays but take no part in descreening or surface area, so the
+// mutant behaves as if they were absent. (The ALPB size weights atoms by r^3,
+// where the sentinel is already negligible.)
+bool is_cas_deleted_radius(double radius) {
+  return std::abs(radius - 0.001) <= 1.0e-9;
+}
+
 struct GbAtomParameters {
   std::vector<double> intrinsic_radius_a;
   std::vector<double> offset_radius_a;
   std::vector<double> scaled_radius_a;
   std::vector<titan_gb::Gbn2Parameters> gbn2;
   std::vector<bool> active;
+  std::vector<double> active_mask; // 1 for active, 0 for CAS-deleted atoms
+  // GBn2 neck table index of the intrinsic radius, lround((r - 1) * 20), or
+  // -1 when r is outside [1, 2] A (titan_gb::gbn2_neck_integral gives NaN).
+  std::vector<long long> neck_index;
 };
 
 GbAtomParameters build_gb_atom_parameters(
@@ -342,6 +372,8 @@ GbAtomParameters build_gb_atom_parameters(
   result.scaled_radius_a.resize(mol.size());
   result.gbn2.resize(mol.size());
   result.active.resize(mol.size());
+  result.active_mask.resize(mol.size());
+  result.neck_index.resize(mol.size());
   const GbGeometryIndex index(mol, atom_info);
   for (size_t atom = 0; atom < mol.size(); ++atom) {
     const double intrinsic =
@@ -350,14 +382,18 @@ GbAtomParameters build_gb_atom_parameters(
                                                : titan_gb::kDielectricOffsetAngstrom);
     result.intrinsic_radius_a[atom] = intrinsic;
     result.offset_radius_a[atom] = offset;
+    result.neck_index[atom] =
+        std::isfinite(intrinsic) && intrinsic >= 1.0 && intrinsic <= 2.0
+            ? std::lround((intrinsic - 1.0) * 20.0)
+            : -1;
 
-    // CAS marks deleted side-chain atoms with the exact 0.001 A sentinel.
-    // They retain a finite target Born radius but must not descreen neighbours.
-    const bool inactive =
-        atom < input_vdw_radii.size() &&
-        std::abs(input_vdw_radii[atom] - 0.001) <= 1.0e-9;
+    // CAS-deleted atoms retain a finite target Born radius but must not
+    // descreen neighbours.
+    const bool inactive = atom < input_vdw_radii.size() &&
+                          is_cas_deleted_radius(input_vdw_radii[atom]);
     const char element = index.element(atom);
     result.active[atom] = !inactive;
+    result.active_mask[atom] = inactive ? 0.0 : 1.0;
     result.gbn2[atom] = titan_gb::gbn2_parameters(element,
         atom < atom_info.size() && titan_gb::gbn2_nucleic_residue(atom_info[atom].get_res_name()));
     result.scaled_radius_a[atom] =
@@ -368,11 +404,298 @@ GbAtomParameters build_gb_atom_parameters(
   return result;
 }
 
+#if TITAN_SIMD_X86
+// The shell integral of titan_gb::hct_pair_integral_inverse_angstrom for the
+// lanes in `act`, whose r and s are valid (other lanes hold 1). Sets
+// `contributes` to the lanes with a non-empty shell; the result means
+// something only there (the scalar function returns 0 for the others).
+TITAN_TARGET_AVX2
+inline __m256d hct_shell_avx2(__m256d r, __m256d s_safe, __m256d act,
+                              __m256d rho_v, __m256d inv_rho,
+                              __m256d rgbmax_v, bool cutoff_active,
+                              __m256d &contributes) noexcept {
+  const __m256d one = _mm256_set1_pd(1.0);
+  const __m256d quarter = _mm256_set1_pd(0.25);
+  const __m256d half = _mm256_set1_pd(0.5);
+  const __m256d sign = _mm256_set1_pd(-0.0);
+  __m256d upper = _mm256_add_pd(r, s_safe);
+  if (cutoff_active)
+    upper = _mm256_blendv_pd(
+        upper, rgbmax_v, _mm256_cmp_pd(upper, rgbmax_v, _CMP_GT_OQ));
+  const __m256d lower = _mm256_max_pd(
+      rho_v, _mm256_andnot_pd(sign, _mm256_sub_pd(r, s_safe)));
+  contributes = _mm256_and_pd(
+      act, _mm256_and_pd(_mm256_cmp_pd(rho_v, upper, _CMP_LT_OQ),
+                         _mm256_cmp_pd(lower, upper, _CMP_LT_OQ)));
+  if (_mm256_movemask_pd(contributes) == 0)
+    return _mm256_setzero_pd();
+  const __m256d L = _mm256_blendv_pd(one, lower, contributes);
+  const __m256d U = _mm256_blendv_pd(one, upper, contributes);
+  const __m256d inv_r = _mm256_div_pd(one, r);
+  const __m256d lower_inv = _mm256_div_pd(one, L);
+  const __m256d upper_inv = _mm256_div_pd(one, U);
+  const __m256d lower_inv2 = _mm256_mul_pd(lower_inv, lower_inv);
+  const __m256d upper_inv2 = _mm256_mul_pd(upper_inv, upper_inv);
+  const __m256d log_term =
+      titan_avx2::log_pd(_mm256_mul_pd(upper_inv, L));
+  __m256d term = _mm256_sub_pd(lower_inv, upper_inv);
+  term = _mm256_add_pd(
+      term, _mm256_mul_pd(_mm256_mul_pd(quarter, r),
+                          _mm256_sub_pd(upper_inv2, lower_inv2)));
+  term = _mm256_add_pd(term,
+                       _mm256_mul_pd(_mm256_mul_pd(half, inv_r), log_term));
+  term = _mm256_add_pd(
+      term,
+      _mm256_mul_pd(
+          _mm256_mul_pd(_mm256_mul_pd(quarter, _mm256_mul_pd(s_safe, s_safe)),
+                        inv_r),
+          _mm256_sub_pd(lower_inv2, upper_inv2)));
+  // Target atom completely inside the source: Ponder's correction.
+  const __m256d inside =
+      _mm256_cmp_pd(rho_v, _mm256_sub_pd(s_safe, r), _CMP_LT_OQ);
+  term = _mm256_add_pd(
+      term, _mm256_and_pd(inside, _mm256_mul_pd(_mm256_set1_pd(2.0),
+                                                _mm256_sub_pd(inv_rho,
+                                                              lower_inv))));
+  return _mm256_mul_pd(half, term);
+}
+
+// HCT descreening of one target atom by sources [0, count) of one molecule,
+// four at a time, added into four lane sums. Each lane follows
+// titan_gb::hct_pair_integral_inverse_angstrom: masks stand for its
+// branches (self pair, CAS-deleted source, rgbmax reach, U <= rho, L >= U,
+// target inside the source) and the accurate AVX2 log replaces std::log.
+// Returns the first source index left to the scalar loop (a multiple of 4),
+// or SIZE_MAX when a lane meets a pair the scalar code rejects, in which case
+// the atom's radius is NaN.
+TITAN_TARGET_AVX2
+size_t hct_sources_avx2(double xi, double yi, double zi, double rho,
+                        const double *x, const double *y, const double *z,
+                        const double *scaled, const double *active,
+                        size_t count, size_t self, double rgbmax,
+                        bool cutoff_active, double *lanes) noexcept {
+  const __m256d one = _mm256_set1_pd(1.0);
+  const __m256d zero = _mm256_setzero_pd();
+  const __m256d infinity =
+      _mm256_set1_pd(std::numeric_limits<double>::infinity());
+  const __m256d xi_v = _mm256_set1_pd(xi);
+  const __m256d yi_v = _mm256_set1_pd(yi);
+  const __m256d zi_v = _mm256_set1_pd(zi);
+  const __m256d rho_v = _mm256_set1_pd(rho);
+  const __m256d inv_rho = _mm256_set1_pd(1.0 / rho);
+  const __m256d rgbmax_v = _mm256_set1_pd(rgbmax);
+  const __m256d sign = _mm256_set1_pd(-0.0);
+  const __m256i lane_index = _mm256_set_epi64x(3, 2, 1, 0);
+  const __m256i self_v = _mm256_set1_epi64x(static_cast<long long>(self));
+  __m256d sum = _mm256_load_pd(lanes);
+  const size_t vector_end = count & ~static_cast<size_t>(3);
+  for (size_t j = 0; j < vector_end; j += 4) {
+    const __m256d dx = _mm256_sub_pd(xi_v, _mm256_loadu_pd(x + j));
+    const __m256d dy = _mm256_sub_pd(yi_v, _mm256_loadu_pd(y + j));
+    const __m256d dz = _mm256_sub_pd(zi_v, _mm256_loadu_pd(z + j));
+    const __m256d d2 = _mm256_add_pd(
+        _mm256_add_pd(_mm256_mul_pd(dx, dx), _mm256_mul_pd(dy, dy)),
+        _mm256_mul_pd(dz, dz));
+    const __m256i index = _mm256_add_epi64(
+        _mm256_set1_epi64x(static_cast<long long>(j)), lane_index);
+    const __m256d not_self = _mm256_castsi256_pd(_mm256_xor_si256(
+        _mm256_cmpeq_epi64(index, self_v), _mm256_set1_epi64x(-1)));
+    __m256d act = _mm256_and_pd(
+        not_self, _mm256_cmp_pd(_mm256_loadu_pd(active + j), zero,
+                                _CMP_NEQ_UQ));
+    if (_mm256_movemask_pd(act) == 0)
+      continue;
+    const __m256d s = _mm256_loadu_pd(scaled + j);
+    // As in the scalar loop: a non-finite or zero distance to any active
+    // source is rejected before the cutoff, a non-positive or non-finite
+    // descreening radius only for a pair the integral actually evaluates.
+    const __m256d good_distance =
+        _mm256_and_pd(_mm256_cmp_pd(d2, zero, _CMP_GT_OQ),
+                      _mm256_cmp_pd(d2, infinity, _CMP_LT_OQ));
+    if (_mm256_movemask_pd(_mm256_andnot_pd(good_distance, act)) != 0)
+      return static_cast<size_t>(-1);
+    if (cutoff_active) {
+      const __m256d reach = _mm256_add_pd(rgbmax_v, s);
+      act = _mm256_and_pd(
+          act, _mm256_cmp_pd(d2, _mm256_mul_pd(reach, reach), _CMP_LT_OQ));
+    }
+    const __m256d good_radius =
+        _mm256_and_pd(_mm256_cmp_pd(s, zero, _CMP_GT_OQ),
+                      _mm256_cmp_pd(s, infinity, _CMP_LT_OQ));
+    if (_mm256_movemask_pd(_mm256_andnot_pd(good_radius, act)) != 0)
+      return static_cast<size_t>(-1);
+    const __m256d r = _mm256_sqrt_pd(_mm256_blendv_pd(one, d2, act));
+    const __m256d s_safe = _mm256_blendv_pd(one, s, act);
+    __m256d contributes;
+    const __m256d contribution = hct_shell_avx2(
+        r, s_safe, act, rho_v, inv_rho, rgbmax_v, cutoff_active, contributes);
+    if (_mm256_movemask_pd(contributes) == 0)
+      continue;
+    const __m256d finite = _mm256_cmp_pd(_mm256_andnot_pd(sign, contribution),
+                                         infinity, _CMP_LT_OQ);
+    if (_mm256_movemask_pd(_mm256_andnot_pd(finite, contributes)) != 0)
+      return static_cast<size_t>(-1);
+    sum = _mm256_add_pd(sum, _mm256_and_pd(contributes, contribution));
+  }
+  _mm256_store_pd(lanes, sum);
+  return vector_end;
+}
+
+// GBn2 (igb 8) descreening of one target atom, as hct_sources_avx2 and with
+// the scalar loop's choices per lane: Amber's far-field series where
+// r > 4 s and the shell stays inside the cutoff (this also covers sulfur's
+// negative s), the HCT shell integral otherwise, and the neck term of
+// titan_gb::gbn2_neck_integral on every pair inside the cutoff. ri and
+// target_neck are the target's intrinsic radius and neck index, rj and
+// neck_index the sources' (-1 = outside [1, 2] A, a NaN neck term).
+TITAN_TARGET_AVX2
+size_t gbn2_sources_avx2(double xi, double yi, double zi, double rho,
+                         double ri, long long target_neck, const double *x,
+                         const double *y, const double *z,
+                         const double *scaled, const double *active,
+                         const double *rj, const long long *neck_index,
+                         size_t count, size_t self, double rgbmax,
+                         bool cutoff_active, double *lanes) noexcept {
+  const __m256d one = _mm256_set1_pd(1.0);
+  const __m256d zero = _mm256_setzero_pd();
+  const __m256d infinity =
+      _mm256_set1_pd(std::numeric_limits<double>::infinity());
+  const __m256d xi_v = _mm256_set1_pd(xi);
+  const __m256d yi_v = _mm256_set1_pd(yi);
+  const __m256d zi_v = _mm256_set1_pd(zi);
+  const __m256d rho_v = _mm256_set1_pd(rho);
+  const __m256d inv_rho = _mm256_set1_pd(1.0 / rho);
+  const __m256d rgbmax_v = _mm256_set1_pd(rgbmax);
+  const __m256d ri_v = _mm256_set1_pd(ri);
+  const __m256d sign = _mm256_set1_pd(-0.0);
+  const __m256i lane_index = _mm256_set_epi64x(3, 2, 1, 0);
+  const __m256i self_v = _mm256_set1_epi64x(static_cast<long long>(self));
+  const double *d0 = titan_gb::neck_d0.data();
+  const double *m0 = titan_gb::neck_m0.data();
+  __m256d sum = _mm256_load_pd(lanes);
+  const size_t vector_end = count & ~static_cast<size_t>(3);
+  for (size_t j = 0; j < vector_end; j += 4) {
+    const __m256d dx = _mm256_sub_pd(xi_v, _mm256_loadu_pd(x + j));
+    const __m256d dy = _mm256_sub_pd(yi_v, _mm256_loadu_pd(y + j));
+    const __m256d dz = _mm256_sub_pd(zi_v, _mm256_loadu_pd(z + j));
+    const __m256d d2 = _mm256_add_pd(
+        _mm256_add_pd(_mm256_mul_pd(dx, dx), _mm256_mul_pd(dy, dy)),
+        _mm256_mul_pd(dz, dz));
+    const __m256i index = _mm256_add_epi64(
+        _mm256_set1_epi64x(static_cast<long long>(j)), lane_index);
+    const __m256d not_self = _mm256_castsi256_pd(_mm256_xor_si256(
+        _mm256_cmpeq_epi64(index, self_v), _mm256_set1_epi64x(-1)));
+    __m256d act = _mm256_and_pd(
+        not_self, _mm256_cmp_pd(_mm256_loadu_pd(active + j), zero,
+                                _CMP_NEQ_UQ));
+    if (_mm256_movemask_pd(act) == 0)
+      continue;
+    const __m256d s = _mm256_loadu_pd(scaled + j);
+    const __m256d good_distance =
+        _mm256_and_pd(_mm256_cmp_pd(d2, zero, _CMP_GT_OQ),
+                      _mm256_cmp_pd(d2, infinity, _CMP_LT_OQ));
+    if (_mm256_movemask_pd(_mm256_andnot_pd(good_distance, act)) != 0)
+      return static_cast<size_t>(-1);
+    if (cutoff_active) {
+      const __m256d reach = _mm256_add_pd(rgbmax_v, s);
+      act = _mm256_and_pd(
+          act, _mm256_cmp_pd(d2, _mm256_mul_pd(reach, reach), _CMP_LT_OQ));
+    }
+    const int act_bits = _mm256_movemask_pd(act);
+    if (act_bits == 0)
+      continue;
+    // Every pair inside the cutoff takes a neck term: an out-of-table
+    // radius on either side makes it NaN, and the atom's radius with it.
+    const long long neck[4] = {neck_index[j], neck_index[j + 1],
+                               neck_index[j + 2], neck_index[j + 3]};
+    bool neck_ok = target_neck >= 0;
+    for (int lane = 0; lane < 4; ++lane)
+      if ((act_bits >> lane) & 1)
+        neck_ok = neck_ok && neck[lane] >= 0;
+    if (!neck_ok)
+      return static_cast<size_t>(-1);
+
+    const __m256d r = _mm256_sqrt_pd(_mm256_blendv_pd(one, d2, act));
+    const __m256d s_safe = _mm256_blendv_pd(one, s, act);
+    __m256d far = _mm256_and_pd(
+        act, _mm256_cmp_pd(r, _mm256_mul_pd(_mm256_set1_pd(4.0), s_safe),
+                           _CMP_GT_OQ));
+    if (cutoff_active)
+      far = _mm256_and_pd(far, _mm256_cmp_pd(r, _mm256_sub_pd(rgbmax_v, s_safe),
+                                             _CMP_LE_OQ));
+    const __m256d shell = _mm256_andnot_pd(far, act);
+    __m256d base = zero;
+    if (_mm256_movemask_pd(shell) != 0) {
+      // The shell integral rejects a non-positive or non-finite radius.
+      const __m256d good_radius =
+          _mm256_and_pd(_mm256_cmp_pd(s, zero, _CMP_GT_OQ),
+                        _mm256_cmp_pd(s, infinity, _CMP_LT_OQ));
+      if (_mm256_movemask_pd(_mm256_andnot_pd(good_radius, shell)) != 0)
+        return static_cast<size_t>(-1);
+      __m256d contributes;
+      const __m256d value =
+          hct_shell_avx2(r, _mm256_blendv_pd(one, s, shell), shell, rho_v,
+                         inv_rho, rgbmax_v, cutoff_active, contributes);
+      base = _mm256_and_pd(contributes, value);
+    }
+    if (_mm256_movemask_pd(far) != 0) {
+      // titan_gb::gbn2_far_integral, in its operation order.
+      const __m256d q = _mm256_div_pd(s_safe, r);
+      const __m256d u = _mm256_mul_pd(q, q);
+      __m256d series = _mm256_div_pd(_mm256_mul_pd(u, _mm256_set1_pd(5.0)),
+                                     _mm256_set1_pd(11.0));
+      series = _mm256_mul_pd(u, _mm256_add_pd(_mm256_set1_pd(4. / 9.), series));
+      series = _mm256_mul_pd(u, _mm256_add_pd(_mm256_set1_pd(3. / 7.), series));
+      series = _mm256_mul_pd(u, _mm256_add_pd(_mm256_set1_pd(2. / 5.), series));
+      series = _mm256_add_pd(_mm256_set1_pd(1. / 3.), series);
+      const __m256d value = _mm256_mul_pd(
+          _mm256_div_pd(_mm256_mul_pd(u, s_safe), _mm256_mul_pd(r, r)),
+          series);
+      base = _mm256_blendv_pd(base, value, far);
+    }
+    // titan_gb::gbn2_neck_integral, nearest table entry, zero beyond
+    // ri + rj + 6.8.
+    const auto entry = [&](const double *table, int lane) {
+      return ((act_bits >> lane) & 1) ? table[neck[lane] * 21 + target_neck]
+                                      : 1.0;
+    };
+    const __m256d d0_v = _mm256_set_pd(entry(d0, 3), entry(d0, 2),
+                                       entry(d0, 1), entry(d0, 0));
+    const __m256d m0_v = _mm256_set_pd(entry(m0, 3), entry(m0, 2),
+                                       entry(m0, 1), entry(m0, 0));
+    const __m256d reach = _mm256_add_pd(
+        _mm256_add_pd(ri_v, _mm256_loadu_pd(rj + j)), _mm256_set1_pd(6.8));
+    const __m256d d = _mm256_sub_pd(r, d0_v);
+    const __m256d dd = _mm256_mul_pd(d, d);
+    const __m256d neck_value = _mm256_div_pd(
+        _mm256_mul_pd(_mm256_set1_pd(.826836), m0_v),
+        _mm256_add_pd(
+            _mm256_add_pd(one, dd),
+            _mm256_mul_pd(_mm256_mul_pd(_mm256_mul_pd(_mm256_set1_pd(.3), dd),
+                                        dd),
+                          dd)));
+    const __m256d contribution = _mm256_add_pd(
+        base,
+        _mm256_and_pd(_mm256_cmp_pd(r, reach, _CMP_LT_OQ), neck_value));
+    const __m256d finite = _mm256_cmp_pd(_mm256_andnot_pd(sign, contribution),
+                                         infinity, _CMP_LT_OQ);
+    if (_mm256_movemask_pd(_mm256_andnot_pd(finite, act)) != 0)
+      return static_cast<size_t>(-1);
+    sum = _mm256_add_pd(sum, _mm256_and_pd(act, contribution));
+  }
+  _mm256_store_pd(lanes, sum);
+  return vector_end;
+}
+#endif
+
+// free_radii, when given, receives each atom's radius from its own molecule
+// alone: that integral is exactly the complex one before the environment's
+// sources are added, so one pass over the molecule's own pairs yields both.
 void calculate_born_radius_range(
     const MOL &mol, const GbAtomParameters &primary,
     AlignedDoubleVector &radii, int igb, size_t begin, size_t end,
     const MOL *env_mol, const GbAtomParameters *environment,
-    double rgbmax_angstrom) {
+    double rgbmax_angstrom, AlignedDoubleVector *free_radii = nullptr) {
   // A pair farther than rgbmax + s_j contributes exactly zero, so it can be
   // rejected on squared distances before paying for the sqrt and the log in
   // the pair integral. Atoms are still visited in ascending index order, which
@@ -380,14 +703,60 @@ void calculate_born_radius_range(
   // uncut loop for every pair that does contribute.
   const bool cutoff_active = rgbmax_angstrom > 0.0 &&
                              std::isfinite(rgbmax_angstrom);
+  const auto radius_nm = [&](size_t i, bool valid, double integral) {
+    const double born_a =
+        valid ? (igb == 8 ? titan_gb::gbn2_born_radius(
+                    primary.intrinsic_radius_a[i], integral, primary.gbn2[i])
+                         : titan_gb::born_radius_angstrom(
+                    primary.intrinsic_radius_a[i], integral, igb))
+              : std::numeric_limits<double>::quiet_NaN();
+    return born_a * 0.1;
+  };
   end = std::min(end, mol.size());
+#if TITAN_SIMD_X86
+  // The AVX2 pair loops: HCT for igb 1/2/5, HCT/far/neck for GBn2. The four
+  // lane sums carry on from the molecule's own sources into the
+  // environment's, so a fused free/complex pass still equals separate calls
+  // bit for bit.
+  const bool vector_pairs = titan_simd_dispatch::runtime_has_avx2();
+#endif
   for (size_t i = begin; i < end; ++i) {
     double integral = 0.0;
+    alignas(32) double lanes[4] = {0.0, 0.0, 0.0, 0.0};
     bool valid = true;
     const auto accumulate_sources = [&](const MOL &sources,
                                         const GbAtomParameters &parameters,
                                         bool same_molecule) {
-      for (size_t j = 0; j < sources.size(); ++j) {
+      size_t first_scalar = 0;
+#if TITAN_SIMD_X86
+      const double rho = primary.offset_radius_a[i];
+      if (vector_pairs && rho > 0.0 && std::isfinite(rho)) {
+        first_scalar =
+            igb == 8
+                ? gbn2_sources_avx2(
+                      mol.pos.x[i], mol.pos.y[i], mol.pos.z[i], rho,
+                      primary.intrinsic_radius_a[i], primary.neck_index[i],
+                      sources.pos.x.data(), sources.pos.y.data(),
+                      sources.pos.z.data(), parameters.scaled_radius_a.data(),
+                      parameters.active_mask.data(),
+                      parameters.intrinsic_radius_a.data(),
+                      parameters.neck_index.data(), sources.size(),
+                      same_molecule ? i : static_cast<size_t>(-1),
+                      rgbmax_angstrom, cutoff_active, lanes)
+                : hct_sources_avx2(
+                      mol.pos.x[i], mol.pos.y[i], mol.pos.z[i], rho,
+                      sources.pos.x.data(), sources.pos.y.data(),
+                      sources.pos.z.data(), parameters.scaled_radius_a.data(),
+                      parameters.active_mask.data(), sources.size(),
+                      same_molecule ? i : static_cast<size_t>(-1),
+                      rgbmax_angstrom, cutoff_active, lanes);
+        if (first_scalar == static_cast<size_t>(-1)) {
+          valid = false;
+          return;
+        }
+      }
+#endif
+      for (size_t j = first_scalar; j < sources.size(); ++j) {
         if ((same_molecule && i == j) ||
             !parameters.active[j])
           continue;
@@ -426,17 +795,15 @@ void calculate_born_radius_range(
       }
     };
 
+    const auto total = [&] {
+      return integral + ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]));
+    };
     accumulate_sources(mol, primary, true);
+    if (free_radii != nullptr)
+      (*free_radii)[i] = radius_nm(i, valid, total());
     if (valid && env_mol != nullptr && environment != nullptr)
       accumulate_sources(*env_mol, *environment, false);
-
-    const double born_a =
-        valid ? (igb == 8 ? titan_gb::gbn2_born_radius(
-                    primary.intrinsic_radius_a[i], integral, primary.gbn2[i])
-                         : titan_gb::born_radius_angstrom(
-                    primary.intrinsic_radius_a[i], integral, igb))
-              : std::numeric_limits<double>::quiet_NaN();
-    radii[i] = born_a * 0.1;
+    radii[i] = radius_nm(i, valid, total());
   }
 }
 
@@ -454,7 +821,7 @@ static void calculate_nsr6_radii(const MOL &mol,
       throw std::invalid_argument("GBNSR6: incomplete atom metadata");
     const GbGeometryIndex index(m, ai);
     for (size_t i=0; i<m.size(); ++i) {
-      if (std::abs(v[i]-.001) <= 1.e-9)
+      if (is_cas_deleted_radius(v[i]))
         throw std::invalid_argument("GBNSR6: CAS deletion sentinels are unsupported");
       atoms.push_back({m.pos.x[i],m.pos.y[i],m.pos.z[i],0.,
                        gb_intrinsic_radius_angstrom(m,ai,index,i,66)});
@@ -530,6 +897,76 @@ void cal_effective_born_radii_parallel_avx2(
       });
 }
 
+void cal_free_and_complex_born_radii_avx2(
+    const MOL &mol, const AlignedDoubleVector &vdw_radii,
+    const std::vector<mol_info> &atom_info, AlignedDoubleVector &free_radii,
+    AlignedDoubleVector &complex_radii, int igb, size_t begin, size_t end,
+    const MOL &env_mol, const AlignedDoubleVector &env_vdw_radii,
+    const std::vector<mol_info> &env_atom_info, double rgbmax_angstrom,
+    double nsr6_spacing) {
+  if (igb == 66) {
+    cal_effective_born_radii_avx2(mol, vdw_radii, atom_info, free_radii, igb,
+                                  begin, end, nullptr, nullptr, nullptr,
+                                  rgbmax_angstrom, nsr6_spacing);
+    cal_effective_born_radii_avx2(mol, vdw_radii, atom_info, complex_radii,
+                                  igb, begin, end, &env_mol, &env_vdw_radii,
+                                  &env_atom_info, rgbmax_angstrom,
+                                  nsr6_spacing);
+    return;
+  }
+  if (free_radii.size() < mol.size())
+    free_radii.resize(mol.size());
+  if (complex_radii.size() < mol.size())
+    complex_radii.resize(mol.size());
+  const GbAtomParameters primary =
+      build_gb_atom_parameters(mol, vdw_radii, atom_info, igb);
+  const GbAtomParameters environment =
+      build_gb_atom_parameters(env_mol, env_vdw_radii, env_atom_info, igb);
+  calculate_born_radius_range(mol, primary, complex_radii, igb, begin, end,
+                              &env_mol, &environment, rgbmax_angstrom,
+                              &free_radii);
+}
+
+void cal_binding_born_radii_parallel_avx2(
+    const MOL &rec, const AlignedDoubleVector &rec_vdw_radii,
+    const std::vector<mol_info> &rec_info, const MOL &lg,
+    const AlignedDoubleVector &lg_vdw_radii,
+    const std::vector<mol_info> &lg_info, int igb, TitanExecutor &executor,
+    double rgbmax_angstrom, AlignedDoubleVector &rec_free_radii,
+    AlignedDoubleVector &lg_free_radii, AlignedDoubleVector &rec_complex_radii,
+    AlignedDoubleVector &lg_complex_radii) {
+  if (igb == 66)
+    throw std::invalid_argument(
+        "cal_binding_born_radii_parallel_avx2: GBNSR6 radii come from "
+        "calculate_gbnsr6_binding_radii");
+  const size_t rec_size = rec.size();
+  const size_t lg_size = lg.size();
+  rec_free_radii.resize(rec_size);
+  rec_complex_radii.resize(rec_size);
+  lg_free_radii.resize(lg_size);
+  lg_complex_radii.resize(lg_size);
+  const GbAtomParameters rec_parameters =
+      build_gb_atom_parameters(rec, rec_vdw_radii, rec_info, igb);
+  const GbAtomParameters lg_parameters =
+      build_gb_atom_parameters(lg, lg_vdw_radii, lg_info, igb);
+  // Every atom of either molecule integrates over all rec + lg atoms, so one
+  // index range over both keeps the static partition balanced.
+  executor.parallel_for(
+      rec_size + lg_size, executor.capacity(), 32,
+      [&](size_t, size_t begin, size_t end) {
+        if (begin < rec_size)
+          calculate_born_radius_range(rec, rec_parameters, rec_complex_radii,
+                                      igb, begin, std::min(end, rec_size),
+                                      &lg, &lg_parameters, rgbmax_angstrom,
+                                      &rec_free_radii);
+        if (end > rec_size)
+          calculate_born_radius_range(
+              lg, lg_parameters, lg_complex_radii, igb,
+              std::max(begin, rec_size) - rec_size, end - rec_size, &rec,
+              &rec_parameters, rgbmax_angstrom, &lg_free_radii);
+      });
+}
+
 static void build_complex_geometry(const MOL &rec, const MOL &lg,
                                    const Multi_MOL_parameters &rec_parameters,
                                    const Multi_MOL_parameters &lg_parameters,
@@ -576,9 +1013,46 @@ compute_gbsa_sasa(const MOL &mol, std::span<const double> radii,
   options.probe_radius = TitanSASA::kDefaultProbeRadiusA;
   options.min_cell_size = 3.0;
   options.point_count = point_count;
-  return TitanSASA::compute_per_atom_sasa(
-      std::span<const TitanSASA::Atom>(atoms.data(), atoms.size()), options,
-      targets, executor);
+
+  // A CAS-deleted atom would otherwise enter as a probe-sized sphere: it
+  // would carry area and occlude its neighbours. Drop such atoms, keeping
+  // the order of the rest, so the surface is that of the structure without
+  // them; their entries stay zero.
+  std::vector<size_t> kept;
+  kept.reserve(atoms.size());
+  for (size_t i = 0; i < atoms.size(); ++i)
+    if (!is_cas_deleted_radius(atoms[i].radius))
+      kept.push_back(i);
+  if (kept.size() == atoms.size())
+    return TitanSASA::compute_per_atom_sasa(
+        std::span<const TitanSASA::Atom>(atoms.data(), atoms.size()), options,
+        targets, executor);
+
+  constexpr size_t dropped = std::numeric_limits<size_t>::max();
+  std::vector<size_t> compact_of(atoms.size(), dropped);
+  std::vector<TitanSASA::Atom> compact;
+  compact.reserve(kept.size());
+  for (size_t c = 0; c < kept.size(); ++c) {
+    compact_of[kept[c]] = c;
+    compact.push_back(atoms[kept[c]]);
+  }
+  std::vector<double> area(atoms.size(), 0.0);
+  std::vector<size_t> compact_targets;
+  if (!targets.empty()) {
+    compact_targets.reserve(targets.size());
+    for (const size_t t : targets)
+      if (t < atoms.size() && compact_of[t] != dropped)
+        compact_targets.push_back(compact_of[t]);
+    // An empty target list means "every atom", not "none".
+    if (compact_targets.empty())
+      return area;
+  }
+  const std::vector<double> compact_area = TitanSASA::compute_per_atom_sasa(
+      std::span<const TitanSASA::Atom>(compact.data(), compact.size()),
+      options, compact_targets, executor);
+  for (size_t c = 0; c < kept.size(); ++c)
+    area[kept[c]] = compact_area[c];
+  return area;
 }
 
 static double alpb_electrostatic_size_nm(const MOL &mol,
@@ -689,6 +1163,53 @@ void build_gbsa_sasa_cache(const MOL &rec, const MOL &lg,
   }
 }
 
+namespace {
+// Lennard-Jones (kJ/mol) of receptor atom i and ligand atom j at r_nm, with
+// the expressions of the scalar remainder loop of cal_energy_gbsa_avx2.
+// ENE-22 uses it again to take the plain term out of excluded pairs.
+double gbsa_pair_lj(cache_sigma_epsilon &CachedData,
+                    const Multi_MOL_parameters &rec_parameters,
+                    const Multi_MOL_parameters &lg_parameters, size_t i,
+                    size_t j, double r_nm, double r6_nm, bool is_charmm,
+                    bool is_gromos, bool is_oplsaa, bool has_overrides) {
+  double vdw;
+  if (is_charmm) {
+    double sigma_ij{}, epsilon_ij{};
+    charmm::pair_params(CachedData, rec_parameters, lg_parameters, i, j,
+                        sigma_ij, epsilon_ij);
+    vdw = charmm::lj_energy(sigma_ij, epsilon_ij, r_nm);
+  } else if (is_gromos) {
+    double c6_ij{}, c12_ij{};
+    gromos::pair_params(CachedData, rec_parameters, lg_parameters, i, j,
+                        c6_ij, c12_ij);
+    const double inv_r6 = 1.0 / r6_nm;
+    vdw = inv_r6 * (c12_ij * inv_r6 - c6_ij);
+  } else {
+    double eps_ij =
+        std::sqrt(lg_parameters.epsilon[j] * rec_parameters.epsilon[i]);
+    if (is_oplsaa) {
+      double sig_ij =
+          std::sqrt(lg_parameters.sigma[j] * rec_parameters.sigma[i]);
+      double sig2 = sig_ij * sig_ij;
+      double sig6 = sig2 * sig2 * sig2;
+      double sr6 = sig6 / r6_nm;
+      vdw = 4.0 * eps_ij * (sr6 * sr6 - sr6);
+    } else {
+      double sig_ij =
+          0.5 * (lg_parameters.sigma[j] + rec_parameters.sigma[i]);
+      double sig2 = sig_ij * sig_ij;
+      double sig6 = sig2 * sig2 * sig2;
+      double sr6 = sig6 / r6_nm;
+      vdw = 4.0 * eps_ij * (sr6 * sr6 - sr6);
+    }
+    if (has_overrides)
+      titan_lj::override_lj_energy(CachedData, rec_parameters,
+                                   lg_parameters, i, j, r_nm, vdw);
+  }
+  return vdw;
+}
+} // namespace
+
 int cal_energy_gbsa_avx2(
     const MOL &rec, const MOL &lg, const std::vector<mol_info> &info_rec,
     const std::vector<mol_info> &info_lg, cache_sigma_epsilon &CachedData,
@@ -706,7 +1227,7 @@ int cal_energy_gbsa_avx2(
     const AlignedDoubleVector &lg_complex_radii, GBSA_Aggregator *aggregator,
     const GBSASasaCache *sasa_cache,
     bool write_pair_cache, bool include_rec_onebody,
-    bool include_lig_onebody) {
+    bool include_lig_onebody, const titan_gbsa::TopologyPairs *topology_pairs) {
   (void)num_snap;
   (void)rec_lcpo_p1;
   (void)rec_lcpo_p2;
@@ -745,6 +1266,17 @@ int cal_energy_gbsa_avx2(
   double endpoint_gpol_sum = 0.0;
   const bool is_charmm =
       Arguments.force_f.find("CHARMM") != std::string::npos;
+  // ENE-11: [ nonbond_params ] for the AMBER/OPLS combination-rule paths
+  // (the CHARMM path reads them through charmm::pair_params_block).
+  // ENE-19: GROMOS keeps C6/C12 in the sigma/epsilon slots; its branch mixes
+  // them geometrically, E = C12/r^12 - C6/r^6, and takes the pair overrides
+  // (C6/C12 as well) through gromos::pair_params, like gromos_nonbonded.h.
+  const bool is_gromos =
+      !is_charmm && Arguments.force_f.find("GROMOS") != std::string::npos;
+  const bool has_overrides =
+      !is_charmm && !is_gromos && CachedData.has_charmm_pair_overrides();
+  const bool has_gromos_overrides =
+      is_gromos && CachedData.has_charmm_pair_overrides();
   const bool can_write_pair_cache =
       write_pair_cache && !CachedData.elec_ener.empty();
 
@@ -873,60 +1405,6 @@ int cal_energy_gbsa_avx2(
   const std::vector<double> *sasa_lig_free_ptr = nullptr;
   const std::vector<double> *sasa_complex_ptr = nullptr;
 
-#if 0
-  for (size_t i = 0; i < rec_size; ++i) {
-    complex_mol.pos.x[i] = rec.pos.x[i];
-    complex_mol.pos.y[i] = rec.pos.y[i];
-    complex_mol.pos.z[i] = rec.pos.z[i];
-    complex_radii[i] = rec_parameters.radius[i];
-  }
-  for (size_t j = 0; j < lg_size; ++j) {
-    complex_mol.pos.x[rec_size + j] = lg.pos.x[j];
-    complex_mol.pos.y[rec_size + j] = lg.pos.y[j];
-    complex_mol.pos.z[rec_size + j] = lg.pos.z[j];
-    // THÊM DÒNG NÀY ĐỂ TRẢ LẠI BÁN KÍNH VDW CHO LIGAND
-    complex_radii[rec_size + j] = lg_parameters.radius[j];
-  }
-
-  // --- Thread-Specific Shrake-Rupley SASA Calculation ---
-  std::vector<size_t> rec_targets;
-  rec_targets.reserve(rec_end - rec_begin);
-  for (size_t i = rec_begin; i < rec_end; ++i)
-    rec_targets.push_back(i);
-
-  std::vector<size_t> lig_targets;
-  lig_targets.reserve(lg_end - lg_begin);
-  for (size_t j = lg_begin; j < lg_end; ++j)
-    lig_targets.push_back(j);
-
-  std::vector<size_t> com_targets;
-  com_targets.reserve((rec_end - rec_begin) + (lg_end - lg_begin));
-  for (size_t i = rec_begin; i < rec_end; ++i)
-    com_targets.push_back(i);
-  for (size_t j = lg_begin; j < lg_end; ++j)
-    com_targets.push_back(rec_size + j);
-
-  SASA_Grid rec_grid = build_sasa_grid(
-      rec, std::span<const double>(rec_parameters.radius.data(), rec_size),
-      1.4);
-  std::vector<double> sasa_rec_free = compute_sasa_shrake_rupley(
-      rec, std::span<const double>(rec_parameters.radius.data(), rec_size),
-      rec_targets, rec_grid);
-
-  SASA_Grid lig_grid = build_sasa_grid(
-      lg, std::span<const double>(lg_parameters.radius.data(), lg_size), 1.4);
-  std::vector<double> sasa_lig_free = compute_sasa_shrake_rupley(
-      lg, std::span<const double>(lg_parameters.radius.data(), lg_size),
-      lig_targets, lig_grid);
-
-  SASA_Grid com_grid = build_sasa_grid(
-      complex_mol,
-      std::span<const double>(complex_radii.data(), rec_size + lg_size), 1.4);
-  std::vector<double> sasa_complex = compute_sasa_shrake_rupley(
-      complex_mol,
-      std::span<const double>(complex_radii.data(), rec_size + lg_size),
-      com_targets, com_grid);
-#endif
 
   const bool use_precomputed_sasa =
       sasa_cache != nullptr &&
@@ -1033,54 +1511,66 @@ int cal_energy_gbsa_avx2(
 
   // Complete the endpoint cycle.  Intramolecular GB pair terms do not cancel
   // when ligand descreening changes Born radii between free and complex states.
-  for (size_t i = rec_begin; include_rec_onebody && i < rec_end; ++i) {
-    for (size_t k = i + 1; k < rec_size; ++k) {
-      const double dx = rec.pos.x[i] - rec.pos.x[k];
-      const double dy = rec.pos.y[i] - rec.pos.y[k];
-      const double dz = rec.pos.z[i] - rec.pos.z[k];
-      const double r2_nm = 0.01 * (dx * dx + dy * dy + dz * dz);
-      const double delta =
-          titan_gb::polar_pair_energy_kj_mol(
-              rec_parameters.charge[i], rec_parameters.charge[k], r2_nm,
-              rec_complex_radii[i], rec_complex_radii[k], kappa_val,
-              int_diel, ext_diel, use_alpb, alpb_complex_size_nm) -
-          titan_gb::polar_pair_energy_kj_mol(
-              rec_parameters.charge[i], rec_parameters.charge[k], r2_nm,
-              rec_free_radii[i], rec_free_radii[k], kappa_val, int_diel,
-              ext_diel, use_alpb, alpb_rec_size_nm);
-      endpoint_gpol_sum += delta;
-      if (collect_decomposition) {
-        local_decomp_entries[rec_slot_for_atom(i)].gpol += 0.5 * delta;
-        local_decomp_entries[rec_slot_for_atom(k)].gpol += 0.5 * delta;
-      }
-    }
-  }
-  for (size_t j = lg_begin; include_lig_onebody && j < lg_end; ++j) {
-    for (size_t k = j + 1; k < lg_size; ++k) {
-      const double dx = lg.pos.x[j] - lg.pos.x[k];
-      const double dy = lg.pos.y[j] - lg.pos.y[k];
-      const double dz = lg.pos.z[j] - lg.pos.z[k];
-      const double r2_nm = 0.01 * (dx * dx + dy * dy + dz * dz);
-      const double delta =
-          titan_gb::polar_pair_energy_kj_mol(
-              lg_parameters.charge[j], lg_parameters.charge[k], r2_nm,
-              lg_complex_radii[j], lg_complex_radii[k], kappa_val, int_diel,
-              ext_diel, use_alpb, alpb_complex_size_nm) -
-          titan_gb::polar_pair_energy_kj_mol(
-              lg_parameters.charge[j], lg_parameters.charge[k], r2_nm,
-              lg_free_radii[j], lg_free_radii[k], kappa_val, int_diel,
-              ext_diel, use_alpb, alpb_lig_size_nm);
-      endpoint_gpol_sum += delta;
-      if (collect_decomposition) {
-        local_decomp_entries[lig_slot_for_atom(j)].gpol += 0.5 * delta;
-        local_decomp_entries[lig_slot_for_atom(k)].gpol += 0.5 * delta;
-      }
-    }
-  }
+  // ENE-15: the pairs (i in this call's rows, k > i) run four partners per
+  // AVX2 step (gbsa/gb_intramolecular_delta.cpp, equal to the scalar
+  // polar_pair_energy_kj_mol to rounding); half of each pair delta goes to
+  // both atoms of the per-atom decomposition.
+  std::vector<double> intra_half_delta;
+  auto intramolecular_delta = [&](const MOL &mol,
+                                  const Multi_MOL_parameters &parameters,
+                                  const AlignedDoubleVector &complex_radii,
+                                  const AlignedDoubleVector &free_radii,
+                                  size_t n, size_t row_begin, size_t row_end,
+                                  double free_size_nm, auto &&slot_for_atom) {
+    if (row_begin >= row_end)
+      return;
+    titan_gbsa::GbPairConstants constants;
+    constants.kappa_nm_inverse = kappa_val;
+    constants.internal_dielectric = int_diel;
+    constants.external_dielectric = ext_diel;
+    constants.use_alpb = use_alpb;
+    constants.alpb_complex_size_nm = alpb_complex_size_nm;
+    constants.alpb_free_size_nm = free_size_nm;
+    if (collect_decomposition)
+      intra_half_delta.assign(n, 0.0);
+    endpoint_gpol_sum += titan_gbsa::intramolecular_delta_gb(
+        mol.pos.x.data(), mol.pos.y.data(), mol.pos.z.data(),
+        parameters.charge.data(), complex_radii.data(), free_radii.data(), n,
+        row_begin, row_end, constants,
+        collect_decomposition ? intra_half_delta.data() : nullptr);
+    if (collect_decomposition)
+      for (size_t atom = row_begin; atom < n; ++atom)
+        if (intra_half_delta[atom] != 0.0)
+          local_decomp_entries[slot_for_atom(atom)].gpol +=
+              intra_half_delta[atom];
+  };
+  if (include_rec_onebody)
+    intramolecular_delta(rec, rec_parameters, rec_complex_radii,
+                         rec_free_radii, rec_size, rec_begin, rec_end,
+                         alpb_rec_size_nm, rec_slot_for_atom);
+  if (include_lig_onebody)
+    intramolecular_delta(lg, lg_parameters, lg_complex_radii, lg_free_radii,
+                         lg_size, lg_begin, lg_end, alpb_lig_size_nm,
+                         lig_slot_for_atom);
   // FIX: DO NOT divide by scalar_eu_par here. Keep it in kJ/mol.
   Energy.G_polar += endpoint_gpol_sum;
 
   __m256d v_scale = _mm256_set1_pd(0.01);
+
+  // ENE-04: the four-lane pair energies stay in registers. The totals are
+  // vector sums (one horizontal sum at the end), the receptor half of the
+  // decomposition goes to per-atom vectors added four lanes at a time and
+  // the ligand half to per-row vector sums; both reach the decomposition
+  // slots once. Only the summation grouping differs from adding lane by lane.
+  __m256d vdw_total = _mm256_setzero_pd();
+  __m256d elec_total = _mm256_setzero_pd();
+  __m256d gpol_total = _mm256_setzero_pd();
+  AlignedDoubleVector rec_half_ev, rec_half_ee, rec_half_gpol;
+  if (collect_decomposition && lg_begin < lg_end && rec_begin < rec_end) {
+    rec_half_ev.assign(rec_size, 0.0);
+    rec_half_ee.assign(rec_size, 0.0);
+    rec_half_gpol.assign(rec_size, 0.0);
+  }
 
   for (size_t j = lg_begin; j < lg_end; ++j) {
     double pos_x = lg.pos.x[j], pos_y = lg.pos.y[j], pos_z = lg.pos.z[j];
@@ -1090,12 +1580,17 @@ int cal_energy_gbsa_avx2(
     __m256d v_pos_z = _mm256_set1_pd(pos_z);
     __m256d v_R_j = _mm256_set1_pd(R_j);
     __m256d v_q_j = _mm256_set1_pd(lg_parameters.charge[j]);
+    const __m256d avx_temp_epsilon_lg = _mm256_set1_pd(lg_parameters.epsilon[j]);
+    const __m256d avx_temp_sigma_lg = _mm256_set1_pd(lg_parameters.sigma[j]);
     // The ligand decomposition slot is fixed for this j, so resolve it once
     // instead of once per lane of every block. The index is kept rather than a
     // reference because registering a receptor slot inside the loop could
     // reallocate local_decomp_entries.
     const size_t lig_decomp_slot =
         collect_decomposition ? lig_slot_for_atom(j) : 0;
+    __m256d lig_ev_row = _mm256_setzero_pd();
+    __m256d lig_ee_row = _mm256_setzero_pd();
+    __m256d lig_gpol_row = _mm256_setzero_pd();
 
     const size_t vector_rec_end =
         rec_begin + ((rec_end - rec_begin) / 4) * 4;
@@ -1118,8 +1613,6 @@ int cal_energy_gbsa_avx2(
       // VDW Mixing Rules
       __m256d avx_rec_epsilon = _mm256_loadu_pd(&rec_parameters.epsilon[i]);
       __m256d avx_rec_sigma = _mm256_loadu_pd(&rec_parameters.sigma[i]);
-      __m256d avx_temp_epsilon_lg = _mm256_set1_pd(lg_parameters.epsilon[j]);
-      __m256d avx_temp_sigma_lg = _mm256_set1_pd(lg_parameters.sigma[j]);
 
       __m256d eps_ij = _mm256_sqrt_pd(_mm256_mul_pd(
           avx_temp_epsilon_lg, avx_rec_epsilon)); // Geometric mean
@@ -1137,11 +1630,25 @@ int cal_energy_gbsa_avx2(
         const __m256d sigma_vec = _mm256_loadu_pd(sigma_lane);
         const __m256d epsilon_vec = _mm256_loadu_pd(epsilon_lane);
         vdw_res = charmm_lj_energy_gbsa_avx(sigma_vec, epsilon_vec, r_nm);
+      } else if (is_gromos) {
+        __m256d c6_ij, c12_ij;
+        if (has_gromos_overrides) {
+          alignas(32) double c6_lane[4]{};
+          alignas(32) double c12_lane[4]{};
+          for (size_t lane = 0; lane < 4; ++lane)
+            gromos::pair_params(CachedData, rec_parameters, lg_parameters,
+                                i + lane, j, c6_lane[lane], c12_lane[lane]);
+          c6_ij = _mm256_load_pd(c6_lane);
+          c12_ij = _mm256_load_pd(c12_lane);
+        } else {
+          c6_ij = _mm256_sqrt_pd(
+              _mm256_mul_pd(avx_rec_sigma, avx_temp_sigma_lg));
+          c12_ij = eps_ij;
+        }
+        const __m256d inv_r6 = _mm256_div_pd(avx_one, r6_nm);
+        vdw_res = _mm256_mul_pd(
+            inv_r6, _mm256_sub_pd(_mm256_mul_pd(c12_ij, inv_r6), c6_ij));
       } else {
-        alignas(32) double sigma_lane[4]{};
-        alignas(32) double epsilon_lane[4]{};
-        alignas(32) double r6_lane[4]{};
-        alignas(32) double vdw_lane[4]{};
         const __m256d sig_ij = is_oplsaa
                                    ? _mm256_sqrt_pd(_mm256_mul_pd(
                                          avx_temp_sigma_lg, avx_rec_sigma))
@@ -1149,12 +1656,30 @@ int cal_energy_gbsa_avx2(
                                          _mm256_add_pd(avx_temp_sigma_lg,
                                                        avx_rec_sigma),
                                          avx_half);
-        _mm256_storeu_pd(sigma_lane, sig_ij);
-        _mm256_storeu_pd(epsilon_lane, eps_ij);
-        _mm256_storeu_pd(r6_lane, r6_nm);
-        titan_simd_dispatch::gbsa_lj_mixed_sigma_epsilon_r6_fourlanes(
-            sigma_lane, epsilon_lane, r6_lane, vdw_lane);
-        vdw_res = _mm256_loadu_pd(vdw_lane);
+        // ENE-04: the same operations as
+        // titan_simd_dispatch::gbsa_lj_mixed_sigma_epsilon_r6_fourlanes, in
+        // registers (no store, indirect call and reload per block)
+        const __m256d sig2 = _mm256_mul_pd(sig_ij, sig_ij);
+        const __m256d sig6 = _mm256_mul_pd(_mm256_mul_pd(sig2, sig2), sig2);
+        const __m256d sr6 = _mm256_div_pd(sig6, r6_nm);
+        const __m256d sr12 = _mm256_mul_pd(sr6, sr6);
+        const __m256d lj_valid = _mm256_and_pd(
+            _mm256_cmp_pd(sig_ij, _mm256_setzero_pd(), _CMP_GT_OQ),
+            _mm256_cmp_pd(eps_ij, _mm256_setzero_pd(), _CMP_NEQ_OQ));
+        vdw_res = _mm256_and_pd(
+            _mm256_mul_pd(_mm256_mul_pd(avx_four, eps_ij),
+                          _mm256_sub_pd(sr12, sr6)),
+            lj_valid);
+        if (has_overrides) {
+          alignas(32) double vdw_lane[4];
+          alignas(32) double r_lane[4];
+          _mm256_store_pd(vdw_lane, vdw_res);
+          _mm256_store_pd(r_lane, r_nm);
+          titan_lj::override_lj_lanes(CachedData, rec_parameters,
+                                      lg_parameters, i, 4, j, r_lane,
+                                      vdw_lane);
+          vdw_res = _mm256_load_pd(vdw_lane);
+        }
       }
       // Charge product feeds both the Coulomb and the GB term; compute it once.
       __m256d v_qij = _mm256_mul_pd(v_q_i, v_q_j);
@@ -1163,17 +1688,24 @@ int cal_energy_gbsa_avx2(
       __m256d elec_res = _mm256_div_pd(
           _mm256_mul_pd(avx_coulomb_constant, v_qij), r_nm);
 
-      // G_polar
+      // G_polar. ENE-14: both exponentials through titan_avx2::exp_pd (about
+      // 1 ulp; f_exp_avx had a relative error up to 3.2e-6). When every lane
+      // has r^2/(4 RiRj) >= 36, RiRj exp(-r^2/(4 RiRj)) is below half an ulp
+      // of r^2 and f_GB = sqrt(r^2) whatever the exponential returns, so it
+      // is skipped there: the result is the same to the bit.
       __m256d RiRj = _mm256_mul_pd(v_R_i, v_R_j);
-      __m256d exp_term = f_exp_avx(
-          _mm256_mul_pd(avx_minus_one,
-                        _mm256_div_pd(r2_nm, _mm256_mul_pd(avx_four, RiRj))));
+      const __m256d gb_argument = _mm256_mul_pd(
+          avx_minus_one, _mm256_div_pd(r2_nm, _mm256_mul_pd(avx_four, RiRj)));
+      __m256d exp_term =
+          titan_gbsa::gb_exponential_negligible(gb_argument)
+              ? _mm256_setzero_pd()
+              : titan_avx2::exp_pd(gb_argument);
       __m256d fGB =
           _mm256_sqrt_pd(_mm256_add_pd(r2_nm, _mm256_mul_pd(RiRj, exp_term)));
 
       // Proper DH Screening: exp(-kappa * fGB) applied ONLY to external
       // dielectric
-      __m256d screen_exp = f_exp_avx(
+      __m256d screen_exp = titan_avx2::exp_pd(
           _mm256_mul_pd(avx_minus_one, _mm256_mul_pd(kappa, fGB)));
       __m256d gpol_res;
 
@@ -1191,40 +1723,40 @@ int cal_energy_gbsa_avx2(
             _mm256_mul_pd(v_qij, _mm256_sub_pd(term_com_in, term_com_out)));
       }
 
-      __m256d E_vdw_scaled = vdw_res;
-      __m256d E_elec_scaled = elec_res;
-      __m256d G_polar_scaled = gpol_res;
-      double vdw_a[4], elec_a[4], gpol_a[4];
-      _mm256_storeu_pd(vdw_a, E_vdw_scaled);
-      _mm256_storeu_pd(elec_a, E_elec_scaled);
-      _mm256_storeu_pd(gpol_a, G_polar_scaled);
+      vdw_total = _mm256_add_pd(vdw_total, vdw_res);
+      elec_total = _mm256_add_pd(elec_total, elec_res);
+      gpol_total = _mm256_add_pd(gpol_total, gpol_res);
 
-      Energy.E_vdw += vdw_a[0] + vdw_a[1] + vdw_a[2] + vdw_a[3];
-      Energy.E_elec += elec_a[0] + elec_a[1] + elec_a[2] + elec_a[3];
-      Energy.G_polar += gpol_a[0] + gpol_a[1] + gpol_a[2] + gpol_a[3];
-
-      // FIX: Clean decomposition assignment
-      for (int k = 0; k < 4; ++k) {
-        if (i + k >= rec_size)
-          continue;
-        size_t pos = rec_size * j + (i + k);
-        if (can_write_pair_cache) {
-          CachedData.set_elec_vdw(pos, elec_a[k], vdw_a[k]);
-        }
-        if (collect_decomposition) {
-          constexpr double half = 0.5;
-          auto &rec_decomp =
-              local_decomp_entries[rec_slot_for_atom(i + k)];
-          rec_decomp.ev += half * vdw_a[k];
-          rec_decomp.ee += half * elec_a[k];
-          rec_decomp.gpol += half * gpol_a[k];
-
-          auto &lig_decomp = local_decomp_entries[lig_decomp_slot];
-          lig_decomp.ev += half * vdw_a[k];
-          lig_decomp.ee += half * elec_a[k];
-          lig_decomp.gpol += half * gpol_a[k];
-        }
+      if (can_write_pair_cache) {
+        alignas(32) double vdw_a[4], elec_a[4];
+        _mm256_store_pd(vdw_a, vdw_res);
+        _mm256_store_pd(elec_a, elec_res);
+        for (size_t k = 0; k < 4; ++k)
+          CachedData.set_elec_vdw(rec_size * j + (i + k), elec_a[k], vdw_a[k]);
       }
+      if (collect_decomposition) {
+        const __m256d half_vdw = _mm256_mul_pd(avx_half, vdw_res);
+        const __m256d half_elec = _mm256_mul_pd(avx_half, elec_res);
+        const __m256d half_gpol = _mm256_mul_pd(avx_half, gpol_res);
+        _mm256_storeu_pd(&rec_half_ev[i], _mm256_add_pd(
+                                              _mm256_loadu_pd(&rec_half_ev[i]),
+                                              half_vdw));
+        _mm256_storeu_pd(&rec_half_ee[i], _mm256_add_pd(
+                                              _mm256_loadu_pd(&rec_half_ee[i]),
+                                              half_elec));
+        _mm256_storeu_pd(&rec_half_gpol[i],
+                         _mm256_add_pd(_mm256_loadu_pd(&rec_half_gpol[i]),
+                                       half_gpol));
+        lig_ev_row = _mm256_add_pd(lig_ev_row, half_vdw);
+        lig_ee_row = _mm256_add_pd(lig_ee_row, half_elec);
+        lig_gpol_row = _mm256_add_pd(lig_gpol_row, half_gpol);
+      }
+    }
+    if (collect_decomposition && vector_rec_end > rec_begin) {
+      auto &lig_decomp = local_decomp_entries[lig_decomp_slot];
+      lig_decomp.ev += titan_avx2::hsum_pd(lig_ev_row);
+      lig_decomp.ee += titan_avx2::hsum_pd(lig_ee_row);
+      lig_decomp.gpol += titan_avx2::hsum_pd(lig_gpol_row);
     }
 
     // Scalar Remainder Loop
@@ -1237,31 +1769,9 @@ int cal_energy_gbsa_avx2(
       double r_nm = std::sqrt(r2_nm);
       double r6_nm = r2_nm * r2_nm * r2_nm;
 
-      double vdw;
-      if (Arguments.force_f.find("CHARMM") != std::string::npos) {
-        double sigma_ij{}, epsilon_ij{};
-        charmm::pair_params(CachedData, rec_parameters, lg_parameters, i, j,
-                            sigma_ij, epsilon_ij);
-        vdw = charmm::lj_energy(sigma_ij, epsilon_ij, r_nm);
-      } else {
-        double eps_ij =
-            std::sqrt(lg_parameters.epsilon[j] * rec_parameters.epsilon[i]);
-        if (is_oplsaa) {
-          double sig_ij =
-              std::sqrt(lg_parameters.sigma[j] * rec_parameters.sigma[i]);
-          double sig2 = sig_ij * sig_ij;
-          double sig6 = sig2 * sig2 * sig2;
-          double sr6 = sig6 / r6_nm;
-          vdw = 4.0 * eps_ij * (sr6 * sr6 - sr6);
-        } else {
-          double sig_ij =
-              0.5 * (lg_parameters.sigma[j] + rec_parameters.sigma[i]);
-          double sig2 = sig_ij * sig_ij;
-          double sig6 = sig2 * sig2 * sig2;
-          double sr6 = sig6 / r6_nm;
-          vdw = 4.0 * eps_ij * (sr6 * sr6 - sr6);
-        }
-      }
+      const double vdw =
+          gbsa_pair_lj(CachedData, rec_parameters, lg_parameters, i, j, r_nm,
+                       r6_nm, is_charmm, is_gromos, is_oplsaa, has_overrides);
 
       // Elec (Remove int_diel division)
       double elec =
@@ -1287,17 +1797,26 @@ int cal_energy_gbsa_avx2(
 
       if (collect_decomposition) {
         constexpr double half = 0.5;
-        auto &rec_decomp =
-            local_decomp_entries[rec_slot_for_atom(i)];
-        rec_decomp.ev += half * vdw;
-        rec_decomp.ee += half * elec;
-        rec_decomp.gpol += half * gpol;
+        rec_half_ev[i] += half * vdw;
+        rec_half_ee[i] += half * elec;
+        rec_half_gpol[i] += half * gpol;
 
-        auto &lig_decomp = local_decomp_entries[lig_slot_for_atom(j)];
+        auto &lig_decomp = local_decomp_entries[lig_decomp_slot];
         lig_decomp.ev += half * vdw;
         lig_decomp.ee += half * elec;
         lig_decomp.gpol += half * gpol;
       }
+    }
+  }
+  Energy.E_vdw += titan_avx2::hsum_pd(vdw_total);
+  Energy.E_elec += titan_avx2::hsum_pd(elec_total);
+  Energy.G_polar += titan_avx2::hsum_pd(gpol_total);
+  if (!rec_half_ev.empty()) {
+    for (size_t i = rec_begin; i < rec_end; ++i) {
+      auto &rec_decomp = local_decomp_entries[rec_slot_for_atom(i)];
+      rec_decomp.ev += rec_half_ev[i];
+      rec_decomp.ee += rec_half_ee[i];
+      rec_decomp.gpol += rec_half_gpol[i];
     }
   }
 
@@ -1315,6 +1834,54 @@ int cal_energy_gbsa_avx2(
     if (collect_decomposition && std::abs(dG_np_lig[j]) > 1e-8) {
       auto &lig_decomp = local_decomp_entries[lig_slot_for_atom(j)];
       lig_decomp.gnp += dG_np_lig[j];
+    }
+  }
+
+  // ENE-22 (22/10/2026): topology exclusions and listed pairs between the
+  // groups (gbsa/gb_topology_pairs.h). The loops above added the plain
+  // Coulomb/LJ term of every pair; an excluded pair loses it and a listed
+  // pair gains its listed term (plain Coulomb with the listed charge
+  // product, as GROMACS evaluates 1-4 pairs). The GB polar term keeps every
+  // pair. Each pair is handled by the call whose ranges contain it, and
+  // before the ALPB scaling below, which then covers it like the others.
+  if (topology_pairs != nullptr && topology_pairs->rec_size == rec_size &&
+      topology_pairs->lig_size == lg_size) {
+    for (const auto &pair : topology_pairs->pairs) {
+      const size_t i = pair.rec;
+      const size_t j = pair.lig;
+      if (i < rec_begin || i >= rec_end || j < lg_begin || j >= lg_end)
+        continue;
+      const double dx = rec.pos.x[i] - lg.pos.x[j];
+      const double dy = rec.pos.y[i] - lg.pos.y[j];
+      const double dz = rec.pos.z[i] - lg.pos.z[j];
+      const double r2_nm = (dx * dx + dy * dy + dz * dz) * 0.01;
+      const double r_nm = std::sqrt(r2_nm);
+      const double r6_nm = r2_nm * r2_nm * r2_nm;
+      const double plain_vdw =
+          gbsa_pair_lj(CachedData, rec_parameters, lg_parameters, i, j, r_nm,
+                       r6_nm, is_charmm, is_gromos, is_oplsaa, has_overrides);
+      const double plain_elec = titan_gb::kCoulombKJMolNmPerE2 *
+                                lg_parameters.charge[j] *
+                                rec_parameters.charge[i] / r_nm;
+      const double inv_r6 = 1.0 / r6_nm;
+      const double listed_vdw =
+          inv_r6 * (pair.listed_c12 * inv_r6 - pair.listed_c6);
+      const double listed_elec =
+          titan_gb::kCoulombKJMolNmPerE2 * pair.listed_qq / r_nm;
+      const double vdw = (pair.excluded ? 0.0 : plain_vdw) + listed_vdw;
+      const double elec = (pair.excluded ? 0.0 : plain_elec) + listed_elec;
+      Energy.E_vdw += vdw - plain_vdw;
+      Energy.E_elec += elec - plain_elec;
+      if (can_write_pair_cache)
+        CachedData.set_elec_vdw(rec_size * j + i, elec, vdw);
+      if (collect_decomposition) {
+        auto &rec_decomp = local_decomp_entries[rec_slot_for_atom(i)];
+        rec_decomp.ev += 0.5 * (vdw - plain_vdw);
+        rec_decomp.ee += 0.5 * (elec - plain_elec);
+        auto &lig_decomp = local_decomp_entries[lig_slot_for_atom(j)];
+        lig_decomp.ev += 0.5 * (vdw - plain_vdw);
+        lig_decomp.ee += 0.5 * (elec - plain_elec);
+      }
     }
   }
 

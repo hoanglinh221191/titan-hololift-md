@@ -3458,6 +3458,7 @@ void apply_jcp_linear_pb_operator(
       std::max<std::size_t>(1, std::min<std::size_t>(executor.capacity(), n));
   std::vector<TreecodeStats> local_stats(workers);
   const auto near_begin = std::chrono::steady_clock::now();
+  const NearSourceCache source_cache = build_near_source_cache(panels);
   executor.parallel_for(
       n, workers, 4,
       [&](std::size_t worker, std::size_t begin, std::size_t end) {
@@ -3465,7 +3466,7 @@ void apply_jcp_linear_pb_operator(
           TreecodeStats &worker_stats = local_stats[worker];
           const JcpNearAccum sum = accumulate_jcp_near_ordered(
               panels[i], i, panels, x, eps_ratio, kappa, true, order, 0, n,
-              near_integration, quad_buffer, &worker_stats);
+              near_integration, quad_buffer, &worker_stats, &source_cache);
           double phi_row =
               jcp_lhs_phi_for_panel(panels[i], eps_ratio, lhs_phi) * x[i];
           double phin_row =
@@ -3530,6 +3531,7 @@ void apply_jcp_poisson_operator(
       std::max<std::size_t>(1, std::min<std::size_t>(executor.capacity(), n));
   std::vector<TreecodeStats> local_stats(workers);
   const auto near_begin = std::chrono::steady_clock::now();
+  const NearSourceCache source_cache = build_near_source_cache(panels);
   executor.parallel_for(
       n, workers, 4,
       [&](std::size_t worker, std::size_t begin, std::size_t end) {
@@ -3537,7 +3539,7 @@ void apply_jcp_poisson_operator(
           TreecodeStats &worker_stats = local_stats[worker];
           const JcpNearAccum sum = accumulate_jcp_near_ordered(
               panels[i], i, panels, x, eps_ratio, 0.0, false, order, 0, n,
-              near_integration, quad_buffer, &worker_stats);
+              near_integration, quad_buffer, &worker_stats, &source_cache);
           double row =
               jcp_lhs_phi_for_panel(panels[i], eps_ratio, lhs_phi) * x[i];
           row -= sum.phi;
@@ -3633,9 +3635,9 @@ build_energy_projection_sources(const std::vector<Panel> &panels,
     sources.x[j] = panel.has_source_quadrature_center ? panel.source_x : panel.x;
     sources.y[j] = panel.has_source_quadrature_center ? panel.source_y : panel.y;
     sources.z[j] = panel.has_source_quadrature_center ? panel.source_z : panel.z;
-    sources.nx[j] = panel.nx;
-    sources.ny[j] = panel.ny;
-    sources.nz[j] = panel.nz;
+    sources.nx[j] = panel_source_nx(panel);
+    sources.ny[j] = panel_source_ny(panel);
+    sources.nz[j] = panel_source_nz(panel);
     sources.area[j] = panel.area;
     sources.phi[j] = unknowns[j];
     if (coupled)
@@ -3874,12 +3876,194 @@ double project_reaction_energy(const std::vector<Atom> &atoms,
   return energy;
 }
 
+// Curved energy projection with far cells aggregated.  Every curved dual cell
+// is first summed as one point - its area centroid, total area and
+// area-weighted normal - for all atoms.  Cells whose centroid lies within
+// far_eta cell radii of an atom then have that point replaced by all of their
+// samples.  The single-point error decays as (radius/distance)^2, so far_eta
+// sets the accuracy; as far_eta grows the result tends to the exact sample
+// sum.  No per-sample copy is made, which is most of the projection memory.
+struct CurvedProjectionSplit {
+  EnergyProjectionSources aggregate;
+  std::vector<double> radius;
+  std::vector<std::uint64_t> keys;
+  std::vector<std::uint32_t> order;
+  double cell_size{0.0};
+  double ox{0.0}, oy{0.0}, oz{0.0};
+};
+
+[[nodiscard]] std::uint64_t projection_grid_key(std::int64_t ix,
+                                                std::int64_t iy,
+                                                std::int64_t iz) noexcept {
+  constexpr std::int64_t bias = std::int64_t{1} << 20;
+  constexpr std::uint64_t mask = (std::uint64_t{1} << 21) - 1U;
+  return ((static_cast<std::uint64_t>(ix + bias) & mask) << 42) |
+         ((static_cast<std::uint64_t>(iy + bias) & mask) << 21) |
+         (static_cast<std::uint64_t>(iz + bias) & mask);
+}
+
+CurvedProjectionSplit build_curved_projection_split(
+    const std::vector<Panel> &panels, const std::vector<double> &unknowns,
+    bool coupled, double far_eta) {
+  const std::size_t n = panels.size();
+  CurvedProjectionSplit split;
+  auto &a = split.aggregate;
+  a.x.resize(n);
+  a.y.resize(n);
+  a.z.resize(n);
+  a.nx.resize(n);
+  a.ny.resize(n);
+  a.nz.resize(n);
+  a.area.resize(n);
+  a.phi.resize(n);
+  if (coupled)
+    a.phin.resize(n);
+  split.radius.assign(n, 0.0);
+  double radius_max = 0.0;
+  split.ox = split.oy = split.oz = std::numeric_limits<double>::infinity();
+  for (std::size_t j = 0; j < n; ++j) {
+    const auto &cell = *curved_dual_cell(panels[j]);
+    const double area = cell.area;
+    a.x[j] = cell.center[0];
+    a.y[j] = cell.center[1];
+    a.z[j] = cell.center[2];
+    const double inverse = area > 0.0 ? 1.0 / area : 0.0;
+    a.nx[j] = cell.normal_integral[0] * inverse;
+    a.ny[j] = cell.normal_integral[1] * inverse;
+    a.nz[j] = cell.normal_integral[2] * inverse;
+    a.area[j] = area;
+    a.phi[j] = unknowns[j];
+    if (coupled)
+      a.phin[j] = unknowns[n + j];
+    double radius = 0.0;
+    for (const auto &q : cell.samples) {
+      const double dx = q.xyz[0] - cell.center[0];
+      const double dy = q.xyz[1] - cell.center[1];
+      const double dz = q.xyz[2] - cell.center[2];
+      radius = std::max(radius, std::sqrt(dx * dx + dy * dy + dz * dz));
+    }
+    split.radius[j] = radius;
+    radius_max = std::max(radius_max, radius);
+    split.ox = std::min(split.ox, a.x[j]);
+    split.oy = std::min(split.oy, a.y[j]);
+    split.oz = std::min(split.oz, a.z[j]);
+  }
+  split.cell_size = std::max(1.0e-6, far_eta * radius_max);
+  split.keys.resize(n);
+  split.order.resize(n);
+  for (std::size_t j = 0; j < n; ++j) {
+    split.keys[j] = projection_grid_key(
+        static_cast<std::int64_t>(std::floor((a.x[j] - split.ox) / split.cell_size)),
+        static_cast<std::int64_t>(std::floor((a.y[j] - split.oy) / split.cell_size)),
+        static_cast<std::int64_t>(std::floor((a.z[j] - split.oz) / split.cell_size)));
+    split.order[j] = static_cast<std::uint32_t>(j);
+  }
+  std::sort(split.order.begin(), split.order.end(),
+            [&](std::uint32_t l, std::uint32_t r) {
+              return split.keys[l] != split.keys[r] ? split.keys[l] < split.keys[r]
+                                                    : l < r;
+            });
+  std::vector<std::uint64_t> sorted(n);
+  for (std::size_t k = 0; k < n; ++k)
+    sorted[k] = split.keys[split.order[k]];
+  split.keys = std::move(sorted);
+  return split;
+}
+
+// Sum of `kernel(source point)` over the samples of every cell near `atom`,
+// minus the same kernel at that cell's aggregate point.
+template <typename PointKernel>
+double curved_projection_near_correction(const Atom &atom,
+                                         const std::vector<Panel> &panels,
+                                         const CurvedProjectionSplit &split,
+                                         const std::vector<double> &unknowns,
+                                         bool coupled, double far_eta,
+                                         PointKernel kernel) {
+  const auto &a = split.aggregate;
+  const std::size_t n = panels.size();
+  const auto cx = static_cast<std::int64_t>(
+      std::floor((atom.x - split.ox) / split.cell_size));
+  const auto cy = static_cast<std::int64_t>(
+      std::floor((atom.y - split.oy) / split.cell_size));
+  const auto cz = static_cast<std::int64_t>(
+      std::floor((atom.z - split.oz) / split.cell_size));
+  double correction = 0.0;
+  for (std::int64_t dz = -1; dz <= 1; ++dz)
+    for (std::int64_t dy = -1; dy <= 1; ++dy)
+      for (std::int64_t dx = -1; dx <= 1; ++dx) {
+        const std::uint64_t key = projection_grid_key(cx + dx, cy + dy, cz + dz);
+        auto first = std::lower_bound(split.keys.begin(), split.keys.end(), key);
+        for (auto it = first; it != split.keys.end() && *it == key; ++it) {
+          const std::size_t j = split.order[static_cast<std::size_t>(
+              it - split.keys.begin())];
+          const double rx = atom.x - a.x[j], ry = atom.y - a.y[j],
+                       rz = atom.z - a.z[j];
+          const double limit = far_eta * split.radius[j];
+          if (rx * rx + ry * ry + rz * rz >= limit * limit)
+            continue;
+          const double phi = unknowns[j];
+          const double phin = coupled ? unknowns[n + j] : 0.0;
+          for (const auto &q : curved_dual_cell(panels[j])->samples)
+            correction += kernel(q.xyz[0], q.xyz[1], q.xyz[2], q.normal[0],
+                                 q.normal[1], q.normal[2], q.weight, phi, phin);
+          correction -= kernel(a.x[j], a.y[j], a.z[j], a.nx[j], a.ny[j],
+                               a.nz[j], a.area[j], phi, phin);
+        }
+      }
+  return correction;
+}
+
 double jcp_linear_pb_energy_kcal(const std::vector<Atom> &atoms,
                                  const std::vector<Panel> &panels,
                                  const std::vector<double> &x, double eps_ratio,
                                  double kappa, TitanExecutor &executor,
                                  std::vector<double> *reaction_phi_by_atom,
-                                 std::string *kernel_policy) {
+                                 std::string *kernel_policy,
+                                 double far_eta = 0.0) {
+  if (far_eta > 0.0 && !panels.empty() && curved_dual_cell(panels.front())) {
+    const CurvedProjectionSplit split =
+        build_curved_projection_split(panels, x, true, far_eta);
+    constexpr double inv_four_pi = 1.0 / (4.0 * kPi);
+    const auto point = [&](const Atom &atom) {
+      return [&atom, eps_ratio, kappa](double sx, double sy, double sz,
+                                       double nx, double ny, double nz,
+                                       double area, double phi, double phin) {
+        const double dx = atom.x - sx, dy = atom.y - sy, dz = atom.z - sz;
+        const double r2 = dx * dx + dy * dy + dz * dz;
+        if (r2 <= 1.0e-28)
+          return 0.0;
+        const double r = std::sqrt(r2);
+        const double screened = std::exp(-kappa * r);
+        const double g0 = inv_four_pi / r;
+        const double normal_dot = nx * dx + ny * dy + nz * dz;
+        const double dg0 = inv_four_pi * normal_dot / (r2 * r);
+        const double k1 = g0 * (1.0 - screened);
+        const double k2 = dg0 * (eps_ratio * screened * (1.0 + kappa * r) - 1.0);
+        return area * (k1 * phin + k2 * phi);
+      };
+    };
+    const auto scalar = [&](const Atom &atom) {
+      return linear_pb_reaction_phi_scalar(atom, split.aggregate, eps_ratio,
+                                           kappa) +
+             curved_projection_near_correction(atom, panels, split, x, true,
+                                               far_eta, point(atom));
+    };
+    const auto avx2 = [&](const Atom &atom) {
+#if TITAN_SIMD_X86
+      return linear_pb_reaction_phi_avx2(atom, split.aggregate, eps_ratio,
+                                         kappa) +
+             curved_projection_near_correction(atom, panels, split, x, true,
+                                               far_eta, point(atom));
+#else
+      return scalar(atom);
+#endif
+    };
+    const double energy = project_reaction_energy(
+        atoms, executor, scalar, avx2, reaction_phi_by_atom, kernel_policy);
+    if (kernel_policy != nullptr)
+      *kernel_policy += "-cell-aggregate-eta" + std::to_string(far_eta);
+    return energy;
+  }
   const EnergyProjectionSources sources =
       build_energy_projection_sources(panels, x, true);
   const auto scalar = [&](const Atom &atom) {
@@ -3901,7 +4085,46 @@ double jcp_poisson_energy_kcal(const std::vector<Atom> &atoms,
                                const std::vector<double> &phi, double eps_ratio,
                                TitanExecutor &executor,
                                std::vector<double> *reaction_phi_by_atom,
-                               std::string *kernel_policy) {
+                               std::string *kernel_policy,
+                               double far_eta = 0.0) {
+  if (far_eta > 0.0 && !panels.empty() && curved_dual_cell(panels.front())) {
+    const CurvedProjectionSplit split =
+        build_curved_projection_split(panels, phi, false, far_eta);
+    constexpr double inv_four_pi = 1.0 / (4.0 * kPi);
+    const double k2_scale = eps_ratio - 1.0;
+    const auto point = [&](const Atom &atom) {
+      return [&atom, k2_scale](double sx, double sy, double sz, double nx,
+                               double ny, double nz, double area, double value,
+                               double) {
+        const double dx = atom.x - sx, dy = atom.y - sy, dz = atom.z - sz;
+        const double r2 = dx * dx + dy * dy + dz * dz;
+        if (r2 <= 1.0e-28)
+          return 0.0;
+        const double r = std::sqrt(r2);
+        const double normal_dot = nx * dx + ny * dy + nz * dz;
+        return area * k2_scale * inv_four_pi * normal_dot / (r2 * r) * value;
+      };
+    };
+    const auto scalar = [&](const Atom &atom) {
+      return poisson_reaction_phi_scalar(atom, split.aggregate, eps_ratio) +
+             curved_projection_near_correction(atom, panels, split, phi, false,
+                                               far_eta, point(atom));
+    };
+    const auto avx2 = [&](const Atom &atom) {
+#if TITAN_SIMD_X86
+      return poisson_reaction_phi_avx2(atom, split.aggregate, eps_ratio) +
+             curved_projection_near_correction(atom, panels, split, phi, false,
+                                               far_eta, point(atom));
+#else
+      return scalar(atom);
+#endif
+    };
+    const double energy = project_reaction_energy(
+        atoms, executor, scalar, avx2, reaction_phi_by_atom, kernel_policy);
+    if (kernel_policy != nullptr)
+      *kernel_policy += "-cell-aggregate-eta" + std::to_string(far_eta);
+    return energy;
+  }
   const EnergyProjectionSources sources =
       build_energy_projection_sources(panels, phi, false);
   const auto scalar = [&](const Atom &atom) {
@@ -3916,6 +4139,96 @@ double jcp_poisson_energy_kcal(const std::vector<Atom> &atoms,
   };
   return project_reaction_energy(atoms, executor, scalar, avx2,
                                  reaction_phi_by_atom, kernel_policy);
+}
+
+// The certificate of a curved node-patch surface as "key=value;...": for the
+// PN lift the vertices that took the star normal (and of them those turned
+// further toward their faces), the repair rounds, the triangles still flat,
+// the straightened neighbour edges, the corner vertices that collocate off
+// the vertex and their largest offset, touching flat non-adjacent patches and
+// the largest shared-edge gap; for the near pairs by admissible subdivision
+// their number, the unresolved ones and the smallest target-to-cell gap
+// ("n/a" when there were none); and the highest Gauss order a self block
+// needed (an unconverged one refuses the lift).  The near counts grow while
+// pairs are integrated, so it is refreshed when the solve ends.
+std::string node_patch_certificate(const std::vector<Panel> &panels) {
+  if (panels.empty() || !panels.front().node_patch_geometry ||
+      !panels.front().node_patch_geometry->curved)
+    return "n/a";
+  const CurvedNodePatchGeometry &c = *panels.front().node_patch_geometry->curved;
+  std::ostringstream out;
+  out << std::setprecision(6);
+  if (c.representation == "curved_pn")
+    out << "pn_star_normals=" << c.pn_star_normal_vertices
+        << ";pn_turned_normals=" << c.pn_turned_normal_vertices
+        << ";pn_repair_rounds=" << c.pn_repair_rounds
+        << ";pn_residual_flat=" << c.pn_residual_flat_triangles
+        << ";pn_straightened_edges=" << c.pn_straightened_edges
+        << ";pn_corner_vertices=" << c.pn_corner_vertices
+        << ";pn_max_offset_A=" << c.pn_max_collocation_offset
+        << ";pn_flat_contacts=" << c.pn_flat_contacts
+        << ";pn_edge_gap_A=" << c.pn_max_shared_edge_gap << ';';
+  out << "near_adaptive=" << c.near_adaptive_evaluations.load()
+      << ";near_unresolved=" << c.near_unresolved_evaluations.load()
+      << ";near_min_gap_A=";
+  const double gap = c.near_min_gap.load();
+  if (std::isfinite(gap))
+    out << gap;
+  else
+    out << "n/a";
+  out << ";self_max_order=" << c.self_max_order
+      << ";self_base_order=" << c.self_base_order
+      << ";self_fallback=" << c.self_fallback_blocks
+      << ";self_fallback_step=" << c.self_max_fallback_step;
+  return out.str();
+}
+
+// The shape of the solved normal derivative q on the node patches, appended
+// to the certificate: q_rms, the largest |q| over the median |q|, and the
+// adjacent node pairs of opposite sign that both exceed 50 median |q|.  A
+// spurious oscillating mode - 451c at h = 1.25 A: |q| up to 573 against a
+// median of 0.008, alternating between neighbouring nodes of 40 small cells
+// refined in a deep pocket - shows as a ratio of order 1e4 and many such
+// pairs, where a smooth q gives a ratio of tens to hundreds and none.  It
+// does not stop the run; the audit of the solution (-pbe-bie-matvec-audit=
+// targets) is the gate that the mode trips.
+std::string node_patch_solution_shape(const std::vector<Panel> &panels,
+                                      const std::vector<double> &x,
+                                      bool coupled) {
+  const std::size_t n = panels.size();
+  if (!coupled || n == 0 || x.size() < 2 * n || !panels.front().node_patch_geometry)
+    return "";
+  const NodePatchGeometry &g = *panels.front().node_patch_geometry;
+  std::vector<double> magnitude(n);
+  double sum_sq = 0.0, largest = 0.0;
+  for (std::size_t i = 0; i < n; ++i) {
+    const double q = x[n + i];
+    magnitude[i] = std::abs(q);
+    sum_sq += q * q;
+    largest = std::max(largest, magnitude[i]);
+  }
+  std::vector<double> sorted = magnitude;
+  std::nth_element(sorted.begin(), sorted.begin() + n / 2, sorted.end());
+  const double median = sorted[n / 2];
+  std::size_t pairs = 0;
+  if (g.adjacent_offsets.size() == n + 1 && median > 0.0)
+    for (std::size_t i = 0; i < n; ++i)
+      for (std::size_t p = g.adjacent_offsets[i]; p < g.adjacent_offsets[i + 1];
+           ++p) {
+        const std::size_t j = g.adjacent_nodes[p];
+        if (j > i && j < n && x[n + i] * x[n + j] < 0.0 &&
+            magnitude[i] > 50 * median && magnitude[j] > 50 * median)
+          ++pairs;
+      }
+  std::ostringstream out;
+  out << std::setprecision(6) << ";q_rms=" << std::sqrt(sum_sq / n)
+      << ";q_max_median=";
+  if (median > 0.0)
+    out << largest / median;
+  else
+    out << "n/a";
+  out << ";q_checkerboard_pairs=" << pairs;
+  return out.str();
 }
 
 } // namespace
@@ -3967,7 +4280,8 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
   const bool sparse_ilu_pipeline =
       result.preconditioner_requested == "fmm-nearfield-ilu0" ||
       result.preconditioner_requested == "fmm-nearfield-ilu0-coarse" ||
-      result.preconditioner_requested == "distance-knn-ilu0";
+      result.preconditioner_requested == "distance-knn-ilu0" ||
+      result.preconditioner_requested == "classic-nearfield-ilu0";
   result.preconditioner_ilu_regularization =
       sparse_ilu_pipeline &&
               options.preconditioner_ilu_regularization != "off"
@@ -4419,6 +4733,13 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
           "-pbe-bie-geometry=triangle.");
     auto parent_panels = std::move(panels);
     panels = build_node_patch_panels(parent_panels, options.diagonal_mode);
+    if (!panels.empty() && panels.front().node_patch_geometry) {
+      const NodePatchGeometry &g = *panels.front().node_patch_geometry;
+      result.node_patch_normal_source =
+          "analytic=" + std::to_string(g.analytic_normal_nodes) +
+          ";averaged=" + std::to_string(g.averaged_normal_nodes) +
+          ";rejected=" + std::to_string(g.analytic_normal_rejected);
+    }
     // A node-patch cell is the barycentric dual of a vertex, which is well
     // defined for an interior vertex of a closed mesh.  A closed triangulation
     // has V/F = 0.5; every open patch boundary pushes the ratio up, and those
@@ -4451,19 +4772,39 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
       }
     }
     const auto curved_begin=std::chrono::steady_clock::now();
-    const bool curved=prepare_curved_node_patches(parent_panels,panels,
+    // The PN lift is only as good as the triangles under it.  The marching
+    // Grid-SES keeps its slivers and needles (it is not remeshed), and at
+    // h = 1.25 A on 1SH1 the lift there gave the normal-derivative unknown a
+    // spurious mode 2000 times its size and an energy four times too large,
+    // with GMRES converged.  So Grid-SES keeps the flat cell, as in v0.5; the
+    // curved cell is built on the remeshed analytic SES.
+    const bool curved_surface=options.primary_surface!="grid-ses";
+    if(!curved_surface)
+      std::cerr<<"TABI node-patch: Grid-SES keeps the flat cell (the curved"
+                 " PN cell needs the remeshed analytic SES)\n";
+    const bool curved=curved_surface&&prepare_curved_node_patches(parent_panels,panels,
       std::max(1e-12,options.eps_out)/std::max(1e-12,options.eps_in),
       debye_kappa_inv_a(options.salt_m,options.temperature_k,options.eps_out),
       options.surface_only?0u:static_cast<std::size_t>(
-        std::max(0,options.curved_pair_cache_mb))*1024u*1024u,executor,options.sum_mode!="treecode");
+        std::max(0,options.curved_pair_cache_mb))*1024u*1024u,executor,options.sum_mode!="treecode",
+      options.curved_sample_order,
+      // The analytic FMM sums one point per cell beyond its near list, so
+      // the curved cell is integrated only inside a near zone there.
+      options.fmm_m2l=="single-matvec-analytic"?options.curved_near_zone_radii:0.0);
     result.node_patch_representation=
         curved && !panels.empty() && panels.front().node_patch_geometry &&
                 panels.front().node_patch_geometry->curved
             ? panels.front().node_patch_geometry->curved->representation
             : std::string("flat_legacy");
+    result.node_patch_certificate = node_patch_certificate(panels);
     if(curved){
-      if(!options.surface_only && options.fmm_m2l!="off")
-        throw std::runtime_error("curved_node_patch_requires_direct_or_classic_treecode");
+      if(!options.surface_only && options.fmm_m2l!="off" &&
+         options.fmm_m2l!="single-matvec-analytic")
+        throw std::runtime_error("curved_node_patch_requires_direct_classic_treecode_or_p1:"+options.fmm_m2l);
+      // The experimental Cartesian full adapter corrects one-ring pairs only,
+      // not the curved near zone the p1 and local p4 near loops correct.
+      if(!options.surface_only && cartesian_full_requested)
+        throw std::runtime_error("curved_node_patch_unsupported_on_cartesian_full_experimental");
       result.surface_mesh_ms+=elapsed_ms(curved_begin,std::chrono::steady_clock::now());
       result.surface_area_a2=std::accumulate(panels.begin(),panels.end(),0.0,[](double a,const Panel&p){return a+p.area;});
     } else if(!options.surface_only) {
@@ -4640,12 +4981,13 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
                      options.preconditioner == "fmm-overlap-schwarz" ||
                      options.preconditioner == "fmm-nearfield-ilu0" ||
                      options.preconditioner == "distance-knn-overlap-schwarz" ||
-                     options.preconditioner == "distance-knn-ilu0")) {
+                     options.preconditioner == "distance-knn-ilu0" ||
+                     options.preconditioner == "classic-nearfield-ilu0")) {
       throw std::invalid_argument(
           "FMM-native BIE preconditioners require positive ionic strength and "
           "the coupled JCP system");
     }
-    if (options.fmm_local == "gmres-p4" &&
+    if (options.fmm_local == "gmres-p4" && !options.fmm_local_geometry_sweep &&
         (options.fmm_local_geometry_guard != "strict-geometry-mac" ||
          std::abs(options.fmm_local_geometry_theta - 0.5) > 1.0e-15)) {
       throw std::invalid_argument(
@@ -6714,10 +7056,15 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
     const bool fmm_overlap_schwarz =
         result.preconditioner_requested == "fmm-overlap-schwarz" ||
         result.preconditioner_requested == "distance-knn-overlap-schwarz";
+    // ILU(0) on the classic treecode's own near (singular) list.  It needs no
+    // FMM context, so it serves the curved node-patch treecode, which cannot
+    // run the FMM M2L path.
+    const bool classic_ilu =
+        result.preconditioner_requested == "classic-nearfield-ilu0";
     const bool fmm_nearfield_ilu0 =
         result.preconditioner_requested == "fmm-nearfield-ilu0" ||
         fmm_nearfield_ilu0_coarse ||
-        result.preconditioner_requested == "distance-knn-ilu0";
+        result.preconditioner_requested == "distance-knn-ilu0" || classic_ilu;
     const bool distance_knn_graph =
         result.preconditioner_requested == "distance-knn-overlap-schwarz" ||
         result.preconditioner_requested == "distance-knn-ilu0";
@@ -6740,7 +7087,8 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
       }
       progress.write("precond_start", result, &jcp_tree_stats, matvec_calls, 0,
                      0, 0.0, "running", true);
-      if (!experimental_treecode || !fmm_m2l_single_matvec || !coupled) {
+      if (!experimental_treecode || (!classic_ilu && !fmm_m2l_single_matvec) ||
+          !coupled) {
         throw std::invalid_argument(
             "PBE BIE FMM-native preconditioners require coupled "
             "JCP treecode with -pbe-bie-fmm-m2l=single-matvec-analytic");
@@ -6748,7 +7096,7 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
       result.preconditioner_block_near = "operator-near";
       const auto precond_begin = std::chrono::steady_clock::now();
       std::shared_ptr<titan::tabi::fmm_m2l::FmmM2lAnalyticContext> fmm_context;
-      if (!(fmm_nearfield_ilu0 && kifmm_fallback_ilu_graph)) {
+      if (!classic_ilu && !(fmm_nearfield_ilu0 && kifmm_fallback_ilu_graph)) {
         fmm_context = ensure_jcp_fmm_m2l_context(
             panels, eps_ratio, kappa,
             static_cast<std::size_t>(std::max(8, effective_tree_leaf_size)),
@@ -6783,12 +7131,56 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
         result.preconditioner_coarse_status = "operator_unsupported";
       }
       if (fmm_nearfield_ilu0) {
-        if (kifmm_fallback_ilu_graph) {
-          kifmm_fallback_graph =
-              titan::tabi::fmm_kifmm::build_kifmm_lite_fallback_panel_graph(
-                  kifmm_prepared_operator,
-                  static_cast<std::size_t>(
-                      result.preconditioner_ilu_neighbor_cap));
+        if (classic_ilu || kifmm_fallback_ilu_graph) {
+          if (classic_ilu) {
+            const TreeInteractionLists &list = jcp_tree.interactions;
+            if (list.singular_offsets.size() != panels.size() + 1U ||
+                list.singular_indices.empty())
+              throw std::runtime_error(
+                  "classic_ilu_requires_cached_interactions: use "
+                  "-pbe-bie-interaction-mode=cached");
+            // Keep the cap nearest near-list neighbours of each row by
+            // collocation distance; ties break on index.  A bounded heap keeps
+            // row capacity at the cap even for long near rows.
+            const auto cap = static_cast<std::size_t>(
+                result.preconditioner_ilu_neighbor_cap);
+            kifmm_fallback_graph.resize(panels.size());
+            for (std::size_t i = 0; i < panels.size(); ++i) {
+              auto &row = kifmm_fallback_graph[i];
+              row.reserve(cap);
+              const auto distance = [&](std::size_t j) {
+                const Panel &a = panels[i];
+                const Panel &b = panels[j];
+                return (a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) +
+                       (a.z - b.z) * (a.z - b.z);
+              };
+              const auto closer = [&](std::size_t j, std::size_t k) {
+                const double x = distance(j), y = distance(k);
+                return x == y ? j < k : x < y;
+              };
+              for (std::size_t pos = list.singular_offsets[i];
+                   pos < list.singular_offsets[i + 1U]; ++pos) {
+                const std::size_t j = list.singular_indices[pos];
+                if (j >= panels.size())
+                  continue;
+                if (row.size() < cap) {
+                  row.push_back(j);
+                  std::push_heap(row.begin(), row.end(), closer);
+                } else if (closer(j, row.front())) {
+                  std::pop_heap(row.begin(), row.end(), closer);
+                  row.back() = j;
+                  std::push_heap(row.begin(), row.end(), closer);
+                }
+              }
+              std::sort(row.begin(), row.end());
+            }
+          } else {
+            kifmm_fallback_graph =
+                titan::tabi::fmm_kifmm::build_kifmm_lite_fallback_panel_graph(
+                    kifmm_prepared_operator,
+                    static_cast<std::size_t>(
+                        result.preconditioner_ilu_neighbor_cap));
+          }
           result.preconditioner_estimated_bytes =
               estimate_jcp_sparse_ilu0_graph_bytes(kifmm_fallback_graph,
                   diagonal.size(),
@@ -6812,7 +7204,7 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
                   result.preconditioner_ilu_neighbor_cap_requested),
               ilu_memory_budget,
               result.preconditioner_ilu_regularization == "adaptive",
-              preconditioner_graph_source);
+              preconditioner_graph_source, &executor);
           if (coarse_preconditioner != nullptr && !ilu_budget.fits_budget) {
             coarse_preconditioner.reset();
             coarse_estimated_bytes = 0;
@@ -6823,7 +7215,7 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
                     result.preconditioner_ilu_neighbor_cap_requested),
                 result.preconditioner_memory_budget_bytes,
                 result.preconditioner_ilu_regularization == "adaptive",
-                preconditioner_graph_source);
+                preconditioner_graph_source, &executor);
           }
           normalized_ilu_graph = ilu_budget.normalized_graph;
           ilu_graph_build_ms = ilu_budget.graph_build_ms;
@@ -6855,7 +7247,7 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
                                     result.preconditioner_memory_budget_bytes;
       if (!block_budget_cap) {
         if (fmm_nearfield_ilu0) {
-          if (kifmm_fallback_ilu_graph) {
+          if (classic_ilu || kifmm_fallback_ilu_graph) {
             sparse_ilu_preconditioner =
                 build_jcp_sparse_ilu0_preconditioner_from_graph(
                     panels, kifmm_fallback_graph, coupled, eps_ratio, kappa,
@@ -7150,7 +7542,9 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
       if (fmm_nearfield_ilu0 && sparse_ilu_preconditioner != nullptr &&
           sparse_ilu_preconditioner->valid_panel_count == panels.size() &&
           !ilu_ill_conditioned && !ilu_quality_rejected && !block_budget_cap) {
-        if (kifmm_fallback_ilu_graph) {
+        if (classic_ilu) {
+          result.preconditioner_effective = "classic_nearfield_ilu0";
+        } else if (kifmm_fallback_ilu_graph) {
           result.preconditioner_effective =
               "fmm_nearfield_ilu0_kifmm_fallback_capped";
         } else if (fmm_nearfield_ilu0_coarse &&
@@ -7831,8 +8225,15 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
       solution_audit.seconds =
           elapsed_ms(solution_audit_begin, std::chrono::steady_clock::now());
     }
+    // "targets" is the manuscript's audit (section 2.6) on every surface and
+    // cell, node patches included: m = min(sample count, N) target panels at
+    // the indices floor((2k + 1) N / (2m)), both equations of each (2m rows),
+    // of the solution, with the sampled direct residual.  A node-patch run
+    // then reports it in place of its pre-GMRES probe, which stays the
+    // fail-closed guard (fmm_cartesian_pre_audit_*).
+    const bool target_audit = options.matvec_audit == "targets";
     if (experimental_treecode && options.matvec_audit != "off" &&
-        !node_patch_discretization) {
+        (!node_patch_discretization || target_audit)) {
       const auto audit_begin = std::chrono::steady_clock::now();
       if (kifmm_any_gmres) {
         write_kifmm_gmres_phase("post_audit_start");
@@ -7840,7 +8241,7 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
       const std::vector<double> &audit_x =
           !linear.best_x.empty() ? linear.best_x : linear.x;
       std::vector<std::size_t> audit_rows;
-      if (options.matvec_audit == "sampled-detail") {
+      if (options.matvec_audit == "sampled-detail" || target_audit) {
         const std::vector<std::size_t> audit_targets = build_audit_rows(
             panels.size(), "sampled", options.matvec_audit_sample_count);
         audit_rows.reserve(audit_targets.size() * (coupled ? 2u : 1u));
@@ -7968,7 +8369,8 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
             std::sqrt(std::max(0.0, diff_sq)) /
             std::max(1.0e-300, std::sqrt(std::max(0.0, direct_sq)));
         result.matvec_audit_rows = audit_rows.size();
-        if (cartesian_full_gmres || gmres_p4 || kifmm_any_gmres) {
+        if (cartesian_full_gmres || gmres_p4 || kifmm_any_gmres ||
+            target_audit) {
           result.fmm_local_sampled_direct_true_residual =
               std::sqrt(std::max(0.0, direct_residual_sq)) /
               std::max(1.0e-300, std::sqrt(std::max(0.0, rhs_sq)));
@@ -8917,10 +9319,12 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
         (coupled ? jcp_linear_pb_energy_kcal(atoms, panels, linear.x, eps_ratio,
                                              kappa, executor,
                                              &atom_reaction_phi,
-                                             &result.energy_projection_kernel)
+                                             &result.energy_projection_kernel,
+                                             options.energy_far_eta)
                  : jcp_poisson_energy_kcal(atoms, panels, linear.x, eps_ratio,
                                            executor, &atom_reaction_phi,
-                                           &result.energy_projection_kernel));
+                                           &result.energy_projection_kernel,
+                                           options.energy_far_eta));
     result.energy_projection_ms = elapsed_ms(
         energy_projection_begin, std::chrono::steady_clock::now());
     const double born =
@@ -8971,6 +9375,10 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
         atom_closure_kj - result.boundary_energy_kcal_mol * kKcalToKJ;
     result.peak_memory_bytes = result.memory_bytes;
     refresh_matvec_cost_summary(result);
+    result.node_patch_certificate =
+        node_patch_certificate(panels) +
+        node_patch_solution_shape(panels, linear.x,
+                                  result.bie_system == "linear_pb_2x2");
     if (options.surface_output != "off") {
       result.output_panels = panels;
       result.output_solution = linear.x;
@@ -9953,6 +10361,10 @@ static Result solve_linear_pb_single_attempt(const std::vector<Atom> &atoms,
                      (kKBKJPerMolK * std::max(1.0, options.temperature_k));
   result.peak_memory_bytes = result.memory_bytes;
   refresh_matvec_cost_summary(result);
+  result.node_patch_certificate =
+      node_patch_certificate(panels) +
+      node_patch_solution_shape(panels, linear.x,
+                                result.bie_system == "linear_pb_2x2");
   if (options.surface_output != "off") {
     result.output_panels = panels;
     result.output_solution = linear.x;

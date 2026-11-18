@@ -174,6 +174,7 @@ private:
 
   std::uint64_t frames_seen_{0};
   std::uint64_t frames_used_{0};
+  bool warned_invalid_box_{false}; // STR-32
   std::array<std::uint64_t, 3> finite_counts_{};
   std::array<std::uint64_t, 3> missing_counts_{};
   std::array<std::uint64_t, 2> finite_chi_counts_{};

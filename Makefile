@@ -4,13 +4,13 @@
 # Tích hợp Auto Dependency Tracking (.d)
 # ==========================================
 
-# Source export of TITAN commit 25fc99e888d6 for HoloLift-MD 1.1.0: the build stamp names that commit,
+# Source export of TITAN commit 8758139ee163 for HoloLift 1.2.0: the build stamp names that commit,
 # and the portable profile (AVX2/FMA) is the default.
-export TITAN_GIT_COMMIT = 25fc99e888d62417b1e7ec3b56100dad79c3414e
-export TITAN_BUILD_NUMBER = 330
+export TITAN_GIT_COMMIT = 8758139ee1637ab977b407679aa385f58246b0b7
+export TITAN_BUILD_NUMBER = 458
 export TITAN_GIT_DIRTY = false
 export TITAN_RELEASE_BUILD = false
-export SOURCE_DATE_EPOCH = 1791114781
+export SOURCE_DATE_EPOCH = 1795001813
 PROFILE ?= portable
 TOOLCHAIN ?= auto
 TITAN_CXX23_FLOOR ?= clang20-gxx13
@@ -27,7 +27,8 @@ BUILD_INFO_HEADER = $(GENERATED_DIR)/titan_version_generated.h
 BUILD_INFO_MANIFEST = $(GENERATED_DIR)/titan_build_manifest.json
 BUILD_INFO_RC = $(GENERATED_DIR)/titan_version.rc
 CLI_REGISTRY_GENERATOR = tools/generate_cli_registry.py
-CLI_PARSER_SOURCE = $(SRC_ROOT)/cli/parse_arguments.cpp
+CLI_PARSER_SOURCE = $(SRC_ROOT)/cli/parse_arguments.cpp $(SRC_ROOT)/cli/parse_helpers.cpp \
+                    $(sort $(wildcard $(SRC_ROOT)/cli/parse_options_*.cpp))
 CLI_REGISTRY_HEADER = $(GENERATED_DIR)/titan_cli_registry_generated.h
 CLI_VALIDATION_TEST = tools/test_cli_validation.py
 INCLUDE_DIRS = -I$(GENERATED_DIR) -I$(SRC_ROOT) -I$(SRC_ROOT)/gmxtraj/include -I$(SRC_ROOT)/eigen
@@ -40,15 +41,6 @@ else ifeq ($(PROFILE),portable)
 else
     COMMON_CXX_DEFINES += -DTITAN_BUILD_PROFILE_TOKEN=unknown
 endif
-
-# Large translation units that exhausted compiler memory at -O3 on Linux.
-# These hold per-frame numeric kernels (streaming engine loop, PBC reconstruction),
-# so -O1 left the hottest Linux code path materially slower than the Windows -O3
-# build. -O2 keeps the peak-memory relief while restoring inlining and
-# vectorisation; TITAN_LOWMEM_OPT allows a per-host fallback to -O1 without
-# editing the Makefile.
-TITAN_LOWMEM_OPT ?= -O2
-LOWMEM_CXXFLAGS = $(filter-out -O3 -pipe,$(CXXFLAGS)) $(TITAN_LOWMEM_OPT)
 
 ifeq ($(PROFILE),native)
     ARCH_FLAGS = -march=native
@@ -192,11 +184,29 @@ PBE_GRID_SRCS = $(wildcard $(SRC_ROOT)/pbe/grid/*.cpp)
 BIE_SRCS = $(wildcard $(SRC_ROOT)/bie/*.cpp) \
            $(wildcard $(SRC_ROOT)/bie/fmm/cartesian/*.cpp)
 PBE_SRCS  = $(wildcard $(SRC_ROOT)/tabi/*.cpp) $(BIE_SRCS) $(PBE_GRID_SRCS)
-PBCTOPO_SRCS = $(wildcard $(SRC_ROOT)/pbctopo/*.cpp)
+PBCTOPO_SRCS = $(wildcard $(SRC_ROOT)/pbctopo/*.cpp) \
+               $(wildcard $(SRC_ROOT)/pbctopo/solve/*.cpp)
+# HOLOLIFT=0 builds without HoloLift-MD (src/hololift is neither compiled nor
+# needed); -pbctopo-temporal=hololift is then refused.
+HOLOLIFT ?= 1
+ifeq ($(HOLOLIFT),0)
+HOLOLIFT_SRCS =
+COMMON_CXX_DEFINES += -DTITAN_WITHOUT_HOLOLIFT=1
+else
 HOLOLIFT_SRCS = $(wildcard $(SRC_ROOT)/hololift/*.cpp)
+endif
 TITAN_PATH_SRCS = $(wildcard $(SRC_ROOT)/titan_path/*.cpp)
 GMXTRAJ_SRCS = $(wildcard $(SRC_ROOT)/gmxtraj/*.cpp)
-SRCS  = $(ROOT_SRCS) $(CLI_SRCS) $(PBE_SRCS) $(PBCTOPO_SRCS) $(HOLOLIFT_SRCS) $(TITAN_PATH_SRCS) $(GMXTRAJ_SRCS)
+POSTPROC_SRCS = $(wildcard $(SRC_ROOT)/postproc/*.cpp)
+ENGINE_SRCS = $(wildcard $(SRC_ROOT)/engine/*.cpp)
+NOCAL_SRCS = $(wildcard $(SRC_ROOT)/nocal/*.cpp)
+PTOPO_SRCS = $(wildcard $(SRC_ROOT)/ptopo/*.cpp)
+TOPOLOGY_SRCS = $(wildcard $(SRC_ROOT)/topology/*.cpp)
+FREE_ENERGY_SRCS = $(wildcard $(SRC_ROOT)/free_energy/*.cpp)
+GBSA_SRCS = $(wildcard $(SRC_ROOT)/gbsa/*.cpp)
+ENERGY_SRCS = $(wildcard $(SRC_ROOT)/energy/*.cpp)
+SRCS  = $(ROOT_SRCS) $(CLI_SRCS) $(PBE_SRCS) $(PBCTOPO_SRCS) $(HOLOLIFT_SRCS) $(TITAN_PATH_SRCS) $(GMXTRAJ_SRCS) $(PTOPO_SRCS) \
+        $(POSTPROC_SRCS) $(ENGINE_SRCS) $(NOCAL_SRCS) $(TOPOLOGY_SRCS) $(FREE_ENERGY_SRCS) $(GBSA_SRCS) $(ENERGY_SRCS)
 OBJS  = $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SRCS))
 DEPS  = $(OBJS:.o=.d)
 
@@ -227,7 +237,7 @@ $(BUILD_INFO_HEADER): FORCE $(VERSION_FILE) $(BUILD_INFO_GENERATOR)
 build-info: $(BUILD_INFO_HEADER)
 
 $(CLI_REGISTRY_HEADER): $(CLI_PARSER_SOURCE) $(CLI_REGISTRY_GENERATOR)
-	@$(PYTHON) $(CLI_REGISTRY_GENERATOR) --parser $(CLI_PARSER_SOURCE) --output $(CLI_REGISTRY_HEADER)
+	@$(PYTHON) $(CLI_REGISTRY_GENERATOR) $(addprefix --parser ,$(CLI_PARSER_SOURCE)) --output $(CLI_REGISTRY_HEADER)
 
 cli-registry: $(CLI_REGISTRY_HEADER)
 
@@ -270,19 +280,6 @@ cli-validation-test: all $(CLI_VALIDATION_SMOKE_TARGET)
 $(BUILD_DIR)/$(SRC_ROOT)/titan_rf_model.o: CXXFLAGS := $(filter-out -O3,$(CXXFLAGS)) -O0
 
 ifneq ($(OS),Windows_NT)
-$(BUILD_DIR)/$(SRC_ROOT)/solv_pbc_pbctopo.o: CXXFLAGS := $(LOWMEM_CXXFLAGS)
-$(BUILD_DIR)/$(SRC_ROOT)/pbctopo/anchor_graph.o: CXXFLAGS := $(LOWMEM_CXXFLAGS)
-$(BUILD_DIR)/$(SRC_ROOT)/pbctopo/component_graph.o: CXXFLAGS := $(LOWMEM_CXXFLAGS)
-$(BUILD_DIR)/$(SRC_ROOT)/pbctopo/component_refine.o: CXXFLAGS := $(LOWMEM_CXXFLAGS)
-$(BUILD_DIR)/$(SRC_ROOT)/pbctopo/component_search.o: CXXFLAGS := $(LOWMEM_CXXFLAGS)
-$(BUILD_DIR)/$(SRC_ROOT)/pbctopo/component_search_pair_table.o: CXXFLAGS := $(LOWMEM_CXXFLAGS)
-$(BUILD_DIR)/$(SRC_ROOT)/pbctopo/llps_local.o: CXXFLAGS := $(LOWMEM_CXXFLAGS)
-$(BUILD_DIR)/$(SRC_ROOT)/pbctopo/local_graph.o: CXXFLAGS := $(LOWMEM_CXXFLAGS)
-$(BUILD_DIR)/$(SRC_ROOT)/engine_postproc.o: CXXFLAGS := $(LOWMEM_CXXFLAGS)
-$(BUILD_DIR)/$(SRC_ROOT)/impl_engine.o: CXXFLAGS := $(LOWMEM_CXXFLAGS)
-$(BUILD_DIR)/$(SRC_ROOT)/solv_pbc_new_al.o: CXXFLAGS := $(LOWMEM_CXXFLAGS)
-$(BUILD_DIR)/$(SRC_ROOT)/find_pull_direction.o: CXXFLAGS := $(LOWMEM_CXXFLAGS)
-$(BUILD_DIR)/$(SRC_ROOT)/pull_direction_pathway.o: CXXFLAGS := $(LOWMEM_CXXFLAGS)
 $(BUILD_DIR)/$(SRC_ROOT)/titan_rf_model.o: CXXFLAGS := $(filter-out -O3 -pipe,$(CXXFLAGS)) -O0
 endif
 

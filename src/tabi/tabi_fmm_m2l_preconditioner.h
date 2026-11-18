@@ -138,7 +138,8 @@ FmmIluBudgetSelection select_fmm_m2l_nearfield_ilu0_budget(
     std::size_t diagonal_size, bool coupled, std::size_t neighbor_cap,
     std::size_t memory_budget_bytes,
     bool include_regularization_retry = false,
-    const std::string &graph_source = "fmm-near");
+    const std::string &graph_source = "fmm-near",
+    TitanExecutor *executor = nullptr);
 
 std::shared_ptr<JcpSparseIluPreconditioner>
 build_fmm_m2l_nearfield_ilu0_preconditioner(

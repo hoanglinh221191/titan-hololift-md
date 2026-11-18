@@ -95,6 +95,8 @@ const char *pbctopo_evidence_state_name(PbctopoEvidenceState state) {
     return "contradicted";
   case PbctopoEvidenceState::WeakAmbiguous:
     return "weak_ambiguous";
+  case PbctopoEvidenceState::ExtendedPeriodic:
+    return "extended_periodic";
   }
   return "not_evaluated";
 }
@@ -220,6 +222,10 @@ const char *pbctopo_failure_reason_name(PbctopoFailureReason reason) {
     return "evidence_hypothesis_unavailable";
   case PbctopoFailureReason::EvidenceUnderdetermined:
     return "evidence_underdetermined";
+  case PbctopoFailureReason::EvidencePeriodic:
+    return "evidence_periodic";
+  case PbctopoFailureReason::BondedWinding:
+    return "bonded_winding";
   case PbctopoFailureReason::CertificationReject:
     return "certification_reject";
   case PbctopoFailureReason::InvalidLattice:
@@ -473,7 +479,21 @@ void write_pbctopo_frame_report_header(std::ostream &out) {
          "soft_pair_inconsistent_edges,"
          "soft_pair_fundamental_cycle_count,"
          "soft_pair_fundamental_cycle_residual_rms,"
-         "soft_pair_fundamental_cycle_residual_max\n";
+         "soft_pair_fundamental_cycle_residual_max,"
+         "steric_policy,input_overlap_scan,input_overlap_vdw_scale,"
+         "input_overlap_fallback_cutoff_A,input_overlap_pairs,"
+         "input_overlap_unit_pairs,input_overlap_min_distance_A,"
+         "input_overlap_min_ratio,contact_cycle_evaluated,contact_cycle_rank,"
+         "contact_cycle_b0_x,contact_cycle_b0_y,contact_cycle_b0_z,"
+         "contact_cycle_b1_x,contact_cycle_b1_y,contact_cycle_b1_z,"
+         "contact_cycle_b2_x,contact_cycle_b2_y,contact_cycle_b2_z,"
+         "contact_graph_components,contact_periodic_graph_components,"
+         "contact_max_component_rank,contact_nonzero_cycle_relations,"
+         "self_image_units,self_image_atom_pairs,self_image_min_distance_A,"
+         "bonded_winding_rank,"
+         "bonded_winding_b0_x,bonded_winding_b0_y,bonded_winding_b0_z,"
+         "bonded_winding_b1_x,bonded_winding_b1_y,bonded_winding_b1_z,"
+         "bonded_winding_b2_x,bonded_winding_b2_y,bonded_winding_b2_z\n";
 }
 
 void write_pbctopo_frame_report_row(std::ostream &out,
@@ -624,7 +644,10 @@ void write_pbctopo_frame_report_row(std::ostream &out,
       << ','
       << pbctopo_frame_mode_name(report.mode) << ',' << report.component_count
       << ',' << report.soft_valid_candidate_count << ','
-      << report.nonclashing_candidate_count << ','
+      << (report.candidate_steric_counts_evaluated
+              ? std::to_string(report.nonclashing_candidate_count)
+              : std::string("na"))
+      << ','
       << report.unique_certified_assignment_count << ','
       << report.committed_candidate_count << ','
       << csv_escape(format_pbctopo_score_vector(report.selected_score)) << ','
@@ -919,7 +942,42 @@ void write_pbctopo_frame_report_row(std::ostream &out,
       << ','
       << format_pbctopo_report_double(
              report.soft_pair_fundamental_cycle_residual_max)
-      << '\n';
+      << ',';
+  const auto &cycle = report.contact_cycle;
+  out << (report.steric_filter ? "filter" : "report") << ','
+      << (!report.input_overlap_evaluated
+              ? "not_evaluated"
+              : report.input_overlap_complete ? "complete" : "incomplete")
+      << ',' << format_pbctopo_report_double(report.input_overlap_vdw_scale)
+      << ','
+      << format_pbctopo_report_double(report.input_overlap_fallback_cutoff_A)
+      << ',';
+  if (report.input_overlap_evaluated)
+    out << report.input_overlap_pairs << ',' << report.input_overlap_unit_pairs;
+  else
+    out << "na,na";
+  out << ','
+      << format_pbctopo_report_double(report.input_overlap_min_distance_A)
+      << ',' << format_pbctopo_report_double(report.input_overlap_min_ratio)
+      << ',' << (cycle.evaluated ? 1 : 0) << ',';
+  if (cycle.evaluated) {
+    out << cycle.rank;
+    for (const auto &vector : cycle.basis)
+      out << ',' << vector.x << ',' << vector.y << ',' << vector.z;
+    out << ',' << cycle.graph_components << ','
+        << cycle.periodic_graph_components << ',' << cycle.max_component_rank
+        << ',' << cycle.nonzero_cycle_relations << ','
+        << cycle.self_image_units << ',' << cycle.self_image_atom_pairs << ','
+        << format_pbctopo_report_double(cycle.self_image_min_distance_A);
+  } else {
+    out << "na";
+    for (int idx = 0; idx < 9 + 7; ++idx)
+      out << ",na";
+  }
+  out << ',' << report.bonded_winding_rank;
+  for (const auto &vector : report.bonded_winding_basis)
+    out << ',' << vector.x << ',' << vector.y << ',' << vector.z;
+  out << '\n';
 }
 
 } // namespace titan_pbctopo

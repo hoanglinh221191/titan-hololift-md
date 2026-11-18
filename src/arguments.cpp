@@ -994,6 +994,21 @@ int arguments::post_process() {
       TitanUI::print_error("MSD: -msd-pbc must be auto, unwrap, or mic.");
       exit(EXIT_FAILURE);
     }
+    std::transform(msd.memory_limit.begin(), msd.memory_limit.end(),
+                   msd.memory_limit.begin(), [](unsigned char c) {
+                     return static_cast<char>(std::tolower(c));
+                   });
+    if (msd.memory_limit != "auto") {
+      try {
+        const double mb = std::stod(msd.memory_limit);
+        if (!std::isfinite(mb) || !(mb > 0.0))
+          throw std::runtime_error("bad");
+      } catch (...) {
+        TitanUI::print_error(
+            "MSD: -msd-memory-limit must be auto or a size in MB > 0.");
+        exit(EXIT_FAILURE);
+      }
+    }
     if (msd.rot_fit_window != "auto") {
       const auto comma = msd.rot_fit_window.find(',');
       try {
@@ -1179,6 +1194,18 @@ int arguments::post_process() {
     cout << "Groups for calculating energy are invalid! ";
     cout << "Your index group(s) must not be negative!\n";
     exit(EXIT_FAILURE);
+  }
+  // PATH-01 (22/10/2026): -de-pathway-radius r used to set the recovery
+  // enter and exit radii both to r, a band of zero width, so Advance and
+  // Recovery could alternate every step at the boundary. The exit radius now
+  // keeps the default exit/enter ratio (3.0/4.0).
+  if (de.path_radius_alias) {
+    if (!de.path_edge_cutoff_explicit)
+      de.path_graph_edge_cutoff = de.dis_along_path;
+    if (!de.path_recovery_enter_explicit)
+      de.path_recovery_enter_radius = de.dis_along_path;
+    if (!de.path_recovery_exit_explicit)
+      de.path_recovery_exit_radius = 0.75 * de.path_recovery_enter_radius;
   }
   if (de.flag_find_pulling_direct) {
     std::transform(de.pull_opt.begin(), de.pull_opt.end(), de.pull_opt.begin(),
@@ -1460,6 +1487,15 @@ int arguments::post_process() {
     TitanUI::print_error("GIST requires the standard analysis path; -gist cannot be combined with -nocal.");
     exit(EXIT_FAILURE);
   }
+  // STR-31: the LLPS core and its DBSCAN clustering take frames only in the
+  // energy frame loop; under -nocal they used to write header-only files.
+  if (llps.flag_llps && flag_nocal) {
+    TitanUI::print_error(
+        "unsupported_nocal_llps: -llps is not supported with -nocal. The LLPS "
+        "and DBSCAN analyses run only in the energy frame loop; remove -nocal "
+        "and select two groups with -g.");
+    exit(EXIT_FAILURE);
+  }
   if (flag_cas && !flag_gbsa) {
     flag_gbsa = true;
     TitanUI::print_info(
@@ -1537,6 +1573,11 @@ int arguments::post_process() {
               "(0 disables filtering).\n";
       exit(EXIT_FAILURE);
     }
+  }
+  if (!std::isfinite(entropy_filter_sigma) || entropy_filter_sigma < 0.0) {
+    cout << "Error: -entropy-filter-sigma must be finite and >= 0 "
+            "(0 = no trimming).\n";
+    exit(EXIT_FAILURE);
   }
 
   if (pbe.flag_pbe) {
@@ -1681,9 +1722,10 @@ int arguments::post_process() {
     }
     if (pbe.tabi_analytic_ses_engine != "current" &&
         pbe.tabi_analytic_ses_engine != "current-dense" &&
-        pbe.tabi_analytic_ses_engine != "patch-ray-experimental") {
+        pbe.tabi_analytic_ses_engine != "patch-ray-experimental" &&
+        pbe.tabi_analytic_ses_engine != "patch-ray-resolution") {
       TitanUI::print_error(
-          "PBE: -pbe-bie-analytic-ses-engine must be current, current-dense, or patch-ray-experimental.");
+          "PBE: -pbe-bie-analytic-ses-engine must be current, current-dense, patch-ray-experimental, or patch-ray-resolution.");
       exit(EXIT_FAILURE);
     }
     // Only a non-default engine is worth rejecting here.  The value is inert
@@ -1788,9 +1830,10 @@ int arguments::post_process() {
         pbe.tabi_precond != "fmm-nearfield-ilu0" &&
         pbe.tabi_precond != "fmm-nearfield-ilu0-coarse" &&
         pbe.tabi_precond != "distance-knn-overlap-schwarz" &&
-        pbe.tabi_precond != "distance-knn-ilu0") {
+        pbe.tabi_precond != "distance-knn-ilu0" &&
+        pbe.tabi_precond != "classic-nearfield-ilu0") {
       TitanUI::print_error(
-          "PBE: -pbe-bie-precond must be auto, none, diagonal, block, block-budgeted, coarse-galerkin-probe, fmm-block-jacobi, fmm-overlap-schwarz, fmm-nearfield-ilu0, fmm-nearfield-ilu0-coarse, distance-knn-overlap-schwarz, or distance-knn-ilu0.");
+          "PBE: -pbe-bie-precond must be auto, none, diagonal, block, block-budgeted, coarse-galerkin-probe, fmm-block-jacobi, fmm-overlap-schwarz, fmm-nearfield-ilu0, fmm-nearfield-ilu0-coarse, distance-knn-overlap-schwarz, distance-knn-ilu0, or classic-nearfield-ilu0.");
       exit(EXIT_FAILURE);
     }
     const bool fmm_native_preconditioner =
@@ -2417,7 +2460,8 @@ int arguments::post_process() {
     const bool sparse_ilu_preconditioner =
         pbe.tabi_precond == "fmm-nearfield-ilu0" ||
         pbe.tabi_precond == "fmm-nearfield-ilu0-coarse" ||
-        pbe.tabi_precond == "distance-knn-ilu0";
+        pbe.tabi_precond == "distance-knn-ilu0" ||
+        pbe.tabi_precond == "classic-nearfield-ilu0";
     // Adaptive is the default for sparse ILU. Other preconditioners do not use
     // this setting; keep their audit state unambiguous instead of rejecting a
     // default that is irrelevant to them.
@@ -2440,6 +2484,13 @@ int arguments::post_process() {
     const bool tabi_fmm_local_static_refine =
         pbe.tabi_fmm_local_refine == "operator-tail-static" ||
         pbe.tabi_fmm_local_refine == "operator-tail-linf";
+    // gmres-p4 also runs under the manuscript's solution audit (=targets),
+    // which audits node patches on the converged solution and skips the
+    // sampled-detail attribution passes; the solve itself is the same.
+    const bool tabi_p4_audit_ok =
+        pbe.tabi_matvec_audit == "sampled-detail" ||
+        (pbe.tabi_fmm_local == "gmres-p4" &&
+         pbe.tabi_matvec_audit == "targets");
     if (pbe.tabi_fmm_local == "single-matvec-p4" &&
         !(pbe.backend == "tabi" && pbe.tabi_sum == "treecode" &&
           pbe.tabi_fmm_m2l == "single-matvec-analytic" &&
@@ -2488,7 +2539,7 @@ int arguments::post_process() {
     if (pbe.tabi_fmm_local == "gmres-p4" &&
         !(pbe.backend == "tabi" && pbe.tabi_sum == "treecode" &&
           pbe.tabi_fmm_m2l == "single-matvec-analytic" &&
-          pbe.tabi_matvec_audit == "sampled-detail" &&
+          tabi_p4_audit_ok &&
           pbe.tabi_taylor_order >= 2 && pbe.tabi_taylor_order <= 5 &&
           tabi_fmm_local_static_refine &&
           tabi_gmres_p4_refine_tolerance_ok &&
@@ -2503,7 +2554,7 @@ int arguments::post_process() {
            pbe.tabi_fmm_local_refine_probe_mode == "rademacher" &&
            pbe.tabi_precond_ilu_drop_tol == 0.0)) {
       TitanUI::print_error(
-          "PBE: -pbe-bie-fmm-local=gmres-p4 requires analytical FMM/M2L TABI treecode, sampled-detail audit, Taylor order 2, 3, 4, or 5, static local refinement (operator-tail-static at tolerance 0.002, or operator-tail-linf with a valid diagnostic tolerance), rademacher refinement probes, metric-cache plan building, green-jet-compressed or green-jet-tiled cache, packed-avx2 fallback, analytic_singular near integration with quad-buffer=off, and fmm-nearfield-ilu0 with neighbor cap 64 and drop tolerance 0. Diagnostic ILU cap sweeps may use neighbor cap 32, 64, or 128 only when -pbe-bie-fmm-local-ilu-cap-sweep=true.");
+          "PBE: -pbe-bie-fmm-local=gmres-p4 requires analytical FMM/M2L TABI treecode, sampled-detail or targets audit, Taylor order 2, 3, 4, or 5, static local refinement (operator-tail-static at tolerance 0.002, or operator-tail-linf with a valid diagnostic tolerance), rademacher refinement probes, metric-cache plan building, green-jet-compressed or green-jet-tiled cache, packed-avx2 fallback, analytic_singular near integration with quad-buffer=off, and fmm-nearfield-ilu0 with neighbor cap 64 and drop tolerance 0. Diagnostic ILU cap sweeps may use neighbor cap 32, 64, or 128 only when -pbe-bie-fmm-local-ilu-cap-sweep=true.");
       exit(EXIT_FAILURE);
     }
     if (pbe.tabi_fmm_local_refine != "off" &&
@@ -2667,9 +2718,9 @@ int arguments::post_process() {
       exit(EXIT_FAILURE);
     }
     if (pbe.tabi_fmm_local_plan_builder == "metric-cache" &&
-        pbe.tabi_matvec_audit != "sampled-detail") {
+        !tabi_p4_audit_ok) {
       TitanUI::print_error(
-          "PBE: -pbe-bie-fmm-local-plan-builder=metric-cache requires sampled-detail audit.");
+          "PBE: -pbe-bie-fmm-local-plan-builder=metric-cache requires sampled-detail audit (or targets with gmres-p4).");
       exit(EXIT_FAILURE);
     }
     if (pbe.tabi_fmm_local_plan_builder == "metric-cache" &&
@@ -2694,9 +2745,9 @@ int arguments::post_process() {
     }
     if ((pbe.tabi_fmm_local_refine_probe_count != 4 ||
          pbe.tabi_fmm_local_refine_probe_mode != "rademacher") &&
-        pbe.tabi_matvec_audit != "sampled-detail") {
+        !tabi_p4_audit_ok) {
       TitanUI::print_error(
-          "PBE: FMM local refine probe controls require sampled-detail audit.");
+          "PBE: FMM local refine probe controls require sampled-detail audit (or targets with gmres-p4).");
       exit(EXIT_FAILURE);
     }
     if (pbe.tabi_fmm_local_geometry_guard != "off" &&
@@ -2710,10 +2761,10 @@ int arguments::post_process() {
           (pbe.tabi_fmm_local == "audit-p4" ||
            pbe.tabi_fmm_local == "single-matvec-p4" ||
            pbe.tabi_fmm_local == "gmres-p4") &&
-          pbe.tabi_matvec_audit == "sampled-detail" &&
+          tabi_p4_audit_ok &&
           pbe.tabi_taylor_order >= 2 && pbe.tabi_taylor_order <= 5)) {
       TitanUI::print_error(
-          "PBE: strict FMM local geometry guard requires static local diagnostics with sampled-detail audit and Taylor order 2, 3, 4, or 5.");
+          "PBE: strict FMM local geometry guard requires static local diagnostics with sampled-detail audit (or targets with gmres-p4) and Taylor order 2, 3, 4, or 5.");
       exit(EXIT_FAILURE);
     }
     if (pbe.tabi_fmm_local_geometry_guard != "off" &&
@@ -2729,7 +2780,7 @@ int arguments::post_process() {
           "PBE: -pbe-bie-fmm-local-geometry-theta requires -pbe-bie-fmm-local-geometry-guard=strict-geometry-mac.");
       exit(EXIT_FAILURE);
     }
-    if (pbe.tabi_fmm_local == "gmres-p4" &&
+    if (pbe.tabi_fmm_local == "gmres-p4" && !pbe.tabi_fmm_local_geometry_sweep &&
         (pbe.tabi_fmm_local_geometry_guard != "strict-geometry-mac" ||
          std::abs(pbe.tabi_fmm_local_geometry_theta - 0.5) > 1.0e-15)) {
       TitanUI::print_error(
@@ -3069,6 +3120,20 @@ int arguments::post_process() {
          pbe.tabi_precond == "fmm-nearfield-ilu0-coarse" ||
          pbe.tabi_precond == "distance-knn-overlap-schwarz" ||
          pbe.tabi_precond == "distance-knn-ilu0");
+    const bool classic_ilu_preconditioner =
+        pbe.backend == "tabi" && pbe.tabi_sum == "treecode" &&
+        pbe.tabi_precond == "classic-nearfield-ilu0";
+    if (classic_ilu_preconditioner && pbe.salt <= 0.0) {
+      TitanUI::print_error(
+          "PBE: -pbe-bie-precond=classic-nearfield-ilu0 works on the coupled JCP system and needs -pbe-salt>0.");
+      exit(EXIT_FAILURE);
+    }
+    if (pbe.tabi_precond == "classic-nearfield-ilu0" &&
+        (pbe.backend != "tabi" || pbe.tabi_sum != "treecode")) {
+      TitanUI::print_error(
+          "PBE: -pbe-bie-precond=classic-nearfield-ilu0 needs -pbe=bie with -pbe-bie-sum=treecode.");
+      exit(EXIT_FAILURE);
+    }
     if (fmm_native_coupled_preconditioner && pbe.salt <= 0.0) {
       TitanUI::print_error(
           "PBE: FMM-native BIE preconditioners require positive ionic strength because they operate on the coupled JCP system; use -pbe-salt>0 or select a Poisson-compatible non-FMM preconditioner.");
@@ -3178,8 +3243,10 @@ int arguments::post_process() {
       TitanUI::print_error("PBE: -pbe-nl-residual must be > 0.");
       exit(EXIT_FAILURE);
     }
-    if (pbe.nl_solver != "picard" && pbe.nl_solver != "newton") {
-      TitanUI::print_error("PBE: -pbe-nl-solver must be picard or newton.");
+    if (pbe.nl_solver != "auto" && pbe.nl_solver != "picard" &&
+        pbe.nl_solver != "newton") {
+      TitanUI::print_error(
+          "PBE: -pbe-nl-solver must be auto, picard or newton.");
       exit(EXIT_FAILURE);
     }
     if (pbe.nl_inner != "auto" && pbe.nl_inner != "sor" &&
@@ -3545,8 +3612,8 @@ int arguments::post_process() {
     if (pbe.mg_levels != "auto") {
       try {
         const int parsed_mg_levels = std::stoi(pbe.mg_levels);
-        if (parsed_mg_levels < 1 || parsed_mg_levels > 4) {
-          TitanUI::print_error("PBE: -pbe-mg-levels must be auto or in [1, 4].");
+        if (parsed_mg_levels < 1 || parsed_mg_levels > 16) {
+          TitanUI::print_error("PBE: -pbe-mg-levels must be auto or in [1, 16].");
           exit(EXIT_FAILURE);
         }
       } catch (...) {
@@ -4073,6 +4140,11 @@ int arguments::post_process() {
   // hololift runs HoloLift-MD on the package VIBE writes, against the XTC
   // trajectory VIBE read (src/Main.cpp, src/hololift/temporal_runner.cpp).
   if (pbc.pbctopo_temporal == "hololift") {
+#ifdef TITAN_WITHOUT_HOLOLIFT
+    TitanUI::print_error("PBCTOPO: this build has no HoloLift-MD "
+                         "(-pbctopo-temporal=hololift).");
+    exit(EXIT_FAILURE);
+#endif
     if (pbc.pbctopo_mode != "vibe") {
       TitanUI::print_error(
           "PBCTOPO: -pbctopo-temporal=hololift requires -pbctopo-mode=vibe.");
@@ -4092,6 +4164,11 @@ int arguments::post_process() {
       pbc.pbctopo_temporal_penalty < 0.0) {
     TitanUI::print_error(
         "PBCTOPO: -pbctopo-temporal-penalty must be finite and >= 0.");
+    exit(EXIT_FAILURE);
+  }
+  if (pbc.pbctopo_steric != "report" && pbc.pbctopo_steric != "filter") {
+    TitanUI::print_error(
+        "PBCTOPO: -pbctopo-steric must be report or filter.");
     exit(EXIT_FAILURE);
   }
   if (!std::isfinite(pbc.pbctopo_vdw_clash_scale) ||
@@ -4199,6 +4276,19 @@ int arguments::post_process() {
   if (group_1 == group_2)
     self_int = true;
 
+  // ENE-21 (22/10/2026): with the same group as receptor and ligand the
+  // "complex" PB solve holds two superposed copies of the molecule and E_MM
+  // is its intramolecular energy, so the binding numbers mean nothing.
+  // MM/GBSA already refuses this (invalid_gbsa_identical_selections).
+  if (pbe.pbsa && self_int) {
+    TitanUI::print_error(
+        "invalid_pbsa_identical_selections: MM/PBSA binding endpoints "
+        "require distinct receptor and ligand selections; the same group "
+        "cannot be used twice (-g=" + std::to_string(group_1) + "&" +
+        std::to_string(group_2) + ").");
+    exit(EXIT_FAILURE);
+  }
+
   transform(eu.begin(), eu.end(), eu.begin(), ::toupper);
   if (eu != "KJ/MOL" && eu != "KCAL/MOL") {
     cout << "Energy unit is invalid, only kcal/mol and kJ/mol are supported. "
@@ -4227,6 +4317,7 @@ int arguments::post_process() {
   if (tu != "PS" && tu != "NS") {
     cout << "Time unit is invalid, only ps and ns are supported. Will use the "
             "default unit (ps)\n";
+    tu = "ps";
   } else if (tu == "PS")
     tu = "ps";
   else

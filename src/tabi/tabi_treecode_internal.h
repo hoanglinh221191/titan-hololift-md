@@ -690,6 +690,45 @@ JcpAccum taylor_jcp_node_sum(const Panel &target, const TreeNode &node,
                              double eps_ratio, double kappa, bool coupled,
                              int order,
                              const std::string &derivative_mode) noexcept;
+using RadialJcpFarKernel = JcpAccum (*)(const Panel &, const TreeNode &,
+                                        const double *, const double *,
+                                        const double *, const double *,
+                                        double, double) noexcept;
+// Four nodes for one target: nodes[4], densities lane-major (scalar, normal
+// x, y, z for lane 0, then lane 1, ...), out[4].
+using RadialJcpFarKernel4 = void (*)(const Panel &, const TreeNode *const *,
+                                     const double *const *, double, double,
+                                     JcpAccum *) noexcept;
+// One far-field (target, node) evaluation of the treecode apply, chosen once
+// per apply: the fast radial kernel of tabi_radial_taylor.h for orders 2-5
+// with analytic derivatives (equal to taylor_jcp_node_sum to rounding), else
+// taylor_jcp_node_sum itself. TITAN_FORCE_SCALAR=1 forces the latter. When
+// `fast4` is set, four nodes can go through it at once with the same result
+// per node as `fast`.
+struct JcpFarEvaluator {
+  RadialJcpFarKernel fast{nullptr};
+  RadialJcpFarKernel4 fast4{nullptr};
+  int order{0};
+  bool coupled{false};
+  const std::string *derivative_mode{nullptr};
+  JcpAccum operator()(const Panel &target, const TreeNode &node,
+                      const NodeMoments &phin_scalar,
+                      const NodeMoments &phi_normal_x,
+                      const NodeMoments &phi_normal_y,
+                      const NodeMoments &phi_normal_z, double eps_ratio,
+                      double kappa) const noexcept {
+    if (fast != nullptr)
+      return fast(target, node, phin_scalar.values.data(),
+                  phi_normal_x.values.data(), phi_normal_y.values.data(),
+                  phi_normal_z.values.data(), eps_ratio, kappa);
+    return taylor_jcp_node_sum(target, node, phin_scalar,
+                               {phi_normal_x, phi_normal_y, phi_normal_z},
+                               eps_ratio, kappa, coupled, order,
+                               *derivative_mode);
+  }
+};
+JcpFarEvaluator make_jcp_far_evaluator(int order, bool coupled,
+                                       const std::string &derivative_mode) noexcept;
 JcpChannelAccum taylor_jcp_node_channel_sum(
     const Panel &target, const TreeNode &node, const NodeMoments &phin_scalar,
     const std::array<NodeMoments, 3> &phi_normal, double eps_ratio,
@@ -700,6 +739,19 @@ JcpChannelAccum taylor_jcp_node_channel_degree_sum(
     const std::array<NodeMoments, 3> &phi_normal, double eps_ratio,
     double kappa, bool coupled, int order, const std::string &derivative_mode,
     int moment_degree) noexcept;
+// The two sums above use radial-derivative coefficients for orders 2-5 with
+// analytic derivatives. These are the truncated power-series versions they
+// replaced, kept as the reference for tests and for every other case.
+JcpAccum taylor_jcp_node_sum_series(
+    const Panel &target, const TreeNode &node, const NodeMoments &phin_scalar,
+    const std::array<NodeMoments, 3> &phi_normal, double eps_ratio,
+    double kappa, bool coupled, int order,
+    const std::string &derivative_mode) noexcept;
+JcpChannelAccum taylor_jcp_node_channel_sum_series(
+    const Panel &target, const TreeNode &node, const NodeMoments &phin_scalar,
+    const std::array<NodeMoments, 3> &phi_normal, double eps_ratio,
+    double kappa, bool coupled, int order,
+    const std::string &derivative_mode) noexcept;
 JcpAccum sum_jcp_channels(const JcpChannelAccum &channels) noexcept;
 JcpChannelAccum direct_jcp_ordered_channel_sum_scalar(
     const Panel &target, std::size_t target_index,

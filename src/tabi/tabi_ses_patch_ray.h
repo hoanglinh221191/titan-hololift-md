@@ -5,6 +5,7 @@
 #include "tabi_ses_patch_intersections.h"
 #include "tabi_ses_patch_provenance.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -24,6 +25,17 @@ struct AxisRayCrossings {
   std::vector<std::size_t> offsets;
   std::vector<double> coordinates;
   std::size_t odd_rows{0};
+  // Rows with a patch intersection that could not be certified even after
+  // the perturbed retries, ascending. Their crossings are the uncertified
+  // ones; a caller that votes with row parity must treat them as it treats an
+  // odd row.
+  std::vector<std::size_t> uncertified_rows;
+
+  [[nodiscard]] bool row_uncertified(std::size_t row_index) const noexcept {
+    return !uncertified_rows.empty() &&
+           std::binary_search(uncertified_rows.begin(), uncertified_rows.end(),
+                              row_index);
+  }
 
   [[nodiscard]] std::size_t row_count() const noexcept {
     if (u_count != 0U &&

@@ -1,7 +1,7 @@
 {
- "package": "HoloLift-MD 1.1.0",
- "titan_commit": "25fc99e888d62417b1e7ec3b56100dad79c3414e",
- "titan_build_stamp": "0.2.0-dev.330+g25fc99e888d6",
+ "package": "HoloLift 1.2.0",
+ "titan_commit": "8758139ee1637ab977b407679aa385f58246b0b7",
+ "titan_build_stamp": "0.2.0-dev.458+g8758139ee163",
  "exported_paths": [
   "src",
   "Makefile",
@@ -18,7 +18,42 @@
   "manual.txt moved to docs/TITAN_MANUAL.txt",
   "Makefile: build stamp pinned to the TITAN commit; PROFILE defaults to portable",
   "tools/build_hololift_temporal_value_runner.ps1: output under build\\",
-  "README, LICENSE, THIRD_PARTY_NOTICES, CITATION, .gitignore and TITAN_XDR_NOTICE.license added"
+  "README, TUTORIAL, release notes, LICENSE, THIRD_PARTY_NOTICES, CITATION, .gitignore, TITAN_XDR_NOTICE.license and examples added"
  ],
- "source_files_modified": []
+ "source_files_modified": [],
+ "forcefields": {
+  "from": "forcefields/ of the TITAN-VIBE 1.1.0 release, without its \"(n)\" duplicates",
+  "files": [
+   "AMBER14SB_aminoacids.rtp",
+   "AMBER19SB_aminoacids.rtp",
+   "amber99bsc1.ff",
+   "AMBER99SB-BSC1_aminoacids.rtp",
+   "AMBER99SB-DISP_aminoacids.rtp",
+   "AMBER99SB-ILDN_aminoacids.rtp",
+   "AMBER99SB_aminoacids.rtp",
+   "CHARMM27_aminoacids.rtp",
+   "CHARMM27aminoacids.rtp",
+   "CHARMM36_aminoacids.rtp",
+   "ffAMBER14SBnonbonded.dat",
+   "ffAMBER19SBnonbonded.dat",
+   "ffAMBER99SB-BSC1nonbonded.dat",
+   "ffAMBER99SB-DISPnonbonded.dat",
+   "ffAMBER99SB-ILDNnonbonded.dat",
+   "ffAMBER99SBnonbonded.dat",
+   "ffCHARMM27nonbonded.dat",
+   "ffCHARMM36nonbonded.dat",
+   "ffGROMOS43A1nonbonded.dat",
+   "ffGROMOS53A6nonbonded.dat",
+   "ffGROMOS54A7nonbonded.dat",
+   "ffOPLSAAnonbonded.dat",
+   "GROMOS43A1_aminoacids.rtp",
+   "GROMOS53A6_aminoacids.rtp",
+   "GROMOS54A7_aminoacids.rtp",
+   "OPLSAA_aminoacids.rtp"
+  ]
+ },
+ "example_01": {
+  "starting_structure": "frame 26 of examples/quickstart/01_peptide_pair of the TITAN-VIBE 1.1.0 release, both chains whole",
+  "frames": "built by examples/01_separation/make_frames.py (fixed seed)"
+ }
 }

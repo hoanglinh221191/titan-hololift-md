@@ -386,6 +386,112 @@ SidecarRow make_fit_row(const arguments &args, std::string module,
   return row;
 }
 
+// Per-time-block fit results written by the MSD module (STR-25).
+struct TimeBlockSeries {
+  std::string status{"missing"};
+  std::size_t count{0};
+  double length_ps{std::numeric_limits<double>::quiet_NaN()};
+  std::vector<double> slopes;
+  std::vector<double> alphas;
+};
+
+std::vector<double> parse_double_list(const std::string &text) {
+  std::vector<double> values;
+  std::stringstream in(text);
+  for (std::string item; std::getline(in, item, ',');) {
+    item = trim(item);
+    if (item.empty())
+      continue;
+    double value = std::numeric_limits<double>::quiet_NaN();
+    if (!parse_double(item, value))
+      value = std::numeric_limits<double>::quiet_NaN();
+    values.push_back(value);
+  }
+  return values;
+}
+
+TimeBlockSeries
+read_time_blocks(const std::map<std::string, std::string> &summary) {
+  TimeBlockSeries blocks;
+  const auto get = [&](const char *key) -> std::string {
+    const auto it = summary.find(key);
+    return it == summary.end() ? std::string() : it->second;
+  };
+  const std::string status = get("time_block_status");
+  if (status.empty())
+    return blocks;
+  blocks.status = status;
+  double value = 0.0;
+  if (parse_double(get("time_blocks"), value) && value >= 0.0)
+    blocks.count = static_cast<std::size_t>(value);
+  if (parse_double(get("time_block_length_ps"), value))
+    blocks.length_ps = value;
+  blocks.slopes = parse_double_list(get("time_block_slope_A2_per_ps"));
+  blocks.alphas = parse_double_list(get("time_block_alpha"));
+  return blocks;
+}
+
+// Two-sided 95 % Student t quantile for `dof` degrees of freedom.
+double student_t95(std::size_t dof) {
+  static constexpr double table[] = {
+      12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+      2.201,  2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+      2.080,  2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042};
+  if (dof == 0)
+    return std::numeric_limits<double>::quiet_NaN();
+  return dof <= 30 ? table[dof - 1] : 1.96;
+}
+
+// A fitted observable with its sampling uncertainty from B contiguous time
+// blocks: mean = full-trajectory point estimate (unchanged), sem =
+// sd(block values) * scale / sqrt(B), ci95 = point +- t(B-1) sem.
+SidecarRow make_time_block_row(const arguments &args, std::string module,
+                               std::string observable, const fs::path &source,
+                               std::size_t fit_points, double point_value,
+                               const TimeBlockSeries &blocks,
+                               const std::vector<double> &block_values,
+                               double scale, unsigned int seed_offset) {
+  SidecarRow row;
+  row.module = std::move(module);
+  row.observable = std::move(observable);
+  row.source_file = source.filename().string();
+  row.n_samples = fit_points;
+  row.mean = point_value;
+  std::vector<double> scaled;
+  bool finite = !block_values.empty();
+  for (const double value : block_values) {
+    finite = finite && std::isfinite(value);
+    scaled.push_back(value * scale);
+  }
+  if (blocks.status != "ok" || blocks.count < 2 ||
+      block_values.size() != blocks.count || !finite ||
+      !std::isfinite(point_value)) {
+    row.n_blocks = blocks.count;
+    row.status = "insufficient_blocks";
+    row.note = blocks.status == "ok" ? std::string("time_blocks_incomplete")
+                                     : "time_blocks:" + blocks.status;
+    return row;
+  }
+  const Stats stats = summarize_values(scaled);
+  row.n_blocks = blocks.count;
+  row.sem = stats.sem;
+  const double half = student_t95(blocks.count - 1) * stats.sem;
+  row.ci95_low = point_value - half;
+  row.ci95_high = point_value + half;
+  if (args.uncertainty.mode == "bootstrap") {
+    const auto ci = bootstrap_ci95(scaled, args.uncertainty.bootstrap_samples,
+                                   args.uncertainty.seed + seed_offset);
+    row.boot_low = ci.first;
+    row.boot_high = ci.second;
+  }
+  row.status = "ok";
+  std::ostringstream note;
+  note << "time_block_sem;blocks=" << blocks.count
+       << ";block_length_ps=" << format_double(blocks.length_ps);
+  row.note = note.str();
+  return row;
+}
+
 SidecarRow make_temporal_row(const arguments &args, std::string module,
                              std::string observable, const fs::path &source,
                              const std::vector<double> &values) {
@@ -626,16 +732,8 @@ void add_msd_fit_rows(const arguments &args, std::vector<SidecarRow> &rows) {
     const auto linear = linear_fit_with_blocks(
         points, tmin, tmax, args.uncertainty.blocks,
         args.uncertainty.bootstrap_samples, args.uncertainty.seed);
-    rows.push_back(make_fit_row(args, "MSD", "slope_A2_per_ps", file, linear,
-                                linear.point.slope, 1.0));
-    rows.push_back(make_fit_row(args, "MSD", "D_A2_per_ps", file, linear,
-                                linear.point.ok ? linear.point.slope / 6.0
-                                                : std::numeric_limits<double>::quiet_NaN(),
-                                1.0 / 6.0));
-    rows.push_back(make_fit_row(args, "MSD", "D_cm2_per_s", file, linear,
-                                linear.point.ok ? linear.point.slope / 6.0e4
-                                                : std::numeric_limits<double>::quiet_NaN(),
-                                1.0 / 6.0e4));
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double slope = linear.point.ok ? linear.point.slope : nan;
 
     double amin = tmin;
     double amax = tmax;
@@ -643,13 +741,48 @@ void add_msd_fit_rows(const arguments &args, std::vector<SidecarRow> &rows) {
     const auto logfit = loglog_fit_with_blocks(
         points, amin, amax, args.uncertainty.blocks,
         args.uncertainty.bootstrap_samples, args.uncertainty.seed + 17U);
-    rows.push_back(make_fit_row(args, "MSD", "alpha", file, logfit,
-                                logfit.point.slope, 1.0));
-    rows.push_back(make_fit_row(
+
+    // Sampling uncertainty from contiguous TIME blocks of the trajectory,
+    // MSD and fit per block by the MSD module (STR-25).
+    const TimeBlockSeries blocks = read_time_blocks(diffusion_summary);
+    rows.push_back(make_time_block_row(args, "MSD", "slope_A2_per_ps", file,
+                                       linear.point.n, slope, blocks,
+                                       blocks.slopes, 1.0, 0U));
+    rows.push_back(make_time_block_row(args, "MSD", "D_A2_per_ps", file,
+                                       linear.point.n, slope / 6.0, blocks,
+                                       blocks.slopes, 1.0 / 6.0, 0U));
+    rows.push_back(make_time_block_row(args, "MSD", "D_cm2_per_s", file,
+                                       linear.point.n, slope / 6.0e4, blocks,
+                                       blocks.slopes, 1.0 / 6.0e4, 0U));
+    rows.push_back(make_time_block_row(
+        args, "MSD", "alpha", file, logfit.point.n,
+        logfit.point.ok ? logfit.point.slope : nan, blocks, blocks.alphas, 1.0,
+        17U));
+
+    // The former "block" rows: blocks along the LAG axis of one MSD curve.
+    // Adjacent lags share their origins, so the spread of these sub-window
+    // slopes measures how straight the curve is, not the sampling error of
+    // D; kept under honest names (MDA-14).
+    auto sensitivity = [&](SidecarRow row) {
+      row.observable += "_fit_window_sensitivity";
+      if (row.status == "ok")
+        row.note = "lag_axis_sub_window_spread_not_sampling_error";
+      return row;
+    };
+    rows.push_back(sensitivity(make_fit_row(args, "MSD", "slope_A2_per_ps",
+                                            file, linear, linear.point.slope,
+                                            1.0)));
+    rows.push_back(sensitivity(make_fit_row(args, "MSD", "D_A2_per_ps", file,
+                                            linear, slope / 6.0, 1.0 / 6.0)));
+    rows.push_back(sensitivity(make_fit_row(args, "MSD", "D_cm2_per_s", file,
+                                            linear, slope / 6.0e4,
+                                            1.0 / 6.0e4)));
+    rows.push_back(sensitivity(make_fit_row(args, "MSD", "alpha", file, logfit,
+                                            logfit.point.slope, 1.0)));
+    rows.push_back(sensitivity(make_fit_row(
         args, "MSD", "prefactor_A2_per_ps_alpha", file, logfit,
-        logfit.point.ok ? std::exp(logfit.point.intercept)
-                        : std::numeric_limits<double>::quiet_NaN(),
-        1.0, true, true));
+        logfit.point.ok ? std::exp(logfit.point.intercept) : nan, 1.0, true,
+        true)));
   }
 }
 
@@ -663,6 +796,10 @@ void write_summary(const arguments &args, const std::string &filename,
   out << "bootstrap_samples: " << args.uncertainty.bootstrap_samples << '\n';
   out << "seed: " << args.uncertainty.seed << '\n';
   out << "fit_aware_modules: MSD,S2,Membrane\n";
+  out << "msd_fit_uncertainty: time blocks (MSD and fit per contiguous time "
+         "block, written by the MSD module); *_fit_window_sensitivity rows "
+         "are the former lag-axis blocks and do not estimate a sampling "
+         "error\n";
   out << "trajectory_policy: trajectory_equal_means\n";
   out << "note: Point estimates are unchanged; uncertainty files are opt-in "
          "diagnostics.\n";
@@ -941,6 +1078,15 @@ void export_uncertainty_outputs(const arguments &args, const info &out_info,
     std::vector<SidecarRow> rows;
     add_temporal_rows(args, rows, "MSD", "msd_timeseries.dat",
                       {{"msd_A2", {"msd_A2"}}}, true);
+    // msd_timeseries is MSD against LAG, not a time series: this row is the
+    // mean of the curve over its lags and its "blocks" are lag windows
+    // (STR-25); named for what it is.
+    for (SidecarRow &row : rows)
+      if (row.module == "MSD" && row.observable == "msd_A2") {
+        row.observable = "msd_A2_mean_over_lags";
+        if (row.status == "ok")
+          row.note = "lag_axis_blocks_not_time_blocks";
+      }
     add_msd_fit_rows(args, rows);
     write_sidecar(out_info.get_msd_uncertainty_filename(), rows);
     accumulate_counters(rows, counters);
@@ -975,8 +1121,8 @@ void export_uncertainty_outputs(const arguments &args, const info &out_info,
                        {"penetration_depth_A", {"penetration_depth_A"}}});
     add_record_value_rows(rows, "Membrane", "membrane_order_parameters.csv",
                           {"resname", "tail", "bond"},
-                          {{"order_parameter", {"mean_S", "S"}},
-                           {"order_parameter_std", {"std_S"}}});
+                          {{"order_parameter", {"mean_P2_bond", "mean_S", "S"}},
+                           {"order_parameter_std", {"std_P2_bond", "std_S"}}});
     add_key_value_rows(rows, "Membrane", "membrane_summary_average.dat",
                        {{"replicate_mean_apl_A2", {"mean_apl_A2"}},
                         {"replicate_mean_thickness_A", {"mean_thickness_A"}},

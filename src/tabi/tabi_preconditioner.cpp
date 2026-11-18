@@ -139,11 +139,32 @@ int shared_vertex_count(const Panel &a, const Panel &b) noexcept {
   return count;
 }
 
+// A node patch carries no triangle vertex indices, so the vertex-sharing test
+// would leave it only its self pair and every block of a block preconditioner
+// would be the 2x2 point block.  Its counterpart of a triangle's
+// vertex-sharing neighbours is its one-ring: the nodes adjacent to it.
+bool node_patch_one_ring(const Panel &target, const Panel &source) noexcept {
+  if (!target.node_patch_geometry ||
+      target.node_patch_geometry != source.node_patch_geometry)
+    return false;
+  const NodePatchGeometry &g = *source.node_patch_geometry;
+  const std::size_t s = source.node_patch_index;
+  if (s + 1 >= g.adjacent_offsets.size())
+    return false;
+  return std::binary_search(
+      g.adjacent_nodes.begin() + static_cast<std::ptrdiff_t>(g.adjacent_offsets[s]),
+      g.adjacent_nodes.begin() +
+          static_cast<std::ptrdiff_t>(g.adjacent_offsets[s + 1]),
+      target.node_patch_index);
+}
+
 bool is_singular_near_pair(const Panel &target, std::size_t target_index,
                            const Panel &source,
                            std::size_t source_index) noexcept {
   if (source_index == target_index)
     return true;
+  if (source.node_patch_geometry)
+    return node_patch_one_ring(target, source);
   return shared_vertex_count(target, source) > 0;
 }
 
@@ -1071,9 +1092,9 @@ bool complete_jcp_hybrid_galerkin_monopole(
     moment.x -= panel.area * source_x(panel);
     moment.y -= panel.area * source_y(panel);
     moment.z -= panel.area * source_z(panel);
-    moment.nx -= panel.area * panel.nx;
-    moment.ny -= panel.area * panel.ny;
-    moment.nz -= panel.area * panel.nz;
+    moment.nx -= panel.area * panel_source_nx(panel);
+    moment.ny -= panel.area * panel_source_ny(panel);
+    moment.nz -= panel.area * panel_source_nz(panel);
   };
   for (std::size_t aggregate = 0; aggregate < q; ++aggregate) {
     AggregateMoment &moment = aggregate_moments[aggregate];
@@ -1085,9 +1106,9 @@ bool complete_jcp_hybrid_galerkin_monopole(
       moment.x += panel.area * source_x(panel);
       moment.y += panel.area * source_y(panel);
       moment.z += panel.area * source_z(panel);
-      moment.nx += panel.area * panel.nx;
-      moment.ny += panel.area * panel.ny;
-      moment.nz += panel.area * panel.nz;
+      moment.nx += panel.area * panel_source_nx(panel);
+      moment.ny += panel.area * panel_source_ny(panel);
+      moment.nz += panel.area * panel_source_nz(panel);
     }
   }
 
@@ -1123,9 +1144,9 @@ bool complete_jcp_hybrid_galerkin_monopole(
       moment.x += panel.area * source_x(panel);
       moment.y += panel.area * source_y(panel);
       moment.z += panel.area * source_z(panel);
-      moment.nx += panel.area * panel.nx;
-      moment.ny += panel.area * panel.ny;
-      moment.nz += panel.area * panel.nz;
+      moment.nx += panel.area * panel_source_nx(panel);
+      moment.ny += panel.area * panel_source_ny(panel);
+      moment.nz += panel.area * panel_source_nz(panel);
     }
   }
   coarse.moments_setup_ms =

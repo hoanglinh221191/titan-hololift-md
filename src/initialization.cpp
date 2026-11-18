@@ -2,7 +2,7 @@
 #include "arguments.h"
 #include "functions.h"
 #include "groups.h"
-#include "lj_topology.h"
+#include "topology/lj_topology.h"
 #include "titan_ui.h"
 #include <expected>
 #include <filesystem>

@@ -1,11 +1,16 @@
 #include "tabi_near.h"
 #include "tabi_node_patch_curved.h"
 
+#include "../titan_avx2_math.h"
+#include "../titan_simd_dispatch.h"
+
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <cstdlib>
+#include <iostream>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -159,22 +164,90 @@ KernelValues point_kernel(const Panel &target, const Panel &source, double sx,
   const double inv_eps_ratio = 1.0 / std::max(1.0e-12, eps_ratio);
   const double g0 = green(r, 0.0);
   const double gk = green(r, kappa);
-  const double d0_src =
-      source_normal_green(target.x, target.y, target.z, sx, sy, sz, source.nx,
-                          source.ny, source.nz, 0.0);
-  const double dk_src =
-      source_normal_green(target.x, target.y, target.z, sx, sy, sz, source.nx,
-                          source.ny, source.nz, kappa);
+  // (sx, sy, sz) is the source point of the one-point rule, so the normal is
+  // the source normal that goes with it (panel_source_nx).
+  const double snx = panel_source_nx(source), sny = panel_source_ny(source),
+               snz = panel_source_nz(source);
+  const double d0_src = source_normal_green(target.x, target.y, target.z, sx,
+                                            sy, sz, snx, sny, snz, 0.0);
+  const double dk_src = source_normal_green(target.x, target.y, target.z, sx,
+                                            sy, sz, snx, sny, snz, kappa);
   const double d0_tgt = target_normal_green(target, sx, sy, sz, 0.0);
   const double dk_tgt = target_normal_green(target, sx, sy, sz, kappa);
-  const double d2_0 =
-      mixed_normal_green(target, sx, sy, sz, source.nx, source.ny, source.nz,
-                         0.0);
+  const double d2_0 = mixed_normal_green(target, sx, sy, sz, snx, sny, snz, 0.0);
   const double d2_k =
-      mixed_normal_green(target, sx, sy, sz, source.nx, source.ny, source.nz,
-                         kappa);
+      mixed_normal_green(target, sx, sy, sz, snx, sny, snz, kappa);
   return {g0 - gk, eps_ratio * dk_src - d0_src,
           d0_tgt - inv_eps_ratio * dk_tgt, d2_k - d2_0};
+}
+
+// point_kernel() with one sqrt and one exp instead of seven and eight.  Each
+// expression is copied from green(), source_normal_green(),
+// target_normal_green() and mixed_normal_green(); only exp(-0*r), which is
+// exactly 1 for finite r, and the repeated sqrt/exp calls are replaced by the
+// identical values already computed.  The result is therefore point_kernel()
+// bit for bit.  Returns false for a non-finite r, where exp(-0*r) is not 1;
+// the caller then uses point_kernel().
+bool point_kernel_shared(const Panel &target, const Panel &source, double sx,
+                         double sy, double sz, double eps_ratio, double kappa,
+                         KernelValues &out) noexcept {
+  const double dx = target.x - sx;
+  const double dy = target.y - sy;
+  const double dz = target.z - sz;
+  const double r2 = dx * dx + dy * dy + dz * dz;
+  const double r = std::sqrt(r2);
+  if (!std::isfinite(r))
+    return false;
+  if (r <= 1.0e-14) {
+    out = {};
+    return true;
+  }
+  const double inv_eps_ratio = 1.0 / std::max(1.0e-12, eps_ratio);
+  const double kk0 = std::max(0.0, 0.0);
+  const double expkr0 = 1.0;
+  const double kk = std::max(0.0, kappa);
+  const double expkr = std::exp(-kk * r);
+  const double g0 = expkr0 / (4.0 * kPi * r);
+  const double gk = expkr / (4.0 * kPi * r);
+
+  double d0_src = 0.0;
+  double dk_src = 0.0;
+  double d0_tgt = 0.0;
+  double dk_tgt = 0.0;
+  double d2_0 = 0.0;
+  double d2_k = 0.0;
+  if (!(r2 <= 1.0e-28)) {
+    const double snx = panel_source_nx(source), sny = panel_source_ny(source),
+                 snz = panel_source_nz(source);
+    const double ndotu_src = snx * dx + sny * dy + snz * dz;
+    const double ndotu_tgt =
+        target.nx * dx + target.ny * dy + target.nz * dz;
+    d0_src = expkr0 * (1.0 + kk0 * r) * ndotu_src / (4.0 * kPi * r2 * r);
+    dk_src = expkr * (1.0 + kk * r) * ndotu_src / (4.0 * kPi * r2 * r);
+    d0_tgt = -expkr0 * (1.0 + kk0 * r) * ndotu_tgt / (4.0 * kPi * r2 * r);
+    dk_tgt = -expkr * (1.0 + kk * r) * ndotu_tgt / (4.0 * kPi * r2 * r);
+
+    const double inv_r = 1.0 / r;
+    const double nxu = ndotu_tgt * inv_r;
+    const double nyu = ndotu_src * inv_r;
+    const double nxny = target.nx * snx + target.ny * sny + target.nz * snz;
+    const double inv_r2 = inv_r * inv_r;
+    const double fprime0 = -expkr0 * (1.0 + kk0 * r) * inv_r2 / (4.0 * kPi);
+    const double fsecond0 =
+        expkr0 *
+        (kk0 * kk0 * inv_r + 2.0 * kk0 * inv_r2 + 2.0 * inv_r2 * inv_r) /
+        (4.0 * kPi);
+    d2_0 = -fsecond0 * nxu * nyu - (fprime0 * inv_r) * (nxny - nxu * nyu);
+    const double fprime = -expkr * (1.0 + kk * r) * inv_r2 / (4.0 * kPi);
+    const double fsecond =
+        expkr *
+        (kk * kk * inv_r + 2.0 * kk * inv_r2 + 2.0 * inv_r2 * inv_r) /
+        (4.0 * kPi);
+    d2_k = -fsecond * nxu * nyu - (fprime * inv_r) * (nxny - nxu * nyu);
+  }
+  out = {g0 - gk, eps_ratio * dk_src - d0_src,
+         d0_tgt - inv_eps_ratio * dk_tgt, d2_k - d2_0};
+  return true;
 }
 
 Vec3 make_vec(double x, double y, double z) noexcept { return {x, y, z}; }
@@ -455,6 +528,26 @@ KernelValues centroid_integral(const Panel &target, const Panel &source,
   kernel.k3 *= source.area;
   kernel.k4 *= source.area;
   return kernel;
+}
+
+// centroid_integral() through point_kernel_shared(); false when that declines.
+bool centroid_integral_shared(const Panel &target, const Panel &source,
+                              double eps_ratio, double kappa,
+                              KernelValues &kernel) noexcept {
+  const double sx = source.has_source_quadrature_center ? source.source_x
+                                                        : source.x;
+  const double sy = source.has_source_quadrature_center ? source.source_y
+                                                        : source.y;
+  const double sz = source.has_source_quadrature_center ? source.source_z
+                                                        : source.z;
+  if (!point_kernel_shared(target, source, sx, sy, sz, eps_ratio, kappa,
+                           kernel))
+    return false;
+  kernel.k1 *= source.area;
+  kernel.k2 *= source.area;
+  kernel.k3 *= source.area;
+  kernel.k4 *= source.area;
+  return true;
 }
 
 [[maybe_unused]] bool share_vertex(const Panel &a, const Panel &b) noexcept {
@@ -896,6 +989,9 @@ Panel make_subtriangle_panel(const Panel &source, const Vec3 &a, const Vec3 &b,
   sub.y = (a.y + b.y + c.y) / 3.0;
   sub.z = (a.z + b.z + c.z) / 3.0;
   sub.has_triangle_geometry = source.has_triangle_geometry && sub.area > 0.0;
+  // A piece is a flat triangle in its own right: its centroid and normal are
+  // its source point, not the centroid of the node patch it was cut from.
+  sub.has_source_quadrature_center = false;
   sub.v0_index = static_cast<std::size_t>(-1);
   sub.v1_index = static_cast<std::size_t>(-1);
   sub.v2_index = static_cast<std::size_t>(-1);
@@ -1443,8 +1539,22 @@ double sphere_self_boundary(const std::array<Vec3, 3> &vertices) {
       if (std::isfinite(fine) &&
           std::abs(fine - coarse) <= 1e-8 * std::abs(fine) + 2e-13 * (hi - lo))
         return fine;
-      if (depth == 18)
-        throw std::runtime_error("sphere_patch_self_boundary_nonconverged");
+      if (depth == 18) {
+        // A clipped sliver: the edge interval is 2^-18 of the edge and its
+        // integral already negligible against the patch.  The finer value
+        // is kept and counted rather than ending the solve, as for an
+        // unconverged curved near pair.  A non-finite value still stops it.
+        if (!std::isfinite(fine))
+          throw std::runtime_error("sphere_patch_self_boundary_nonconverged");
+        static std::atomic<std::size_t> unconverged{0};
+        if (unconverged.fetch_add(1, std::memory_order_relaxed) == 0)
+          std::cerr << "TABI sphere-patch: a self-boundary interval of a "
+                       "clipped sliver did not converge by depth 18; its "
+                       "finer estimate is used (last change "
+                    << std::abs(fine - coarse) << ", further ones not "
+                    << "reported)\n";
+        return fine;
+      }
       const double mid = (lo + hi) * .5;
       return self(self, lo, mid, depth + 1) + self(self, mid, hi, depth + 1);
     };
@@ -1766,13 +1876,29 @@ JcpNearPairKernel evaluate_jcp_near_pair_kernel(
   AcceptedKernelValues block_decision;
   bool has_block_decision = false;
 
-  if (node_patch_pair && curved_dual_cell(source)) {
+  if (node_patch_pair && curved_dual_cell(source) && !selected.self_pair &&
+      !selected.one_ring && curved_pair_takes_one_point(target, source)) {
+    // FMM route, outside the curved near zone: the one-point kernel the
+    // packed near loop and the multipole moments use for this cell.
+    kernel = centroid_integral(target, source, eps_ratio, coupled ? kappa : 0.0);
+    if (!coupled)
+      kernel = {0.0, kernel.k2, 0.0, 0.0};
+    used_centroid = true;
+  } else if (node_patch_pair && curved_dual_cell(source)) {
     const auto block = curved_node_pair(target, target_index, source,
                                         source_index, eps_ratio, kappa);
     kernel = {coupled ? block[0] : 0.0, block[1],
               coupled ? block[2] : 0.0, coupled ? block[3] : 0.0};
     used_duffy = true;
     subdivisions = selected.self_pair || selected.one_ring ? 16 : 4;
+    // On the FMM route a curved pair beyond the one-ring replaces the
+    // one-point kernel, so the packed near loop must correct it as it
+    // corrects the one-ring.
+    if (!selected.self_pair && !selected.one_ring &&
+        source.node_patch_geometry->curved->one_point_beyond_radii > 0.0) {
+      selected.geometric_buffer = true;
+      geometric_kernel = "curved_near";
+    }
   } else if (node_patch_pair && !coupled) {
     if (selected.self_pair)
       return selected;
@@ -1934,6 +2060,258 @@ JcpNearPairKernel evaluate_jcp_centroid_monopole_kernel(
   return selected;
 }
 
+#if TITAN_SIMD_X86
+namespace {
+
+TITAN_TARGET_AVX2
+inline bool all_lanes_finite(__m256d v) noexcept {
+  const __m256d magnitude = _mm256_andnot_pd(_mm256_set1_pd(-0.0), v);
+  return _mm256_movemask_pd(_mm256_cmp_pd(
+             magnitude,
+             _mm256_set1_pd(std::numeric_limits<double>::infinity()),
+             _CMP_LT_OQ)) == 0xf;
+}
+
+// Plain-centroid kernels of four sources for one target, added into four
+// per-lane row sums (acc_phi/acc_phin, 4 doubles each). Each pointer holds the
+// four lanes of one field; phin is unused for uncoupled rows. The closed forms
+// are those of point_kernel_shared() with one division per lane (1/r) and the
+// accurate AVX2 exp, so each term agrees with the scalar path to rounding.
+// Lanes with r <= 1e-14 contribute nothing, as in the scalar kernel. If any
+// lane has a non-finite r or kernel, nothing is added and false is returned,
+// so the caller reruns those pairs on the scalar path and keeps its failure
+// behaviour.
+TITAN_TARGET_AVX2
+bool plain_centroid_quad_compute_avx2(
+    const Panel &target, const double *sx, const double *sy, const double *sz,
+    const double *snx, const double *sny, const double *snz,
+    const double *area, const double *phi, const double *phin,
+    double eps_ratio, double kk, bool coupled, double *acc_phi,
+    double *acc_phin) noexcept {
+  const __m256d dx = _mm256_sub_pd(_mm256_set1_pd(target.x), _mm256_loadu_pd(sx));
+  const __m256d dy = _mm256_sub_pd(_mm256_set1_pd(target.y), _mm256_loadu_pd(sy));
+  const __m256d dz = _mm256_sub_pd(_mm256_set1_pd(target.z), _mm256_loadu_pd(sz));
+  const __m256d r2 = _mm256_add_pd(
+      _mm256_add_pd(_mm256_mul_pd(dx, dx), _mm256_mul_pd(dy, dy)),
+      _mm256_mul_pd(dz, dz));
+  const __m256d r = _mm256_sqrt_pd(r2);
+  const __m256d infinity =
+      _mm256_set1_pd(std::numeric_limits<double>::infinity());
+  if (_mm256_movemask_pd(_mm256_cmp_pd(r, infinity, _CMP_LT_OQ)) != 0xf)
+    return false;
+  const __m256d live = _mm256_cmp_pd(r, _mm256_set1_pd(1.0e-14), _CMP_GT_OQ);
+  const __m256d one = _mm256_set1_pd(1.0);
+  const __m256d r_safe = _mm256_blendv_pd(one, r, live);
+  const __m256d inv_r = _mm256_div_pd(one, r_safe);
+  const __m256d inv_r2 = _mm256_mul_pd(inv_r, inv_r);
+  const __m256d inv_r3 = _mm256_mul_pd(inv_r2, inv_r);
+  const __m256d q = _mm256_set1_pd(1.0 / (4.0 * kPi));
+  const __m256d snx_v = _mm256_loadu_pd(snx);
+  const __m256d sny_v = _mm256_loadu_pd(sny);
+  const __m256d snz_v = _mm256_loadu_pd(snz);
+  const __m256d source_projection = _mm256_add_pd(
+      _mm256_add_pd(_mm256_mul_pd(snx_v, dx), _mm256_mul_pd(sny_v, dy)),
+      _mm256_mul_pd(snz_v, dz));
+  const __m256d source_d0 =
+      _mm256_mul_pd(_mm256_mul_pd(q, source_projection), inv_r3);
+  const __m256d area_v = _mm256_loadu_pd(area);
+  const __m256d phi_v = _mm256_loadu_pd(phi);
+  if (!coupled) {
+    const __m256d k2 = _mm256_mul_pd(
+        area_v, _mm256_mul_pd(_mm256_set1_pd(eps_ratio - 1.0), source_d0));
+    if (!all_lanes_finite(k2))
+      return false;
+    _mm256_store_pd(acc_phi,
+                    _mm256_add_pd(_mm256_load_pd(acc_phi),
+                                  _mm256_and_pd(live, _mm256_mul_pd(k2, phi_v))));
+    return true;
+  }
+
+  const __m256d kappa = _mm256_set1_pd(kk);
+  const __m256d kr = _mm256_mul_pd(kappa, r_safe);
+  const __m256d e = titan_avx2::exp_pd(_mm256_sub_pd(_mm256_setzero_pd(), kr));
+  const __m256d e1 = _mm256_mul_pd(e, _mm256_add_pd(one, kr));
+  const __m256d g0 = _mm256_mul_pd(q, inv_r);
+  const __m256d k1 = _mm256_mul_pd(area_v, _mm256_sub_pd(g0, _mm256_mul_pd(e, g0)));
+  const __m256d k2 = _mm256_mul_pd(
+      area_v, _mm256_sub_pd(_mm256_mul_pd(_mm256_set1_pd(eps_ratio),
+                                          _mm256_mul_pd(e1, source_d0)),
+                            source_d0));
+  const __m256d tnx = _mm256_set1_pd(target.nx);
+  const __m256d tny = _mm256_set1_pd(target.ny);
+  const __m256d tnz = _mm256_set1_pd(target.nz);
+  const __m256d target_projection = _mm256_add_pd(
+      _mm256_add_pd(_mm256_mul_pd(tnx, dx), _mm256_mul_pd(tny, dy)),
+      _mm256_mul_pd(tnz, dz));
+  const __m256d target_d0 = _mm256_sub_pd(
+      _mm256_setzero_pd(),
+      _mm256_mul_pd(_mm256_mul_pd(q, target_projection), inv_r3));
+  const double inv_eps_ratio = 1.0 / std::max(1.0e-12, eps_ratio);
+  const __m256d k3 = _mm256_mul_pd(
+      area_v, _mm256_sub_pd(target_d0,
+                            _mm256_mul_pd(_mm256_set1_pd(inv_eps_ratio),
+                                          _mm256_mul_pd(e1, target_d0))));
+  const __m256d nxu = _mm256_mul_pd(target_projection, inv_r);
+  const __m256d nyu = _mm256_mul_pd(source_projection, inv_r);
+  const __m256d nxny = _mm256_add_pd(
+      _mm256_add_pd(_mm256_mul_pd(tnx, snx_v), _mm256_mul_pd(tny, sny_v)),
+      _mm256_mul_pd(tnz, snz_v));
+  const __m256d nxu_nyu = _mm256_mul_pd(nxu, nyu);
+  const __m256d mixed0 = _mm256_mul_pd(
+      _mm256_mul_pd(q, inv_r3),
+      _mm256_sub_pd(nxny, _mm256_mul_pd(_mm256_set1_pd(3.0), nxu_nyu)));
+  const __m256d fprime_over_r = _mm256_sub_pd(
+      _mm256_setzero_pd(), _mm256_mul_pd(_mm256_mul_pd(e1, q), inv_r3));
+  const __m256d fsecond = _mm256_mul_pd(
+      _mm256_mul_pd(e, q),
+      _mm256_add_pd(
+          _mm256_add_pd(_mm256_mul_pd(_mm256_set1_pd(kk * kk), inv_r),
+                        _mm256_mul_pd(_mm256_set1_pd(2.0 * kk), inv_r2)),
+          _mm256_mul_pd(_mm256_set1_pd(2.0), inv_r3)));
+  const __m256d mixedk = _mm256_sub_pd(
+      _mm256_sub_pd(_mm256_setzero_pd(), _mm256_mul_pd(fsecond, nxu_nyu)),
+      _mm256_mul_pd(fprime_over_r, _mm256_sub_pd(nxny, nxu_nyu)));
+  const __m256d k4 = _mm256_mul_pd(area_v, _mm256_sub_pd(mixedk, mixed0));
+  if (!all_lanes_finite(k1) || !all_lanes_finite(k2) ||
+      !all_lanes_finite(k3) || !all_lanes_finite(k4))
+    return false;
+  const __m256d phin_v = _mm256_loadu_pd(phin);
+  const __m256d add_phi = _mm256_add_pd(_mm256_mul_pd(k1, phin_v),
+                                        _mm256_mul_pd(k2, phi_v));
+  const __m256d add_phin = _mm256_add_pd(_mm256_mul_pd(k3, phin_v),
+                                         _mm256_mul_pd(k4, phi_v));
+  _mm256_store_pd(acc_phi, _mm256_add_pd(_mm256_load_pd(acc_phi),
+                                         _mm256_and_pd(live, add_phi)));
+  _mm256_store_pd(acc_phin, _mm256_add_pd(_mm256_load_pd(acc_phin),
+                                          _mm256_and_pd(live, add_phin)));
+  return true;
+}
+
+// Four sources read from their Panels.
+TITAN_TARGET_AVX2
+bool plain_centroid_quad_avx2(const Panel &target,
+                              const std::vector<Panel> &panels,
+                              const std::size_t (&source)[4],
+                              const std::vector<double> &unknowns,
+                              std::size_t n, double eps_ratio, double kk,
+                              bool coupled, double *acc_phi,
+                              double *acc_phin) noexcept {
+  alignas(32) double sx[4], sy[4], sz[4], snx[4], sny[4], snz[4], area[4],
+      phi[4], phin[4];
+  for (int lane = 0; lane < 4; ++lane) {
+    const Panel &s = panels[source[lane]];
+    const bool centre = s.has_source_quadrature_center;
+    sx[lane] = centre ? s.source_x : s.x;
+    sy[lane] = centre ? s.source_y : s.y;
+    sz[lane] = centre ? s.source_z : s.z;
+    snx[lane] = panel_source_nx(s);
+    sny[lane] = panel_source_ny(s);
+    snz[lane] = panel_source_nz(s);
+    area[lane] = s.area;
+    phi[lane] = unknowns[source[lane]];
+    phin[lane] = coupled ? unknowns[n + source[lane]] : 0.0;
+  }
+  return plain_centroid_quad_compute_avx2(target, sx, sy, sz, snx, sny, snz,
+                                          area, phi, phin, eps_ratio, kk,
+                                          coupled, acc_phi, acc_phin);
+}
+
+// Four sources read from a NearSourceCache; consecutive indices are used in
+// place, others gathered.
+TITAN_TARGET_AVX2
+bool plain_centroid_quad_cached_avx2(const Panel &target,
+                                     const NearSourceCache &cache,
+                                     const std::size_t (&source)[4],
+                                     const std::vector<double> &unknowns,
+                                     std::size_t n, double eps_ratio,
+                                     double kk, bool coupled, double *acc_phi,
+                                     double *acc_phin) noexcept {
+  const std::size_t j = source[0];
+  const double *phin_base = coupled ? unknowns.data() + n : nullptr;
+  if (source[1] == j + 1 && source[2] == j + 2 && source[3] == j + 3) {
+    return plain_centroid_quad_compute_avx2(
+        target, &cache.x[j], &cache.y[j], &cache.z[j], &cache.nx[j],
+        &cache.ny[j], &cache.nz[j], &cache.area[j], &unknowns[j],
+        coupled ? phin_base + j : nullptr, eps_ratio, kk, coupled, acc_phi,
+        acc_phin);
+  }
+  alignas(32) double sx[4], sy[4], sz[4], snx[4], sny[4], snz[4], area[4],
+      phi[4], phin[4];
+  for (int lane = 0; lane < 4; ++lane) {
+    const std::size_t k = source[lane];
+    sx[lane] = cache.x[k];
+    sy[lane] = cache.y[k];
+    sz[lane] = cache.z[k];
+    snx[lane] = cache.nx[k];
+    sny[lane] = cache.ny[k];
+    snz[lane] = cache.nz[k];
+    area[lane] = cache.area[k];
+    phi[lane] = unknowns[k];
+    phin[lane] = coupled ? phin_base[k] : 0.0;
+  }
+  return plain_centroid_quad_compute_avx2(target, sx, sy, sz, snx, sny, snz,
+                                          area, phi, phin, eps_ratio, kk,
+                                          coupled, acc_phi, acc_phin);
+}
+
+// Lanes of sources j..j+3 that are the target itself or share a vertex with
+// it (bit l set for lane l). Target indices equal to -1 are skipped, so a
+// panel without triangle geometry never matches another one.
+TITAN_TARGET_AVX2
+int special_quad_mask(const NearSourceCache &cache, std::size_t j,
+                      std::size_t self, const std::size_t (&target)[3]) noexcept {
+  const __m256i index = _mm256_add_epi64(
+      _mm256_set1_epi64x(static_cast<long long>(j)), _mm256_set_epi64x(3, 2, 1, 0));
+  __m256i special = _mm256_cmpeq_epi64(
+      index, _mm256_set1_epi64x(static_cast<long long>(self)));
+  const __m256i a = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i *>(cache.v0.data() + j));
+  const __m256i b = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i *>(cache.v1.data() + j));
+  const __m256i c = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i *>(cache.v2.data() + j));
+  for (const std::size_t t : target) {
+    if (t == static_cast<std::size_t>(-1))
+      continue;
+    const __m256i tv = _mm256_set1_epi64x(static_cast<long long>(t));
+    special = _mm256_or_si256(
+        special, _mm256_or_si256(_mm256_cmpeq_epi64(a, tv),
+                                 _mm256_or_si256(_mm256_cmpeq_epi64(b, tv),
+                                                 _mm256_cmpeq_epi64(c, tv))));
+  }
+  return _mm256_movemask_pd(_mm256_castsi256_pd(special));
+}
+
+} // namespace
+#endif
+
+NearSourceCache build_near_source_cache(const std::vector<Panel> &panels) {
+  NearSourceCache cache;
+  const std::size_t n = panels.size();
+  for (auto *field : {&cache.x, &cache.y, &cache.z, &cache.nx, &cache.ny,
+                      &cache.nz, &cache.area})
+    field->resize(n);
+  cache.v0.resize(n);
+  cache.v1.resize(n);
+  cache.v2.resize(n);
+  constexpr std::size_t none = static_cast<std::size_t>(-1);
+  for (std::size_t i = 0; i < n; ++i) {
+    const Panel &p = panels[i];
+    const bool centre = p.has_source_quadrature_center;
+    cache.x[i] = centre ? p.source_x : p.x;
+    cache.y[i] = centre ? p.source_y : p.y;
+    cache.z[i] = centre ? p.source_z : p.z;
+    cache.nx[i] = panel_source_nx(p);
+    cache.ny[i] = panel_source_ny(p);
+    cache.nz[i] = panel_source_nz(p);
+    cache.area[i] = p.area;
+    cache.v0[i] = p.has_triangle_geometry ? p.v0_index : none;
+    cache.v1[i] = p.has_triangle_geometry ? p.v1_index : none;
+    cache.v2[i] = p.has_triangle_geometry ? p.v2_index : none;
+  }
+  return cache;
+}
+
 JcpNearAccum accumulate_jcp_near_ordered(
     const Panel &target, std::size_t target_index,
     const std::vector<Panel> &panels, const std::vector<double> &unknowns,
@@ -1941,7 +2319,7 @@ JcpNearAccum accumulate_jcp_near_ordered(
     const std::vector<std::size_t> &order, std::size_t begin,
     std::size_t count, const std::string &near_integration,
     const std::string &quad_buffer,
-    TreecodeStats *stats) {
+    TreecodeStats *stats, const NearSourceCache *sources) {
   JcpNearAccum acc;
   const std::size_t n = panels.size();
   const std::size_t end = begin + count;
@@ -1964,21 +2342,159 @@ JcpNearAccum accumulate_jcp_near_ordered(
       return acc;
     }
   }
-  for (std::size_t pos = begin; pos < end; ++pos) {
-    const std::size_t j = order[pos];
-    const Panel &source = panels[j];
+  // Most pairs of a row are well separated and end in the plain centroid rule
+  // of evaluate_jcp_near_pair_kernel(): the final else when coupled (or its
+  // "centroid" mode branch), the kappa = 0 centroid when not.  Those pairs are
+  // recognised with the same tests, which depend on strings and on the target
+  // only through values hoisted here, and counted in bulk.  With AVX2 they
+  // are evaluated four at a time into per-lane sums; otherwise, and for the
+  // tail of a row, by the shared sqrt/exp scalar kernel.  Every other pair,
+  // and any pair whose kernel is non-finite, takes the full dispatcher.
+  const bool centroid_mode = near_integration == "centroid";
+  const bool buffer_off = quad_buffer == "off" || quad_buffer.empty() ||
+                          !target.has_triangle_geometry;
+  const bool target_node_patch = is_node_patch_panel(target);
+  const double plain_kappa = coupled ? kappa : 0.0;
+  std::size_t plain_pairs = 0;
+  const auto add_dispatched = [&](std::size_t j) {
     const JcpNearPairKernel selected = evaluate_jcp_near_pair_kernel(
-        target, target_index, source, j, eps_ratio, kappa, coupled,
+        target, target_index, panels[j], j, eps_ratio, kappa, coupled,
         near_integration, quad_buffer, stats);
     if (!selected.valid)
-      continue;
+      return;
     KernelValues kernel;
     kernel.k1 = selected.k1;
     kernel.k2 = selected.k2;
     kernel.k3 = selected.k3;
     kernel.k4 = selected.k4;
     apply_kernel(acc, kernel, unknowns, n, j, coupled);
+  };
+  const auto add_plain_scalar = [&](std::size_t j) {
+    KernelValues kernel;
+    if (centroid_integral_shared(target, panels[j], eps_ratio, plain_kappa,
+                                 kernel) &&
+        finite_kernel(kernel)) {
+      apply_kernel(acc, kernel, unknowns, n, j, coupled);
+      ++plain_pairs;
+      return;
+    }
+    add_dispatched(j);
+  };
+#if TITAN_SIMD_X86
+  // A target with a non-finite position or normal stays on the scalar path,
+  // where the uncoupled rows still evaluate (and reject) its normal terms.
+  const bool vector_plain =
+      titan_simd_dispatch::runtime_has_avx2() && std::isfinite(target.x) &&
+      std::isfinite(target.y) && std::isfinite(target.z) &&
+      std::isfinite(target.nx) && std::isfinite(target.ny) &&
+      std::isfinite(target.nz);
+  alignas(32) double lane_phi[4] = {0.0, 0.0, 0.0, 0.0};
+  alignas(32) double lane_phin[4] = {0.0, 0.0, 0.0, 0.0};
+  std::size_t pending[4];
+  int pending_count = 0;
+  // With a source cache, a target that is not a node patch and a row without
+  // an active geometric buffer, the only special pairs are the self pair and
+  // one-ring pairs sharing a vertex; both are recognised from the cached
+  // vertex indices, and plain pairs read the cached fields.
+  if (vector_plain && sources != nullptr && sources->x.size() == n &&
+      !target_node_patch && (buffer_off || centroid_mode || !coupled)) {
+    constexpr std::size_t none = static_cast<std::size_t>(-1);
+    const std::size_t t0 = target.has_triangle_geometry ? target.v0_index : none;
+    const std::size_t t1 = target.has_triangle_geometry ? target.v1_index : none;
+    const std::size_t t2 = target.has_triangle_geometry ? target.v2_index : none;
+    const std::size_t *v0 = sources->v0.data();
+    const std::size_t *v1 = sources->v1.data();
+    const std::size_t *v2 = sources->v2.data();
+    const auto shares = [&](std::size_t t, std::size_t j) {
+      return t != none && (t == v0[j] || t == v1[j] || t == v2[j]);
+    };
+    const double kk = std::max(0.0, plain_kappa);
+    const std::size_t target_vertices[3] = {t0, t1, t2};
+    for (std::size_t pos = begin; pos < end; ++pos) {
+      const std::size_t j = order[pos];
+      // Four consecutive plain sources go straight to the kernel.
+      if (pending_count == 0 && pos + 4 <= end && order[pos + 1] == j + 1 &&
+          order[pos + 2] == j + 2 && order[pos + 3] == j + 3 &&
+          special_quad_mask(*sources, j, target_index, target_vertices) == 0) {
+        const std::size_t quad[4] = {j, j + 1, j + 2, j + 3};
+        if (plain_centroid_quad_cached_avx2(target, *sources, quad, unknowns,
+                                            n, eps_ratio, kk, coupled,
+                                            lane_phi, lane_phin))
+          plain_pairs += 4;
+        else
+          for (const std::size_t p : quad)
+            add_plain_scalar(p);
+        pos += 3;
+        continue;
+      }
+      if (j == target_index || shares(t0, j) || shares(t1, j) ||
+          shares(t2, j)) {
+        add_dispatched(j);
+        continue;
+      }
+      pending[pending_count++] = j;
+      if (pending_count == 4) {
+        pending_count = 0;
+        if (plain_centroid_quad_cached_avx2(target, *sources, pending,
+                                            unknowns, n, eps_ratio, kk,
+                                            coupled, lane_phi, lane_phin))
+          plain_pairs += 4;
+        else
+          for (const std::size_t p : pending)
+            add_plain_scalar(p);
+      }
+    }
+  } else
+#endif
+  for (std::size_t pos = begin; pos < end; ++pos) {
+    const std::size_t j = order[pos];
+    const Panel &source = panels[j];
+    if (j != target_index) {
+      const bool node_patch_pair =
+          target_node_patch && is_node_patch_panel(source);
+      const bool one_ring = node_patch_pair
+                                ? node_patch_adjacent(target, source)
+                                : shared_vertex_count(target, source) > 0;
+      // A curved pair outside the FMM near zone takes the same one-point
+      // kernel as any plain pair (evaluate_jcp_near_pair_kernel).
+      bool plain = !one_ring && !(node_patch_pair && curved_dual_cell(source) &&
+                                  !curved_pair_takes_one_point(target, source));
+      if (plain && coupled && !centroid_mode && !buffer_off &&
+          source.has_triangle_geometry)
+        plain = !classify_geometric_near_buffer_pair(target, source,
+                                                     quad_buffer)
+                     .active;
+      if (plain) {
+#if TITAN_SIMD_X86
+        if (vector_plain) {
+          pending[pending_count++] = j;
+          if (pending_count == 4) {
+            pending_count = 0;
+            if (plain_centroid_quad_avx2(target, panels, pending, unknowns, n,
+                                         eps_ratio, std::max(0.0, plain_kappa),
+                                         coupled, lane_phi, lane_phin))
+              plain_pairs += 4;
+            else
+              for (const std::size_t p : pending)
+                add_plain_scalar(p);
+          }
+          continue;
+        }
+#endif
+        add_plain_scalar(j);
+        continue;
+      }
+    }
+    add_dispatched(j);
   }
+#if TITAN_SIMD_X86
+  for (int p = 0; p < pending_count; ++p)
+    add_plain_scalar(pending[p]);
+  acc.phi += (lane_phi[0] + lane_phi[1]) + (lane_phi[2] + lane_phi[3]);
+  acc.phin += (lane_phin[0] + lane_phin[1]) + (lane_phin[2] + lane_phin[3]);
+#endif
+  if (stats != nullptr)
+    stats->near_centroid_pairs += plain_pairs;
   if (stats != nullptr) {
     stats->near_integration = near_integration;
     stats->quad_buffer = quad_buffer;

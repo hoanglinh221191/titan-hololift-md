@@ -3,6 +3,7 @@
 #include "BoxMatrix.h"
 #include "info.h"
 #include "titan_executor.h"
+#include "titan_ui.h"
 
 #include <algorithm>
 #include <cctype>
@@ -297,9 +298,12 @@ bool TitanDihedralAnalyzer::adjacent_residues(std::size_t lhs,
   return a.chainnum == b.chainnum && b.local_index == a.local_index + 1;
 }
 
+// STR-32 (22/10/2026): lengths alone are not enough. A box with a/b/c > 0
+// but degenerate angles (flat cell) used to build a NaN BoxMatrix, so every
+// torsion of the frame came out NaN. Such frames now use plain coordinates,
+// as frames without a box do (Q-native/CMap: STR-26 MDB-13).
 bool TitanDihedralAnalyzer::has_valid_box(const box &frame_box) const noexcept {
-  return frame_box.get_a() > 0.0 && frame_box.get_b() > 0.0 &&
-         frame_box.get_c() > 0.0;
+  return BoxMatrix::valid_box(frame_box);
 }
 
 TitanDihedralAnalyzer::Point
@@ -470,6 +474,14 @@ void TitanDihedralAnalyzer::process_frame(const Multi_MOL &mol,
   std::optional<BoxMatrix> box_matrix;
   if (use_mic)
     box_matrix.emplace(frame.Box);
+  else if (!warned_invalid_box_ && frame.Box.get_a() > 0.0 &&
+           frame.Box.get_b() > 0.0 && frame.Box.get_c() > 0.0) {
+    warned_invalid_box_ = true;
+    TitanUI::print_warning(
+        "Dihedral: frame box is not a valid periodic cell (degenerate "
+        "angles); torsions of such frames use plain coordinates, without "
+        "the minimum image.");
+  }
   ++frames_used_;
 
   if (wants_backbone())

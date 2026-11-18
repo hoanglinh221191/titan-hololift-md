@@ -1,6 +1,7 @@
 #include "titan_mbar.h"
 
 #include "aligned_allocator.h"
+#include "free_energy/mbar_demux_map.h"
 #include "titan_dham.h"
 #include "titan_executor.h"
 #include "titan_ui.h"
@@ -19,6 +20,8 @@
 namespace {
 
 constexpr double kBoltzmannKjPerMolK = 0.008314462618;
+// 1 bar nm^3 in kJ/mol (1e-22 J * N_A); same value as DHAM's p V term
+constexpr double kBarNm3ToKJPerMol = 0.06022140857;
 constexpr double kLogGuard = 1e-20;
 constexpr double kTimeFilterTolerancePs = 1e-3;
 constexpr int kSciIterations = 200;
@@ -34,6 +37,11 @@ constexpr double kAdjacentOverlapWarn = 0.03;
 constexpr double kMinStateEssWarn = 5.0;
 constexpr double kMinTargetEssFractionWarn = 0.20;
 constexpr std::size_t kAvxDoubleWidth = 4;
+// KIN-20: moving-block bootstrap. Block length = ceil(4 g); the variance of a
+// mean is then underestimated by about g / (2 L) = 12 % (6 % in the error)
+// for an exponential autocorrelation. At least 8 blocks per replica series.
+constexpr double kBootstrapBlocksPerInefficiency = 4.0;
+constexpr std::size_t kBootstrapMinBlocks = 8;
 
 struct ReplicaSeries {
   int replica_id{-1};
@@ -54,6 +62,7 @@ struct PreparedSeries {
   std::vector<int> sampled_state_indices{};
   std::vector<double> sampled_temperatures_k{};
   std::vector<int64_t> global_indices{};
+  std::vector<double> box_volumes_nm3{}; // NaN when the frame has no box
 };
 
 struct SampleOrigin {
@@ -108,6 +117,47 @@ struct RunningStats {
     return std::sqrt(std::max(0.0, m2 / static_cast<double>(count - 1)));
   }
 };
+
+// Statistical inefficiency g = 1 + 2 tau_int of a time series (Chodera et
+// al., JCTC 3, 26 (2007); pymbar timeseries.statisticalInefficiency with
+// fast = true): g = 1 + 2 sum_t (1 - t/N) C(t) increment(t), summed until the
+// normalised autocorrelation C(t) <= 0 for t > 3, the lag increment growing
+// by one at each step.
+double statistical_inefficiency(const std::vector<double> &series) {
+  const std::size_t n = series.size();
+  if (n < 3)
+    return 1.0;
+  long double mean = 0.0L;
+  for (double v : series)
+    mean += v;
+  mean /= static_cast<long double>(n);
+  std::vector<double> d(n);
+  long double var = 0.0L;
+  for (std::size_t i = 0; i < n; ++i) {
+    d[i] = static_cast<double>(series[i] - mean);
+    var += static_cast<long double>(d[i]) * d[i];
+  }
+  var /= static_cast<long double>(n);
+  if (!(var > 0.0L))
+    return 1.0;
+  double g = 1.0;
+  std::size_t t = 1, increment = 1;
+  while (t < n - 1) {
+    long double c = 0.0L;
+    for (std::size_t i = 0; i + t < n; ++i)
+      c += static_cast<long double>(d[i]) * d[i + t];
+    const double corr =
+        static_cast<double>(c / (static_cast<long double>(n - t) * var));
+    if (corr <= 0.0 && t > 3)
+      break;
+    g += 2.0 * corr *
+         (1.0 - static_cast<double>(t) / static_cast<double>(n)) *
+         static_cast<double>(increment);
+    t += increment;
+    ++increment;
+  }
+  return std::max(1.0, g);
+}
 
 struct TimeSelectionSummary {
   std::size_t count{0};
@@ -167,70 +217,6 @@ filter_time_value_pairs(const std::vector<std::pair<double, double>> &rows,
     filtered.push_back(row);
   }
   return filtered;
-}
-
-bool read_mbar_demux_map(const std::string &path,
-                         std::vector<std::vector<int>> &rows_out,
-                         std::string &error_message) {
-  rows_out.clear();
-  std::ifstream in(path);
-  if (!in.is_open()) {
-    error_message = "cannot open demux map file: " + path;
-    return false;
-  }
-
-  std::string line;
-  std::size_t expected_cols = 0;
-  int line_no = 0;
-  while (std::getline(in, line)) {
-    ++line_no;
-    const auto hash_pos = line.find('#');
-    if (hash_pos != std::string::npos)
-      line.erase(hash_pos);
-    std::replace(line.begin(), line.end(), ',', ' ');
-    std::istringstream iss(line);
-    std::vector<int> row;
-    int value = 0;
-    while (iss >> value)
-      row.push_back(value);
-    if (row.empty())
-      continue;
-    if (expected_cols == 0) {
-      expected_cols = row.size();
-    } else if (row.size() != expected_cols) {
-      error_message = "inconsistent demux-map column count at line " +
-                      std::to_string(line_no);
-      return false;
-    }
-    rows_out.push_back(std::move(row));
-  }
-
-  if (rows_out.empty()) {
-    error_message = "demux map is empty";
-    return false;
-  }
-  return true;
-}
-
-std::unordered_map<int, std::vector<int>>
-build_per_replica_state_assignments(const std::vector<std::vector<int>> &rows,
-                                    std::size_t n_states) {
-  std::unordered_map<int, std::vector<int>> result;
-  for (std::size_t row = 0; row < rows.size(); ++row) {
-    const auto &values = rows[row];
-    for (std::size_t state_idx = 0; state_idx < values.size() &&
-                                   state_idx < n_states;
-         ++state_idx) {
-      const int replica_id = values[state_idx];
-      if (replica_id < 0)
-        continue;
-      auto &assignment = result[replica_id];
-      if (assignment.size() < rows.size())
-        assignment.assign(rows.size(), -1);
-      assignment[row] = static_cast<int>(state_idx);
-    }
-  }
-  return result;
 }
 
 int map_temperature_to_state(const std::vector<double> &temps,
@@ -334,29 +320,28 @@ infer_ladder_temperatures_from_observed_series(
 
 std::vector<double> infer_ladder_temperatures_from_demux(
     const std::vector<std::vector<TitanIO::XvgTimeTwoValues>> &series_by_replica,
-    const std::unordered_map<int, std::vector<int>> &per_replica_assignments,
-    std::size_t n_states, const arguments &args, std::string &error_message) {
+    const titan_fe::DemuxStateMap &demux_map, std::size_t n_states,
+    const arguments &args, std::string &error_message) {
   error_message.clear();
   if (n_states == 0) {
     error_message = "cannot infer MBAR ladder temperatures for zero states";
     return {};
   }
 
+  // KIN-17: the state of each energy row is resolved by its time.
   std::vector<double> state_sums(n_states, 0.0);
   std::vector<int> state_counts(n_states, 0);
   for (std::size_t replica_idx = 0; replica_idx < series_by_replica.size();
        ++replica_idx) {
-    const auto assignment_it =
-        per_replica_assignments.find(static_cast<int>(replica_idx));
-    if (assignment_it == per_replica_assignments.end())
+    const int replica = static_cast<int>(replica_idx);
+    if (!demux_map.covers_replica(replica))
       continue;
     const auto &series = series_by_replica[replica_idx];
-    const auto &assignments = assignment_it->second;
-    const std::size_t n_rows = std::min(series.size(), assignments.size());
-    for (std::size_t row_idx = 0; row_idx < n_rows; ++row_idx) {
+    for (std::size_t row_idx = 0; row_idx < series.size(); ++row_idx) {
       if (!keep_mbar_energy_time(args, series[row_idx].time_ps))
         continue;
-      const int state_index = assignments[row_idx];
+      const int state_index =
+          demux_map.state_at(replica, series[row_idx].time_ps);
       if (state_index < 0 ||
           static_cast<std::size_t>(state_index) >= n_states ||
           !std::isfinite(series[row_idx].value2)) {
@@ -1338,8 +1323,33 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
   if (have_frame_metadata && !frame_metadata.box_volumes_nm3.empty() &&
       !have_box_volume_metadata) {
     TitanUI::print_warning(
-        "MBAR: frame box-volume metadata size mismatch. NPT runs will treat "
-        "the XVG observable as already enthalpy-like.");
+        "MBAR: frame box-volume metadata size mismatch; box volumes are not "
+        "used.");
+  }
+  // KIN-18: in NPT the reduced potential of state k is beta_k (U + p V)
+  // (all states at the target pressure), so the reweighted observable is
+  // H = U + p V; p [bar] * V [nm^3] * 0.0602214 kJ/mol, as in DHAM.
+  const double pv_pressure_bar = args.mbar.target_pressure_bar;
+  const bool pv_pressure_given =
+      std::isfinite(pv_pressure_bar) && pv_pressure_bar > 0.0;
+  const bool add_pv = use_npt && pv_pressure_given && have_box_volume_metadata;
+  const double pv_factor = add_pv ? pv_pressure_bar * kBarNm3ToKJPerMol : 0.0;
+  result.pv_term_included = add_pv;
+  result.pv_pressure_bar = add_pv ? pv_pressure_bar : 0.0;
+  if (add_pv) {
+    std::ostringstream note;
+    note << "included (p = " << std::fixed << std::setprecision(6)
+         << pv_pressure_bar << " bar, V from the trajectory boxes)";
+    result.pv_term_note = note.str();
+  } else if (!use_npt) {
+    result.pv_term_note = "not included (ensemble nvt)";
+  } else if (!pv_pressure_given) {
+    result.pv_term_note =
+        "not included (no target pressure: -mbar-pressure-bar is not > 0)";
+  } else {
+    result.pv_term_note =
+        "not included (no box volume for the frames; the XVG column is used "
+        "as it is)";
   }
   if (use_per_frame) {
     if (use_demux_map) {
@@ -1351,10 +1361,16 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
           "MBAR: mapping per-frame temperatures to the nearest ladder state.");
     }
   }
-  if (use_npt) {
+  if (add_pv) {
     TitanUI::print_info(
-        "MBAR: ensemble=npt. The XVG observable column is treated as an "
-        "enthalpy-like quantity.");
+        "MBAR: ensemble=npt. Reduced potential beta (U + p V) with p = " +
+        std::to_string(pv_pressure_bar) +
+        " bar and V from the trajectory boxes; <H> and Cp refer to "
+        "H = U + p V.");
+  } else if (use_npt) {
+    TitanUI::print_warning("MBAR: ensemble=npt but the p V term is " +
+                           result.pv_term_note +
+                           ". <H> and Cp are those of the XVG column.");
   }
 
   std::unordered_map<int, std::vector<double>> per_replica_times;
@@ -1374,7 +1390,7 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
     }
   }
 
-  std::unordered_map<int, std::vector<int>> per_replica_state_assignments;
+  titan_fe::DemuxStateMap demux_map;
   std::size_t n_states = 0;
   std::vector<double> temps;
   if (have_temp_file) {
@@ -1388,26 +1404,17 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
     n_states = temps.size();
   }
   if (use_demux_map) {
-    std::vector<std::vector<int>> demux_rows;
+    // KIN-17: one column per state (one per replica = energy file when the
+    // ladder is inferred), optionally preceded by the time in ps.
+    if (n_states == 0)
+      n_states = ener_paths.size();
     std::string demux_error;
-    if (!read_mbar_demux_map(args.mbar.demux_map_file, demux_rows, demux_error)) {
+    if (!demux_map.read(args.mbar.demux_map_file, n_states, ener_paths.size(),
+                        demux_error)) {
       result.abort_reason = demux_error;
       TitanUI::print_error("MBAR: " + demux_error);
       return result;
     }
-    if (n_states == 0)
-      n_states = demux_rows.front().size();
-    if (demux_rows.front().size() != n_states) {
-      result.abort_reason = "demux/temperature count mismatch";
-      TitanUI::print_error(
-          "MBAR: demux-map column count (" +
-          std::to_string(demux_rows.front().size()) +
-          ") must match the number of ladder temperatures (" +
-          std::to_string(n_states) + ").");
-      return result;
-    }
-    per_replica_state_assignments =
-        build_per_replica_state_assignments(demux_rows, n_states);
   }
   if (n_states == 0)
     n_states = ener_paths.size();
@@ -1460,6 +1467,33 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
     });
   }
 
+  if (use_demux_map && !demux_map.has_time_column()) {
+    // A map without a time column has one row per energy row; its times are
+    // the energy times (all of the file, before -b/-e/-dt).
+    std::vector<std::vector<double>> energy_row_times(ener_paths.size());
+    for (std::size_t k = 0; k < ener_paths.size(); ++k) {
+      if (need_temperature_series) {
+        for (const auto &row : parsed_xvg_with_temp[k])
+          energy_row_times[k].push_back(row.time_ps);
+      } else {
+        for (const auto &row : parsed_xvg[k])
+          energy_row_times[k].push_back(row.first);
+      }
+    }
+    std::string demux_error;
+    if (!demux_map.attach_energy_row_times(energy_row_times, demux_error)) {
+      result.abort_reason = demux_error;
+      TitanUI::print_error("MBAR: " + demux_error);
+      return result;
+    }
+  }
+  if (use_demux_map) {
+    result.demux_time_source = demux_map.time_source_name();
+    TitanUI::print_info(std::string("MBAR: demux map states resolved by time (") +
+                        demux_map.time_source_name() + ", " +
+                        std::to_string(demux_map.rows()) + " rows).");
+  }
+
   if (infer_ladder_from_replica_input) {
     if (!need_temperature_series) {
       result.abort_reason = "missing per-frame temperatures for ladder inference";
@@ -1471,9 +1505,8 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
 
     std::string infer_error;
     if (use_demux_map) {
-      temps = infer_ladder_temperatures_from_demux(parsed_xvg_with_temp,
-                                                   per_replica_state_assignments,
-                                                   n_states, args, infer_error);
+      temps = infer_ladder_temperatures_from_demux(
+          parsed_xvg_with_temp, demux_map, n_states, args, infer_error);
       result.temperature_ladder_source = "demux-inferred";
     } else {
       temps = infer_ladder_temperatures_from_observed_series(parsed_xvg_with_temp,
@@ -1504,6 +1537,9 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
     audit.inferred_dt_energy_ps = matched.inferred_dt_energy_ps;
     audit.sparse_energy = sparse_energy;
     audit.irregular_energy_dt = irregular_energy_dt;
+    audit.energy_coarser_than_traj = matched.energy_coarser_than_traj;
+    audit.duplicate_energy_matches = matched.duplicate_energy_matches;
+    audit.inferred_dt_traj_ps = matched.inferred_dt_traj_ps;
     const double coverage_tol =
         std::max(1e-6, 2.0 * std::max(1e-6, matched.inferred_dt_energy_ps));
     audit.truncated_start =
@@ -1527,13 +1563,25 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
       return std::string("sparse_energy");
     if (has_window_loss)
       return std::string("trimmed_to_overlap");
+    if (audit.energy_coarser_than_traj)
+      return std::string("energy_coarser_than_traj");
     return std::string("ok");
+  };
+
+  // box volume of trajectory frame `local_frame_index` of replica k (NaN when
+  // the replica has no trajectory metadata or no volumes)
+  auto frame_volume = [&](int replica, std::size_t local_frame_index) {
+    auto it = per_replica_box_volumes.find(replica);
+    if (it == per_replica_box_volumes.end() ||
+        local_frame_index >= it->second.size())
+      return std::numeric_limits<double>::quiet_NaN();
+    return it->second[local_frame_index];
   };
 
   auto push_sample = [&](PreparedSeries &series, double observable_value,
                          std::size_t local_frame_index, double time_ps,
                          int sampled_state_index, double sampled_temperature_k,
-                         int64_t global_frame_index) {
+                         int64_t global_frame_index, double box_volume_nm3) {
     if (!std::isfinite(observable_value) ||
         !std::isfinite(sampled_temperature_k) || sampled_state_index < 0 ||
         static_cast<std::size_t>(sampled_state_index) >= temps.size()) {
@@ -1545,7 +1593,25 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
     series.sampled_state_indices.push_back(sampled_state_index);
     series.sampled_temperatures_k.push_back(sampled_temperature_k);
     series.global_indices.push_back(global_frame_index);
+    series.box_volumes_nm3.push_back(box_volume_nm3);
     return true;
+  };
+
+  // KIN-17: a demux-map state is resolved by the sample's time; a sample whose
+  // state cannot be resolved stops MBAR (counted here, checked after the loop).
+  std::size_t demux_unresolved = 0;
+  int demux_first_unresolved_replica = -1;
+  double demux_first_unresolved_time_ps = 0.0;
+  auto demux_state = [&](int replica, double time_ps) {
+    const int state = demux_map.state_at(replica, time_ps);
+    if (state < 0 || static_cast<std::size_t>(state) >= temps.size()) {
+      if (demux_unresolved++ == 0) {
+        demux_first_unresolved_replica = replica;
+        demux_first_unresolved_time_ps = time_ps;
+      }
+      return -1;
+    }
+    return state;
   };
 
   std::vector<PreparedSeries> usable_series;
@@ -1610,14 +1676,12 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
 
     PreparedSeries series;
     series.replica_id = static_cast<int>(k);
-    const auto demux_it = per_replica_state_assignments.find(static_cast<int>(k));
-    const std::vector<int> *demux_assignment =
-        (use_demux_map && demux_it != per_replica_state_assignments.end())
-            ? &demux_it->second
-            : nullptr;
+    const int replica = static_cast<int>(k);
+    const bool demux_assignment =
+        use_demux_map && demux_map.covers_replica(replica);
 
     if (!have_replica_metadata) {
-      if (use_demux_map && demux_assignment == nullptr) {
+      if (use_demux_map && !demux_assignment) {
         audit.status = "missing_demux_assignment";
         result.window_audit.push_back(std::move(audit));
         continue;
@@ -1638,9 +1702,11 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
           double sampled_temperature_k =
               std::numeric_limits<double>::quiet_NaN();
           if (use_demux_map) {
-            if (demux_assignment == nullptr || idx >= demux_assignment->size())
+            if (!std::isfinite(row.value1))
               continue;
-            sampled_state_index = (*demux_assignment)[idx];
+            sampled_state_index = demux_state(replica, row.time_ps);
+            if (sampled_state_index < 0)
+              continue;
           } else {
             sampled_state_index = map_temperature_to_state(temps, row.value2);
           }
@@ -1650,7 +1716,8 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
                 temps[static_cast<std::size_t>(sampled_state_index)];
           }
           push_sample(series, row.value1, idx, row.time_ps, sampled_state_index,
-                      sampled_temperature_k, -1);
+                      sampled_temperature_k, -1,
+                      std::numeric_limits<double>::quiet_NaN());
         }
       } else {
         series.observables.reserve(filtered_energy_pairs.size());
@@ -1666,20 +1733,20 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
           double sampled_temperature_k =
               (k < temps.size()) ? temps[k]
                                  : std::numeric_limits<double>::quiet_NaN();
-          if (demux_assignment != nullptr) {
-            if (idx >= demux_assignment->size())
+          if (demux_assignment) {
+            if (!std::isfinite(parsed_xvg[k][idx].second))
               continue;
-            sampled_state_index = (*demux_assignment)[idx];
-            if (sampled_state_index < 0 ||
-                static_cast<std::size_t>(sampled_state_index) >= temps.size()) {
+            sampled_state_index =
+                demux_state(replica, parsed_xvg[k][idx].first);
+            if (sampled_state_index < 0)
               continue;
-            }
             sampled_temperature_k =
                 temps[static_cast<std::size_t>(sampled_state_index)];
           }
           push_sample(series, parsed_xvg[k][idx].second, idx,
                       parsed_xvg[k][idx].first, sampled_state_index,
-                      sampled_temperature_k, -1);
+                      sampled_temperature_k, -1,
+                      std::numeric_limits<double>::quiet_NaN());
         }
       }
       audit.overlap_found = true;
@@ -1712,7 +1779,7 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
     }
 
     if (args.mbar.window_match == "off") {
-      if (use_demux_map && demux_assignment == nullptr) {
+      if (use_demux_map && !demux_assignment) {
         audit.status = "missing_demux_assignment";
         result.window_audit.push_back(std::move(audit));
         continue;
@@ -1768,21 +1835,18 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
             sampled_temperature_k =
                 temps[static_cast<std::size_t>(sampled_state_index)];
           }
-        } else if (demux_assignment != nullptr) {
-          if (idx >= demux_assignment->size())
+        } else if (demux_assignment) {
+          sampled_state_index = demux_state(replica, it_times->second[idx]);
+          if (sampled_state_index < 0)
             continue;
-          sampled_state_index = (*demux_assignment)[idx];
-          if (sampled_state_index < 0 ||
-              static_cast<std::size_t>(sampled_state_index) >= temps.size()) {
-            continue;
-          }
           sampled_temperature_k =
               temps[static_cast<std::size_t>(sampled_state_index)];
         }
         const int64_t global_idx =
             (idx < it_globals->second.size()) ? it_globals->second[idx] : -1;
         push_sample(series, aligned_observables[idx], idx, it_times->second[idx],
-                    sampled_state_index, sampled_temperature_k, global_idx);
+                    sampled_state_index, sampled_temperature_k, global_idx,
+                    frame_volume(replica, idx));
       }
       audit.kept_frames = series.observables.size();
       audit.status = series.observables.empty()
@@ -1798,7 +1862,7 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
       continue;
     }
 
-    if (use_demux_map && demux_assignment == nullptr) {
+    if (use_demux_map && !demux_assignment) {
       audit.status = "missing_demux_assignment";
       result.window_audit.push_back(std::move(audit));
       continue;
@@ -1869,14 +1933,11 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
           sampled_temperature_k =
               temps[static_cast<std::size_t>(sampled_state_index)];
         }
-      } else if (demux_assignment != nullptr) {
-        if (local_frame_index >= demux_assignment->size())
+      } else if (demux_assignment) {
+        sampled_state_index =
+            demux_state(replica, matched.kept_dtraj_times_ps[idx]);
+        if (sampled_state_index < 0)
           continue;
-        sampled_state_index = (*demux_assignment)[local_frame_index];
-        if (sampled_state_index < 0 ||
-            static_cast<std::size_t>(sampled_state_index) >= temps.size()) {
-          continue;
-        }
         sampled_temperature_k =
             temps[static_cast<std::size_t>(sampled_state_index)];
       }
@@ -1886,7 +1947,8 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
               : -1;
       push_sample(series, matched.aligned_values[idx], local_frame_index,
                   matched.kept_dtraj_times_ps[idx], sampled_state_index,
-                  sampled_temperature_k, global_idx);
+                  sampled_temperature_k, global_idx,
+                  frame_volume(replica, local_frame_index));
     }
     audit.kept_frames = series.observables.size();
     audit.status =
@@ -1899,6 +1961,41 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
       usable_series.push_back(std::move(series));
   }
 
+  {
+    // KIN-21: one sample per energy row when the energy grid is coarser
+    std::size_t skipped_frames = 0;
+    const WindowAuditRow *first = nullptr;
+    for (const auto &row : result.window_audit) {
+      if (!row.energy_coarser_than_traj)
+        continue;
+      ++result.energy_coarser_replicas;
+      skipped_frames += row.duplicate_energy_matches;
+      if (!first)
+        first = &row;
+    }
+    if (first) {
+      TitanUI::print_warning(
+          "MBAR: the energy grid is coarser than the trajectory grid for " +
+          std::to_string(result.energy_coarser_replicas) +
+          " replica(s) (replica " + std::to_string(first->replica_id) +
+          ": energy every " + std::to_string(first->inferred_dt_energy_ps) +
+          " ps, frames every " + std::to_string(first->inferred_dt_traj_ps) +
+          " ps). One frame per energy row is used; " +
+          std::to_string(skipped_frames) +
+          " frames between rows carry no energy sample.");
+    }
+  }
+
+  if (demux_unresolved > 0) {
+    std::ostringstream reason;
+    reason << "demux map cannot resolve the state of " << demux_unresolved
+           << " sample(s) (first: replica " << demux_first_unresolved_replica
+           << " at t = " << demux_first_unresolved_time_ps
+           << " ps); the map must cover every sample time";
+    result.abort_reason = reason.str();
+    TitanUI::print_error("MBAR: " + result.abort_reason + ".");
+    return result;
+  }
   if (strict_window_violation) {
     result.abort_reason =
         "strict window matching rejected one or more replicas";
@@ -1911,6 +2008,38 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
     TitanUI::print_warning(
         "MBAR: no usable aligned energy samples remain after window matching.");
     return result;
+  }
+
+  if (add_pv) {
+    // KIN-18: H = U + p V for every sample; U and H must not be mixed, so a
+    // sample without a box volume (a replica without trajectory metadata)
+    // stops MBAR.
+    std::size_t missing_volume = 0;
+    int first_missing_replica = -1;
+    for (const auto &series : usable_series) {
+      for (std::size_t idx = 0; idx < series.observables.size(); ++idx) {
+        const double v = idx < series.box_volumes_nm3.size()
+                             ? series.box_volumes_nm3[idx]
+                             : std::numeric_limits<double>::quiet_NaN();
+        if (!std::isfinite(v) || v <= 0.0) {
+          if (missing_volume++ == 0)
+            first_missing_replica = series.replica_id;
+        }
+      }
+    }
+    if (missing_volume > 0) {
+      std::ostringstream reason;
+      reason << "NPT p V term: " << missing_volume
+             << " sample(s) without a box volume (first: replica "
+             << first_missing_replica
+             << "); H = U + p V cannot be formed for every sample";
+      result.abort_reason = reason.str();
+      TitanUI::print_error("MBAR: " + result.abort_reason + ".");
+      return result;
+    }
+    for (auto &series : usable_series)
+      for (std::size_t idx = 0; idx < series.observables.size(); ++idx)
+        series.observables[idx] += pv_factor * series.box_volumes_nm3[idx];
   }
 
   result.usable_replica_series = usable_series.size();
@@ -2052,6 +2181,35 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
   }
 
   if (args.mbar.bootstrap_samples > 0) {
+    // KIN-20: the frames of a replica series are autocorrelated (REMD energy
+    // along one replica), so frame-wise i.i.d. resampling underestimates the
+    // errors by about sqrt(g). Resample blocks of L = ceil(4 g) consecutive
+    // samples per series (moving-block bootstrap), g = 1 + 2 tau_int of the
+    // series' observable.
+    std::vector<std::size_t> block_lengths(usable_series.size(), 1);
+    for (std::size_t s = 0; s < usable_series.size(); ++s) {
+      const auto &series = usable_series[s];
+      const std::size_t n = series.observables.size();
+      const double g = statistical_inefficiency(series.observables);
+      std::size_t block = static_cast<std::size_t>(
+          std::ceil(kBootstrapBlocksPerInefficiency * g));
+      const std::size_t cap = std::max<std::size_t>(1, n / kBootstrapMinBlocks);
+      if (block > cap) {
+        block = cap;
+        ++result.bootstrap_capped_blocks;
+        TitanUI::print_warning(
+            "MBAR bootstrap: replica " + std::to_string(series.replica_id) +
+            " has statistical inefficiency g = " + std::to_string(g) +
+            " over " + std::to_string(n) +
+            " samples; the block length is capped at N/8 = " +
+            std::to_string(cap) +
+            ", so its bootstrap errors are underestimated.");
+      }
+      block_lengths[s] = std::max<std::size_t>(1, std::min(block, n));
+      result.bootstrap_replica_ids.push_back(series.replica_id);
+      result.bootstrap_inefficiency.push_back(g);
+      result.bootstrap_block_lengths.push_back(block_lengths[s]);
+    }
     std::vector<RunningStats> energy_stats(result.cv_scan.size());
     std::vector<RunningStats> cv_stats(result.cv_scan.size());
     for (int boot = 0; boot < args.mbar.bootstrap_samples; ++boot) {
@@ -2060,26 +2218,34 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
       boot_samples.reserve(samples.size());
       std::vector<int> boot_state_counts(temps.size(), 0);
       std::vector<double> boot_state_sums(temps.size(), 0.0);
-      for (const auto &series : usable_series) {
-        if (series.observables.empty())
+      for (std::size_t s = 0; s < usable_series.size(); ++s) {
+        const auto &series = usable_series[s];
+        const std::size_t n = series.observables.size();
+        if (n == 0)
           continue;
-        std::uniform_int_distribution<std::size_t> dist(
-            0, series.observables.size() - 1);
-        for (std::size_t i = 0; i < series.observables.size(); ++i) {
-          const std::size_t pick = dist(rng);
-          const double value = series.observables[pick];
-          const int state_index = series.sampled_state_indices[pick];
-          if (state_index < 0 ||
-              static_cast<std::size_t>(state_index) >= temps.size()) {
-            continue;
+        const std::size_t block = block_lengths[s];
+        std::uniform_int_distribution<std::size_t> start_dist(0, n - block);
+        for (std::size_t filled = 0; filled < n;) {
+          const std::size_t start = start_dist(rng);
+          const std::size_t take = std::min(block, n - filled);
+          for (std::size_t pick = start; pick < start + take; ++pick) {
+            const double value = series.observables[pick];
+            const int state_index = series.sampled_state_indices[pick];
+            if (state_index < 0 ||
+                static_cast<std::size_t>(state_index) >= temps.size()) {
+              continue;
+            }
+            boot_samples.push_back(value);
+            boot_state_counts[static_cast<std::size_t>(state_index)] += 1;
+            boot_state_sums[static_cast<std::size_t>(state_index)] += value;
           }
-          boot_samples.push_back(value);
-          boot_state_counts[static_cast<std::size_t>(state_index)] += 1;
-          boot_state_sums[static_cast<std::size_t>(state_index)] += value;
+          filled += take;
         }
       }
-      if (boot_samples.empty())
+      if (boot_samples.empty()) {
+        ++result.bootstrap_dropped;
         continue;
+      }
       std::vector<double> boot_temps;
       std::vector<int> boot_counts;
       std::vector<double> boot_means;
@@ -2092,8 +2258,10 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
             boot_state_sums[state_idx] /
             static_cast<double>(boot_state_counts[state_idx]));
       }
-      if (boot_temps.empty())
+      if (boot_temps.empty()) {
+        ++result.bootstrap_dropped;
         continue;
+      }
       const double boot_energy_min =
           *std::min_element(boot_samples.begin(), boot_samples.end());
       std::vector<double> beta_boot(boot_temps.size(), 0.0);
@@ -2104,8 +2272,22 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
       std::vector<double> f_boot(boot_temps.size(), 0.0);
       guess_free_energy_ti(beta_boot, boot_means, f_boot, boot_energy_min);
       SolverStats boot_solver_stats;
-      solve_mbar(boot_samples, beta_boot, boot_counts, f_boot,
-                 boot_energy_min, executor, true, &boot_solver_stats);
+      // KIN-20: a replicate enters the statistics only if its MBAR solve
+      // converged (fast solve first, then the full solver from the TI guess)
+      bool boot_converged =
+          solve_mbar(boot_samples, beta_boot, boot_counts, f_boot,
+                     boot_energy_min, executor, true, &boot_solver_stats);
+      if (!boot_converged) {
+        guess_free_energy_ti(beta_boot, boot_means, f_boot, boot_energy_min);
+        boot_converged =
+            solve_mbar(boot_samples, beta_boot, boot_counts, f_boot,
+                       boot_energy_min, executor, false, &boot_solver_stats);
+      }
+      if (!boot_converged) {
+        ++result.bootstrap_dropped;
+        continue;
+      }
+      ++result.bootstrap_used;
       for (std::size_t idx = 0; idx < result.cv_scan.size(); ++idx) {
         const auto observable = compute_observable_at_temperature(
             boot_samples, beta_boot, boot_counts, f_boot,
@@ -2114,9 +2296,20 @@ CoreResult run_temperature_ladder_reweighting(const arguments &args,
         cv_stats[idx].add(observable.heat_capacity);
       }
     }
+    if (result.bootstrap_dropped > 0) {
+      TitanUI::print_warning(
+          "MBAR bootstrap: " + std::to_string(result.bootstrap_dropped) + "/" +
+          std::to_string(args.mbar.bootstrap_samples) +
+          " replicates dropped (MBAR not converged); errors from " +
+          std::to_string(result.bootstrap_used) + " replicates.");
+    }
+    const double nan = std::numeric_limits<double>::quiet_NaN();
     for (std::size_t idx = 0; idx < result.cv_scan.size(); ++idx) {
-      result.cv_scan[idx].std_energy = energy_stats[idx].stddev();
-      result.cv_scan[idx].std_heat_capacity = cv_stats[idx].stddev();
+      // fewer than two converged replicates: no error estimate
+      result.cv_scan[idx].std_energy =
+          energy_stats[idx].count >= 2 ? energy_stats[idx].stddev() : nan;
+      result.cv_scan[idx].std_heat_capacity =
+          cv_stats[idx].count >= 2 ? cv_stats[idx].stddev() : nan;
       if (std::abs(result.cv_scan[idx].temperature_k - args.mbar.target_temp) <=
           1e-9 * std::max(1.0, args.mbar.target_temp)) {
         result.target_std_energy = result.cv_scan[idx].std_energy;
@@ -2182,7 +2375,8 @@ void write_window_audit_file(const std::string &filename,
          "truncated_start truncated_end irregular_energy_dt sparse_energy "
          "traj_frames energy_points kept_frames dropped_outside unmatched_in_overlap "
          "traj_min_ps traj_max_ps energy_min_ps energy_max_ps overlap_start_ps "
-         "overlap_end_ps inferred_dt_energy_ps\n";
+         "overlap_end_ps inferred_dt_energy_ps energy_coarser_than_traj "
+         "frames_without_own_energy_row inferred_dt_traj_ps\n";
   out << std::setprecision(15);
   for (const auto &row : rows) {
     out << row.replica_id << ' ' << row.status << ' '
@@ -2197,7 +2391,10 @@ void write_window_audit_file(const std::string &filename,
         << row.traj_min_ps << ' ' << row.traj_max_ps << ' '
         << row.energy_min_ps << ' ' << row.energy_max_ps << ' '
         << row.overlap_start_ps << ' ' << row.overlap_end_ps << ' '
-        << row.inferred_dt_energy_ps << '\n';
+        << row.inferred_dt_energy_ps << ' '
+        << (row.energy_coarser_than_traj ? 1 : 0) << ' '
+        << row.duplicate_energy_matches << ' ' << row.inferred_dt_traj_ps
+        << '\n';
   }
 }
 
@@ -2243,10 +2440,19 @@ void write_summary_file(const std::string &filename, const CoreResult &result,
   out << "MBAR Window Match              : " << args.mbar.window_match << "\n";
   out << "MBAR Demux Map                 : "
       << (result.used_demux_map ? args.mbar.demux_map_file : "n/a") << "\n";
+  if (result.used_demux_map)
+    out << "MBAR Demux Map Times           : " << result.demux_time_source
+        << "\n";
   out << "MBAR Temp Column               : " << args.mbar.temp_column << "\n";
   out << "MBAR Pressure (bar)            : " << args.mbar.target_pressure_bar
       << "\n";
-  out << "MBAR Observable                : " << observable_name(use_npt) << "\n";
+  out << "MBAR Observable                : "
+      << (result.pv_term_included
+              ? "enthalpy H = U + pV"
+              : (use_npt ? "XVG column as given (pV not added)"
+                         : observable_name(use_npt)))
+      << "\n";
+  out << "MBAR pV Term                   : " << result.pv_term_note << "\n";
   out << "MBAR Target Temperature (K)    : " << result.target_temp_k << "\n";
   out << "MBAR Usable Replica Series     : "
       << result.usable_replica_series << "\n";
@@ -2254,15 +2460,18 @@ void write_summary_file(const std::string &filename, const CoreResult &result,
       << "\n";
   out << "MBAR Usable Samples            : " << result.total_usable_samples
       << "\n";
+  out << "MBAR Energy Coarser Than Traj  : " << result.energy_coarser_replicas
+      << " replica(s)"
+      << (result.energy_coarser_replicas > 0
+              ? " (one frame per energy row used)"
+              : "")
+      << "\n";
   out << "MBAR Mapped Global Frames      : " << result.mapped_global_frames
       << "\n";
   out << "MBAR Mapped TICA Frames        : "
       << result.mapped_tica_global_frames << "\n";
   out << "MBAR Mapped PCA Frames         : "
       << result.mapped_pca_global_frames << "\n";
-  out << "MBAR Box Volume Metadata       : "
-      << (result.box_volume_metadata_available ? "available" : "not_used")
-      << "\n";
   out << "MBAR Solver Method             : " << result.solver_method << "\n";
   out << "MBAR Solver Iterations         : " << result.solver_iterations << "\n";
   out << "MBAR Solver Backtracks         : "
@@ -2278,6 +2487,27 @@ void write_summary_file(const std::string &filename, const CoreResult &result,
   out << "MBAR Convergence Note          : " << result.convergence_note << "\n";
   out << "MBAR Bootstrap Samples         : " << args.mbar.bootstrap_samples
       << "\n";
+  if (args.mbar.bootstrap_samples > 0) {
+    out << "MBAR Bootstrap Method          : moving block, L = ceil(4 g) per "
+           "replica series (g = 1 + 2 tau_int)\n";
+    out << "MBAR Bootstrap Replicas        :";
+    for (int id : result.bootstrap_replica_ids)
+      out << ' ' << id;
+    out << "\n";
+    out << "MBAR Bootstrap Stat Ineff g    :";
+    for (double g : result.bootstrap_inefficiency)
+      out << ' ' << g;
+    out << "\n";
+    out << "MBAR Bootstrap Block Length    :";
+    for (std::size_t block : result.bootstrap_block_lengths)
+      out << ' ' << block;
+    out << "\n";
+    out << "MBAR Bootstrap Blocks Capped   : " << result.bootstrap_capped_blocks
+        << "\n";
+    out << "MBAR Bootstrap Used            : " << result.bootstrap_used << "\n";
+    out << "MBAR Bootstrap Dropped         : " << result.bootstrap_dropped
+        << " (MBAR not converged)\n";
+  }
   out << "MBAR Scan Points Requested     : " << args.mbar.scan_points << "\n";
   out << "MBAR Scan Points Written       : " << result.cv_scan.size() << "\n";
   out << "MBAR Target <" << observable_symbol(use_npt)
@@ -2300,6 +2530,7 @@ void write_summary_file(const std::string &filename, const CoreResult &result,
   TitanUI::log_kv(log, "MBAR Converged", result.converged ? "yes" : "no");
   TitanUI::log_kv(log, "MBAR Domain", args.mbar.domain);
   TitanUI::log_kv(log, "MBAR Ensemble", args.mbar.ensemble);
+  TitanUI::log_kv(log, "MBAR pV Term", result.pv_term_note);
   TitanUI::log_kv(log, "MBAR Temp Mode", args.mbar.temp_mode);
   TitanUI::log_kv(log, "MBAR Ladder Source",
                   result.temperature_ladder_source);

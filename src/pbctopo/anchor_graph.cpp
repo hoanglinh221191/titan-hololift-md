@@ -1,4 +1,5 @@
 #include "anchor_graph.h"
+#include "anchor_mst.h"
 
 #include "evidence_audit.h"
 
@@ -12,7 +13,9 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <numeric>
+#include <optional>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
@@ -142,6 +145,8 @@ PbctopoAnchorGraphContext build_anchor_graph_context(
     }
   }
   context.has_box = true;
+  context.box_lattice = make_shared<const PbctopoLatticeMetric>(
+      context.box_m, context.box_inv);
 
   if (atoms.empty()) {
     if (timing != nullptr) {
@@ -419,227 +424,6 @@ PbctopoAnchorGraphContext build_anchor_graph_context(
             .count();
   }
   return context;
-}
-
-inline void relax_anchor_best_scalar(double *best, const double *px,
-                                     const double *py, const double *pz,
-                                     size_t n, double sx, double sy,
-                                     double sz) noexcept {
-  for (size_t i = 0; i < n; ++i) {
-    const double dx = sx - px[i];
-    const double dy = sy - py[i];
-    const double dz = sz - pz[i];
-    const double d2 = dx * dx + dy * dy + dz * dz;
-    best[i] = min(best[i], d2);
-  }
-}
-
-#if TITAN_SIMD_X86
-TITAN_TARGET_AVX2
-inline void relax_anchor_best_avx2(double *best, const double *px,
-                                   const double *py, const double *pz,
-                                   size_t n, double sx, double sy,
-                                   double sz) noexcept {
-  const __m256d vsx = _mm256_set1_pd(sx);
-  const __m256d vsy = _mm256_set1_pd(sy);
-  const __m256d vsz = _mm256_set1_pd(sz);
-  size_t i = 0;
-  for (; i + 4 <= n; i += 4) {
-    const __m256d dx = _mm256_sub_pd(vsx, _mm256_loadu_pd(px + i));
-    const __m256d dy = _mm256_sub_pd(vsy, _mm256_loadu_pd(py + i));
-    const __m256d dz = _mm256_sub_pd(vsz, _mm256_loadu_pd(pz + i));
-    const __m256d d2 = _mm256_add_pd(
-        _mm256_add_pd(_mm256_mul_pd(dx, dx), _mm256_mul_pd(dy, dy)),
-        _mm256_mul_pd(dz, dz));
-    const __m256d best_vec = _mm256_loadu_pd(best + i);
-    _mm256_storeu_pd(best + i, _mm256_min_pd(best_vec, d2));
-  }
-  for (; i < n; ++i) {
-    const double dx = sx - px[i];
-    const double dy = sy - py[i];
-    const double dz = sz - pz[i];
-    const double d2 = dx * dx + dy * dy + dz * dz;
-    best[i] = min(best[i], d2);
-  }
-}
-
-TITAN_TARGET_AVX2_FMA
-inline void relax_anchor_best_avx2_fma(double *best, const double *px,
-                                       const double *py, const double *pz,
-                                       size_t n, double sx, double sy,
-                                       double sz) noexcept {
-  const __m256d vsx = _mm256_set1_pd(sx);
-  const __m256d vsy = _mm256_set1_pd(sy);
-  const __m256d vsz = _mm256_set1_pd(sz);
-  size_t i = 0;
-  for (; i + 4 <= n; i += 4) {
-    const __m256d dx = _mm256_sub_pd(vsx, _mm256_loadu_pd(px + i));
-    const __m256d dy = _mm256_sub_pd(vsy, _mm256_loadu_pd(py + i));
-    const __m256d dz = _mm256_sub_pd(vsz, _mm256_loadu_pd(pz + i));
-    const __m256d d2 =
-        _mm256_fmadd_pd(dz, dz,
-                        _mm256_fmadd_pd(dy, dy, _mm256_mul_pd(dx, dx)));
-    const __m256d best_vec = _mm256_loadu_pd(best + i);
-    _mm256_storeu_pd(best + i, _mm256_min_pd(best_vec, d2));
-  }
-  for (; i < n; ++i) {
-    const double dx = sx - px[i];
-    const double dy = sy - py[i];
-    const double dz = sz - pz[i];
-    const double d2 = dx * dx + dy * dy + dz * dz;
-    best[i] = min(best[i], d2);
-  }
-}
-#endif
-
-inline void relax_anchor_best(double *best, const double *px, const double *py,
-                              const double *pz, size_t n, double sx,
-                              double sy, double sz) noexcept {
-  using Kernel = void (*)(double *, const double *, const double *,
-                          const double *, size_t, double, double,
-                          double) noexcept;
-  static const Kernel kernel = []() noexcept -> Kernel {
-#if TITAN_SIMD_X86 && TITAN_RUNTIME_TARGET_ATTRS
-    if (titan_simd_dispatch::runtime_has_avx2_fma())
-      return &relax_anchor_best_avx2_fma;
-    if (titan_simd_dispatch::runtime_has_avx2())
-      return &relax_anchor_best_avx2;
-#endif
-    return &relax_anchor_best_scalar;
-  }();
-  kernel(best, px, py, pz, n, sx, sy, sz);
-}
-
-inline size_t select_anchor_next_scalar(const double *best,
-                                        const unsigned char *used, size_t n,
-                                        double &next_cost) noexcept {
-  size_t next = numeric_limits<size_t>::max();
-  next_cost = numeric_limits<double>::infinity();
-  for (size_t i = 0; i < n; ++i) {
-    if (used[i] != 0)
-      continue;
-    if (best[i] < next_cost) {
-      next = i;
-      next_cost = best[i];
-    }
-  }
-  return next;
-}
-
-#if TITAN_SIMD_X86
-TITAN_TARGET_AVX2
-inline size_t select_anchor_next_avx2(const double *best,
-                                      const unsigned char *used, size_t n,
-                                      double &next_cost) noexcept {
-  const double inf = numeric_limits<double>::infinity();
-  size_t next = numeric_limits<size_t>::max();
-  next_cost = inf;
-  alignas(32) double lane_best[4];
-  size_t i = 0;
-  for (; i + 4 <= n; i += 4) {
-    const __m256d best_vec = _mm256_loadu_pd(best + i);
-    _mm256_store_pd(lane_best, best_vec);
-    for (size_t lane = 0; lane < 4; ++lane) {
-      if (used[i + lane] != 0)
-        continue;
-      if (lane_best[lane] < next_cost) {
-        next = i + lane;
-        next_cost = lane_best[lane];
-      }
-    }
-  }
-  for (; i < n; ++i) {
-    if (used[i] != 0)
-      continue;
-    if (best[i] < next_cost) {
-      next = i;
-      next_cost = best[i];
-    }
-  }
-  return next;
-}
-#endif
-
-inline size_t select_anchor_next(const double *best, const unsigned char *used,
-                                 size_t n, double &next_cost) noexcept {
-  using Kernel =
-      size_t (*)(const double *, const unsigned char *, size_t, double &) noexcept;
-  static const Kernel kernel = []() noexcept -> Kernel {
-#if TITAN_SIMD_X86 && TITAN_RUNTIME_TARGET_ATTRS
-    if (titan_simd_dispatch::runtime_has_avx2())
-      return &select_anchor_next_avx2;
-#endif
-    return &select_anchor_next_scalar;
-  }();
-  return kernel(best, used, n, next_cost);
-}
-
-bool anchor_graph_metrics_ok(const vector<Vec3> &placed_points,
-                             const vector<size_t> &anchor_indices,
-                             double &mst2, double &max_d2,
-                             const PbctopoCutCandidate *incumbent) {
-  mst2 = 0.0;
-  max_d2 = 0.0;
-  if (anchor_indices.size() < 2)
-    return true;
-
-  const size_t n = anchor_indices.size();
-  thread_local vector<double> best_storage;
-  thread_local vector<unsigned char> used_storage;
-  thread_local vector<double> px_storage;
-  thread_local vector<double> py_storage;
-  thread_local vector<double> pz_storage;
-
-  if (best_storage.size() < n)
-    best_storage.resize(n);
-  if (used_storage.size() < n)
-    used_storage.resize(n);
-  if (px_storage.size() < n)
-    px_storage.resize(n);
-  if (py_storage.size() < n)
-    py_storage.resize(n);
-  if (pz_storage.size() < n)
-    pz_storage.resize(n);
-
-  const double inf = numeric_limits<double>::infinity();
-  fill(best_storage.begin(), best_storage.begin() + n, inf);
-  fill(used_storage.begin(), used_storage.begin() + n, static_cast<unsigned char>(0));
-  for (size_t i = 0; i < n; ++i) {
-    const Vec3 &point = placed_points[anchor_indices[i]];
-    px_storage[i] = point.x;
-    py_storage[i] = point.y;
-    pz_storage[i] = point.z;
-  }
-
-  double *best = best_storage.data();
-  unsigned char *used = used_storage.data();
-  const double *px = px_storage.data();
-  const double *py = py_storage.data();
-  const double *pz = pz_storage.data();
-  best[0] = 0.0;
-  const bool has_incumbent =
-      (incumbent != nullptr && incumbent->valid &&
-       isfinite(incumbent->anchor_mst2) && isfinite(incumbent->anchor_max_d2));
-  const double incumbent_anchor_max_d2 =
-      has_incumbent ? incumbent->anchor_max_d2 : inf;
-
-  for (size_t step = 0; step < n; ++step) {
-    double next_cost = inf;
-    const size_t next = select_anchor_next(best, used, n, next_cost);
-    if (next == numeric_limits<size_t>::max())
-      return false;
-    used[next] = 1;
-    mst2 += next_cost;
-    max_d2 = max(max_d2, next_cost);
-    if (has_incumbent && max_d2 > incumbent_anchor_max_d2 + 1.0e-6) {
-      return false;
-    }
-    const double sx = px[next];
-    const double sy = py[next];
-    const double sz = pz[next];
-    relax_anchor_best(best, px, py, pz, n, sx, sy, sz);
-  }
-  return true;
 }
 
 double anchor_axis_value(const Vec3 &point, int axis) {
@@ -1002,7 +786,12 @@ double anchor_endpoint_image_gap(const vector<Vec3> &placed_points,
   if (!context.has_box || a >= placed_points.size() || b >= placed_points.size())
     return numeric_limits<double>::infinity();
   const Vec3 delta = placed_points[b] - placed_points[a];
-  const PbctopoLatticeMetric lattice(context.box_m, context.box_inv);
+  // The same metric as constructing it here from box_m/box_inv.
+  optional<PbctopoLatticeMetric> local_lattice;
+  if (context.box_lattice == nullptr)
+    local_lattice.emplace(context.box_m, context.box_inv);
+  const PbctopoLatticeMetric &lattice =
+      context.box_lattice != nullptr ? *context.box_lattice : *local_lattice;
   const PbctopoNearestImage mic =
       lattice.nearest_image_cartesian(delta.x, delta.y, delta.z);
   if (!mic.valid)

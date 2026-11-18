@@ -9,6 +9,8 @@
 #include <limits>
 #include <vector>
 
+class TitanExecutor;
+
 namespace titan_pbctopo {
 
 inline constexpr std::size_t kPbctopoExactAssignmentBudget = 100000;
@@ -52,6 +54,10 @@ struct PbctopoComponentSearchCallbacks {
   BetterCandidateFn better_candidate = nullptr;
   bool input_atoms_cover_certificate_scope = false;
   bool hard_certificate_domain_complete = false;
+  // When set (with more than one worker), the beam's final rescoring scores
+  // several assignments at once and commits them in order
+  // (component_search.cpp); null keeps every score on the calling thread.
+  TitanExecutor *executor = nullptr;
 
   bool ready() const {
     return build_seed != nullptr && score_assignment != nullptr &&

@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <iomanip>
 #include <limits>
@@ -237,6 +238,37 @@ void TitanLLPSCluster::configure_dynamics(bool enabled, bool detailed,
       static_cast<std::size_t>(dynamics_max_lag_frames_ + 1), 0);
   msd_time_count_rna_.assign(
       static_cast<std::size_t>(dynamics_max_lag_frames_ + 1), 0);
+
+  const std::size_t lag_slots =
+      static_cast<std::size_t>(dynamics_max_lag_frames_ + 1);
+  pooled_joint_protein_.assign(lag_slots, 0);
+  pooled_pairs_protein_.assign(lag_slots, 0);
+  pooled_joint_rna_.assign(lag_slots, 0);
+  pooled_pairs_rna_.assign(lag_slots, 0);
+  disp_gt_protein_.assign(lag_slots, 0);
+  disp_all_protein_.assign(lag_slots, 0);
+  disp_gt_rna_.assign(lag_slots, 0);
+  disp_all_rna_.assign(lag_slots, 0);
+  msd_lat_sum_protein_.assign(lag_slots, 0.0);
+  msd_lat_sum_rna_.assign(lag_slots, 0.0);
+  rna_molecule_tracks_.clear();
+  pooled_inside_protein_ = 0;
+  pooled_frames_protein_ = 0;
+  pooled_inside_rna_ = 0;
+  pooled_frames_rna_ = 0;
+  dense_drift_x_ = 0.0;
+  dense_drift_y_ = 0.0;
+  dense_drift_z_ = 0.0;
+}
+
+void TitanLLPSCluster::configure_liquidity(int rna_segment_beads,
+                                           bool msd_drift_correct,
+                                           double mobile_displacement_nm,
+                                           double mobile_lag_ns) {
+  rna_segment_beads_ = std::max(0, rna_segment_beads);
+  msd_drift_correct_ = msd_drift_correct;
+  mobile_displacement_nm_ = std::max(0.0, mobile_displacement_nm);
+  mobile_lag_ns_ = mobile_lag_ns;
 }
 
 void TitanLLPSCluster::configure_trace_outputs(const info &info_output) {
@@ -738,7 +770,28 @@ void TitanLLPSCluster::process_frame(TitanExecutor &executor, const MOL &pro,
   shape_row.time_ps = current_time_ps;
   shape_row.frame = frame_idx;
   shape_row.cluster_id = giant_cluster_id;
-  if (giant_cluster_id > 0) {
+  // Liquidity v3 (performance only): TITAN_LLPS_SKIP_DROPLET_SHAPE=1 skips
+  // the periodic-graph lifting used only for the droplet-shape timeseries
+  // (rows are then NaN); TITAN_LLPS_PDB_STRIDE=n writes the droplet PDB
+  // every n-th frame. Neither feeds the liquidity block.
+  static const bool skip_shape = [] {
+    const char *v = std::getenv("TITAN_LLPS_SKIP_DROPLET_SHAPE");
+    return v != nullptr && v[0] == '1';
+  }();
+  static const int pdb_stride_env = [] {
+    const char *v = std::getenv("TITAN_LLPS_PDB_STRIDE");
+    const int n = (v != nullptr) ? std::atoi(v) : 0;
+    return n > 0 ? n : 0;
+  }();
+  if (pdb_stride_env > 0)
+    write_pdb_stride_ = pdb_stride_env;
+  if (skip_shape) {
+    shape_row.rg_angstrom = shape_row.asphericity_angstrom2 =
+        shape_row.acylindricity_angstrom2 =
+            shape_row.relative_shape_anisotropy = shape_row.sphericity_proxy =
+                std::numeric_limits<double>::quiet_NaN();
+  }
+  if (giant_cluster_id > 0 && !skip_shape) {
     int ref_idx = -1;
     for (int i = 0; i < N; ++i) {
       if (nodes[static_cast<std::size_t>(i)].cluster_id == giant_cluster_id) {
@@ -841,6 +894,8 @@ void TitanLLPSCluster::process_frame(TitanExecutor &executor, const MOL &pro,
   int cnt_rna_dense = 0;
   std::vector<ChainFrameSummary> frame_chains;
   frame_chains.reserve(static_cast<std::size_t>(N));
+  std::vector<ChainFrameSummary> frame_dyn_units;
+  frame_dyn_units.reserve(static_cast<std::size_t>(N));
 
   std::size_t ci = 0;
   while (ci < static_cast<std::size_t>(N)) {
@@ -920,7 +975,51 @@ void TitanLLPSCluster::process_frame(TitanExecutor &executor, const MOL &pro,
     }
     frame_chains.push_back(
         {cur_type == 1 ? 0 : 1, cur_chain, chain_dense, dominant_cluster, ccx,
-         ccy, ccz});
+         ccy, ccz, n_beads});
+
+    // Liquidity v2: membership and MSD need a unit whose size is comparable to
+    // the mobile unit of the condensate. A protein chain already is one. The
+    // 800-nt RNA is a single moleculetype, so a whole-molecule majority vote
+    // over ~2400 backbone beads flickers across the 50% line from frame to
+    // frame and its COM is not the coordinate of anything that moves as a
+    // body. Split it into fixed-length backbone segments instead.
+    if (dynamics_enabled_ && cur_type != 1 && rna_segment_beads_ > 0 &&
+        n_beads > rna_segment_beads_) {
+      const int seg_len = rna_segment_beads_;
+      const int n_seg = (n_beads + seg_len - 1) / seg_len;
+      for (int seg = 0; seg < n_seg; ++seg) {
+        const std::size_t sb = ci + static_cast<std::size_t>(seg) *
+                                       static_cast<std::size_t>(seg_len);
+        const std::size_t se = std::min(cj, sb + static_cast<std::size_t>(seg_len));
+        const int seg_beads = static_cast<int>(se - sb);
+        if (seg_beads <= 0)
+          continue;
+        int seg_dense_beads = 0;
+        double sx = 0.0;
+        double sy = 0.0;
+        double sz = 0.0;
+        for (std::size_t k = sb; k < se; ++k) {
+          if (bead_is_dense[k])
+            ++seg_dense_beads;
+          sx += nodes[k].x;
+          sy += nodes[k].y;
+          sz += nodes[k].z;
+        }
+        ChainFrameSummary unit;
+        unit.species = 1;
+        // Segment ids stay distinguishable from whole-chain ids.
+        unit.raw_chain_id = cur_chain * 100000 + 1000 + seg;
+        unit.inside_dense = (2 * seg_dense_beads > seg_beads);
+        unit.cluster_id = dominant_cluster;
+        unit.wrapped_com_x = sx / seg_beads;
+        unit.wrapped_com_y = sy / seg_beads;
+        unit.wrapped_com_z = sz / seg_beads;
+        unit.n_beads = seg_beads;
+        frame_dyn_units.push_back(unit);
+      }
+    } else {
+      frame_dyn_units.push_back(frame_chains.back());
+    }
     ci = cj;
   }
 
@@ -957,8 +1056,40 @@ void TitanLLPSCluster::process_frame(TitanExecutor &executor, const MOL &pro,
 
   if (dynamics_enabled_) {
     const auto dynamics_begin = std::chrono::steady_clock::now();
+    // STR-01: the slab normal is set from the cell in update_dynamics (it
+    // was the longest edge, with the Cartesian axis as normal)
     update_dynamics(pro.Box, current_time_ps / 1000.0, giant_cluster_id,
-                    cluster_pro, cluster_rna, frame_chains);
+                    cluster_pro, cluster_rna, frame_dyn_units);
+    // Liquidity v3: whole RNA molecule COM, unwrapped by minimum image
+    // between analysed frames, with the same cumulative dense-phase drift
+    // (updated by update_dynamics for this frame) removed; stored in nm.
+    for (const auto &fc : frame_chains) {
+      if (fc.species != 1)
+        continue;
+      auto &tr = rna_molecule_tracks_[fc.raw_chain_id];
+      if (!tr.has_prev) {
+        tr.ux = fc.wrapped_com_x;
+        tr.uy = fc.wrapped_com_y;
+        tr.uz = fc.wrapped_com_z;
+        tr.has_prev = true;
+      } else {
+        double ddx = fc.wrapped_com_x - tr.prev_x;
+        double ddy = fc.wrapped_com_y - tr.prev_y;
+        double ddz = fc.wrapped_com_z - tr.prev_z;
+        bmat.apply_mic(ddx, ddy, ddz);
+        tr.ux += ddx;
+        tr.uy += ddy;
+        tr.uz += ddz;
+      }
+      tr.prev_x = fc.wrapped_com_x;
+      tr.prev_y = fc.wrapped_com_y;
+      tr.prev_z = fc.wrapped_com_z;
+      tr.t_ns.push_back(current_time_ps / 1000.0);
+      tr.x.push_back(0.1 * (tr.ux - dense_drift_x_));
+      tr.y.push_back(0.1 * (tr.uy - dense_drift_y_));
+      tr.z.push_back(0.1 * (tr.uz - dense_drift_z_));
+      tr.inside.push_back(fc.inside_dense ? 1 : 0);
+    }
     perf_.dynamics_seconds += std::chrono::duration<double>(
                                   std::chrono::steady_clock::now() -
                                   dynamics_begin)

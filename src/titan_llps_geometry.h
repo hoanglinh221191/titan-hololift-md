@@ -11,7 +11,9 @@
 namespace titan_llps_geometry {
 using Point = std::array<double, 3>;
 struct Cell {
-  std::array<double, 9> matrix{}; // row major, columns are lattice vectors, nm
+  // row major, ROWS are the lattice vectors a, b, c (nm): the convention of
+  // PbctopoLatticeMetric and BoxMatrix, which the metric below applies
+  std::array<double, 9> matrix{};
   Point heights{};
   double volume = 0;
   std::optional<titan_pbctopo::PbctopoLatticeMetric> metric;
@@ -30,7 +32,12 @@ struct Cell {
       return Cell({x,0,0,0,y,0,0,0,z});
     }
     double a[3],c[3],d[3]; b.get_v1(a); b.get_v2(c); b.get_v3(d);
-    return Cell({a[0]*.1,c[0]*.1,d[0]*.1,a[1]*.1,c[1]*.1,d[1]*.1,a[2]*.1,c[2]*.1,d[2]*.1});
+    // STR-01: one lattice vector per row. The box vectors used to go in as
+    // columns, so every triclinic cell became the transposed lattice (a box
+    // vector b was not a period: Cell::delta(b) = (1.55, 0, -1.32) nm for
+    // box 150/60/60 A, 70/60/75 deg); orthorhombic cells are symmetric and
+    // were not affected.
+    return Cell({a[0]*.1,a[1]*.1,a[2]*.1,c[0]*.1,c[1]*.1,c[2]*.1,d[0]*.1,d[1]*.1,d[2]*.1});
   }
   Point fractional(Point p) const {return metric ? metric->cartesian_to_scaled(p[0],p[1],p[2]) : p;}
   Point cartesian(Point p) const {return metric ? metric->scaled_to_cartesian(p[0],p[1],p[2]) : p;}
@@ -48,6 +55,42 @@ struct Cell {
     x=(s[0]-std::floor(s[0]))*heights[0]; y=(s[1]-std::floor(s[1]))*heights[1]; z=(s[2]-std::floor(s[2]))*heights[2];
   }
 };
+// STR-01: slab normal of the lateral (in-plane) MSD of -llps-dynamics. The
+// slab axis is the lattice direction with the largest plane spacing (cell
+// height; near ties go to c, then b), and the normal is the unit normal of
+// the planes spanned by the two other lattice vectors (the reciprocal
+// vector of that axis). In an orthorhombic cell these are the longest edge
+// and its Cartesian axis, as before; in a triclinic cell the old code took
+// the longest edge and removed a Cartesian component, which is not the
+// slab normal. Without a periodic cell: c and z.
+struct SlabNormal {
+  int axis = 2;
+  Point normal{0, 0, 1};
+};
+inline SlabNormal slab_normal(const Cell& cell) {
+  SlabNormal s;
+  if (!cell.metric) return s;
+  int best = 2;
+  for (int k : {1, 0})
+    if (cell.heights[k] > cell.heights[best] * (1 + 1e-12)) best = k;
+  // row `best` of the inverse cell matrix: the gradient of that fractional
+  // coordinate, normal to the planes of the two other lattice vectors
+  const auto x = cell.metric->cartesian_to_scaled(1, 0, 0);
+  const auto y = cell.metric->cartesian_to_scaled(0, 1, 0);
+  const auto z = cell.metric->cartesian_to_scaled(0, 0, 1);
+  const Point r{x[best], y[best], z[best]};
+  const double norm = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+  if (!(norm > 0) || !std::isfinite(norm)) throw std::invalid_argument("LLPS: invalid slab normal");
+  s.axis = best;
+  s.normal = {r[0] / norm, r[1] / norm, r[2] / norm};
+  return s;
+}
+// squared length of d without its component along the unit normal n
+inline double lateral_sq(const Point& d, const Point& n) {
+  const double along = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+  const double px = d[0] - along * n[0], py = d[1] - along * n[1], pz = d[2] - along * n[2];
+  return px * px + py * py + pz * pz;
+}
 struct PhaseConfig {
   std::string geometry="none";
   int axis=2; // normal to fractional a/b/c planes, not Cartesian x/y/z
