@@ -20,6 +20,10 @@ public:
 
   [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
 
+  // Whether the calling thread is one of this executor's workers running a
+  // batch: a batch it submits then runs inline, serially (below).
+  [[nodiscard]] bool in_worker() const noexcept { return active_executor_ == this; }
+
   // Several threads may submit batches; they run one after another. A batch
   // submitted from inside a worker of this executor (nested) runs inline on
   // that worker, serially.

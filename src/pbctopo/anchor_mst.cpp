@@ -546,6 +546,16 @@ bool anchor_graph_metrics_ok(const vector<Vec3> &placed_points,
 #endif
 }
 
+void pbctopo_anchor_relax_keys(double *best, const double *px,
+                               const double *py, const double *pz, size_t n,
+                               double sx, double sy, double sz) noexcept {
+  relax_anchor_best(best, px, py, pz, n, sx, sy, sz);
+}
+
+bool pbctopo_anchor_kernel_is_avx2_fma() noexcept {
+  return anchor_kernel_kind() == AnchorKernelKind::Avx2Fma;
+}
+
 PbctopoAnchorMstCounters pbctopo_anchor_mst_counters() {
   PbctopoAnchorMstCounters out;
   out.dense_calls = g_dense_calls.load(memory_order_relaxed);

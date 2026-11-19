@@ -1,8 +1,8 @@
 cff-version: 1.2.0
 message: "If you use HoloLift, please cite the paper below."
 title: "HoloLift"
-version: "1.2.0"
-date-released: "2026-11-18"
+version: "1.2.1"
+date-released: "2026-11-19"
 license: MIT
 repository-code: "https://github.com/hoanglinh221191/titan-hololift-md"
 authors:

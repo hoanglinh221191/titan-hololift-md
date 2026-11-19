@@ -26,7 +26,7 @@ ranked; its first choice is the per-frame answer. HoloLift reads these lists and
 ## 2. Get HoloLift
 
 **Windows (x86-64, a processor with AVX2 and FMA: Intel from 2013, AMD from 2015).** Download
-`HoloLift-1.2.0-windows-x64.zip` from the release page and unzip it. It contains `titan.exe`, the `forcefields`
+`HoloLift-1.2.1-windows-x64.zip` from the release page and unzip it. It contains `titan.exe`, the `forcefields`
 tables, the `examples` and these documents. Nothing needs to be installed.
 
 **Other systems.** Build `titan.exe` from the source, as described in `README.md`.
@@ -249,8 +249,8 @@ molecules, as in the example.
 -g=1-1
 -common_topo=topol.top
 -ff=charmm36
--path-a=C:/HoloLift-1.2.0/forcefields
--path-n=C:/HoloLift-1.2.0/forcefields
+-path-a=C:/HoloLift-1.2.1/forcefields
+-path-n=C:/HoloLift-1.2.1/forcefields
 -pbctopo=true
 -pbctopo-temporal=hololift
 -nocal=true

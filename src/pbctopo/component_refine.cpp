@@ -5,11 +5,20 @@
 #include "warm_state.h"
 
 #include "../BoxMatrix.h"
+#include "../titan_executor.h"
+#include "lattice_math.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <new>
+#include <type_traits>
 #include <utility>
 
 using namespace std;
@@ -607,7 +616,8 @@ PbctopoCutCandidate score_component_placed_points_solution(
     const PointStats *precomputed_stats,
     const PbctopoAnchorGraphContext *anchor_context,
     const vector<PbctopoAtom> *clash_atoms,
-    const vector<size_t> *atom_component_index) {
+    const vector<size_t> *atom_component_index,
+    const PbctopoRigidAnchorMst *rigid_anchor_mst) {
   if (timing != nullptr) {
     switch (phase) {
     case PbctopoRefineScorePhase::Exact:
@@ -711,7 +721,7 @@ PbctopoCutCandidate score_component_placed_points_solution(
   if (!anchor_graph_metrics_enhanced(
           placed_points, anchor_indices, continuity_pairs, anchor_mst2,
           anchor_max_d2, anchor_graph_score, incumbent, phase, anchor_backend,
-          timing, anchor_context)) {
+          timing, anchor_context, rigid_anchor_mst)) {
     if (timing != nullptr) {
       accumulate_anchor(
           chrono::duration<double>(chrono::steady_clock::now() - stage_started)
@@ -880,6 +890,130 @@ PbctopoCutCandidate score_component_offset_solution(
       atom_component_index);
 }
 
+// ---------------------------------------------------------------------------
+// Speculative stage-1 trials.
+//
+// The stage-1 loop of a component scores one trial per shift against a prune
+// threshold, the worst entry of its short list once that list is full, and
+// inserts the trial into the list.  The threshold changes only when a trial
+// enters a full list or fills it.  A window of trials is scored on the
+// executor against the threshold at the window's start and committed in
+// order; at the first commit that changes the threshold the rest of the
+// window is dropped and the next window starts after it.  Every committed
+// score was therefore computed with the threshold the serial loop passes,
+// and its counters are added only at its commit.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::atomic<std::uint64_t> g_speculative_stage1_scored{0};
+std::atomic<std::uint64_t> g_speculative_stage1_committed{0};
+
+bool refine_env_flag(const char *name, bool fallback) noexcept {
+  const char *value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0')
+    return fallback;
+  return !(value[0] == '0' || value[0] == 'n' || value[0] == 'N' ||
+           value[0] == 'f' || value[0] == 'F');
+}
+
+// TITAN_PBCTOPO_REFINE_SPECULATIVE=0 keeps the serial loop;
+// TITAN_PBCTOPO_REFINE_SPECULATIVE_CHECK=1 stops the program if a trial wrote
+// a timing field that add_refine_stage1_trial_timing does not carry over.
+bool refine_speculation_enabled() noexcept {
+  static const bool enabled =
+      refine_env_flag("TITAN_PBCTOPO_REFINE_SPECULATIVE", true);
+  return enabled;
+}
+bool refine_speculation_check() noexcept {
+  static const bool check =
+      refine_env_flag("TITAN_PBCTOPO_REFINE_SPECULATIVE_CHECK", false);
+  return check;
+}
+
+// A timing block with every byte defined, so that two of them can be
+// compared as bytes.
+void reset_refine_trial_timing(PbctopoTimingStats &timing) noexcept {
+  static_assert(std::is_trivially_copyable_v<PbctopoTimingStats>);
+  std::memset(static_cast<void *>(&timing), 0, sizeof(timing));
+  new (&timing) PbctopoTimingStats();
+}
+
+// The fields a stage-1 trial writes (prepare_trial and
+// score_component_placed_points_solution in phase CoarseStage1, anchor
+// backend other than spatial-all).  With move = true the fields are also
+// cleared in from.  A field the trial starts writing must be added here, or
+// the speculative loop drops it; the check flag above finds such a field.
+void add_refine_stage1_trial_timing(PbctopoTimingStats &into,
+                                    PbctopoTimingStats &from, bool move) {
+  auto carry = [move](auto &dst, auto &src) {
+    dst += src;
+    if (move)
+      src = {};
+  };
+  carry(into.component_graph_refine_coarse_score_calls,
+        from.component_graph_refine_coarse_score_calls);
+  carry(into.component_graph_refine_coarse_stage1_score_calls,
+        from.component_graph_refine_coarse_stage1_score_calls);
+  carry(into.component_graph_refine_trial_build_incremental,
+        from.component_graph_refine_trial_build_incremental);
+  carry(into.component_graph_refine_trial_build_global_rebase,
+        from.component_graph_refine_trial_build_global_rebase);
+  carry(into.component_graph_refine_trial_build_full,
+        from.component_graph_refine_trial_build_full);
+  carry(into.component_graph_refine_stats_cached,
+        from.component_graph_refine_stats_cached);
+  carry(into.component_graph_refine_stats_full,
+        from.component_graph_refine_stats_full);
+  carry(into.component_graph_refine_stats_s,
+        from.component_graph_refine_stats_s);
+  carry(into.component_graph_refine_coarse_s,
+        from.component_graph_refine_coarse_s);
+  carry(into.component_graph_refine_coarse_stage1_s,
+        from.component_graph_refine_coarse_stage1_s);
+  carry(into.component_graph_refine_coarse_stage1_build_points_s,
+        from.component_graph_refine_coarse_stage1_build_points_s);
+  carry(into.component_graph_refine_coarse_stage1_continuity_s,
+        from.component_graph_refine_coarse_stage1_continuity_s);
+  carry(into.component_graph_refine_coarse_stage1_anchor_s,
+        from.component_graph_refine_coarse_stage1_anchor_s);
+  carry(into.component_graph_refine_coarse_stage1_cut_score_s,
+        from.component_graph_refine_coarse_stage1_cut_score_s);
+  carry(into.component_graph_refine_coarse_stage1_cut_score_principal_s,
+        from.component_graph_refine_coarse_stage1_cut_score_principal_s);
+  carry(into.component_graph_refine_coarse_stage1_cut_score_edge_scan_s,
+        from.component_graph_refine_coarse_stage1_cut_score_edge_scan_s);
+}
+
+} // namespace
+
+PbctopoRefineSpeculationCounters pbctopo_refine_speculation_counters() {
+  PbctopoRefineSpeculationCounters out;
+  out.scored = g_speculative_stage1_scored.load(memory_order_relaxed);
+  out.committed = g_speculative_stage1_committed.load(memory_order_relaxed);
+  return out;
+}
+
+namespace {
+
+void check_refine_trial_timing_carried(PbctopoTimingStats &task_timing) {
+  PbctopoTimingStats sink;
+  reset_refine_trial_timing(sink);
+  add_refine_stage1_trial_timing(sink, task_timing, true);
+  PbctopoTimingStats untouched;
+  reset_refine_trial_timing(untouched);
+  if (std::memcmp(static_cast<const void *>(&task_timing),
+                  static_cast<const void *>(&untouched),
+                  sizeof(PbctopoTimingStats)) != 0) {
+    std::fprintf(stderr, "[pbctopo] a speculative stage-1 trial wrote a "
+                         "timing field that is not carried to the run's "
+                         "timing (add_refine_stage1_trial_timing)\n");
+    std::fflush(stderr);
+    std::abort();
+  }
+}
+
+} // namespace
+
 PbctopoCutCandidate improve_component_offsets_locally(
     const vector<PbctopoAtom> &atoms, const vector<vector<size_t>> &components,
     box Box, const vector<PbctopoShift> &shifts,
@@ -892,7 +1026,8 @@ PbctopoCutCandidate improve_component_offsets_locally(
     AnchorBackend anchor_backend,
     PbctopoTimingStats *timing, PbctopoWarmState *warm_state,
     const PbctopoCutCandidate *warm_reference_candidate,
-    const PbctopoAnchorGraphContext *anchor_context) {
+    const PbctopoAnchorGraphContext *anchor_context,
+    TitanExecutor *executor) {
   const vector<size_t> &exact_anchor_indices = anchor_indices;
   const vector<size_t> atom_component_index =
       build_atom_component_index(atoms.size(), components);
@@ -967,8 +1102,9 @@ PbctopoCutCandidate improve_component_offsets_locally(
          const PbctopoCutCandidate &trial_candidate, size_t max_keep,
          bool (*better_candidate)(const PbctopoCutCandidate &,
                                   const PbctopoCutCandidate &)) {
+        // Returns whether the list changed.
         if (!trial_candidate.valid)
-          return;
+          return false;
         PbctopoRefineTrialCandidate entry;
         entry.offsets = trial_offsets;
         entry.candidate = trial_candidate;
@@ -977,12 +1113,43 @@ PbctopoCutCandidate improve_component_offsets_locally(
                !better_candidate(entry.candidate, insert_pos->candidate)) {
           ++insert_pos;
         }
+         const size_t position =
+             static_cast<size_t>(insert_pos - top_trials.begin());
          top_trials.insert(insert_pos, std::move(entry));
          if (top_trials.size() > max_keep)
            top_trials.resize(max_keep);
+         return position < max_keep;
       };
   vector<vector<Int3>> stage1_absolute_hint_offsets(offsets.size());
   vector<vector<Int3>> stage2_absolute_hint_offsets(offsets.size());
+  // trial_timing: where the trial's counters go.  The serial loops pass the
+  // run's timing; a speculative trial its own block.
+  auto score_refine_trial_timed =
+      [&](size_t trial_comp_idx, const vector<Int3> &trial_offsets_ref,
+          const vector<size_t> &trial_anchor_indices, vector<Vec3> &trial_points,
+          const PbctopoCutCandidate *incumbent, bool run_ultraclash,
+          PbctopoRefineScorePhase phase,
+          const PbctopoStage1EdgeContext *stage1_edge_context,
+          const PbctopoEdgeScanSoA *edge_scan_soa,
+          const PbctopoCutCandidate *edge_prune_threshold,
+          PbctopoTimingStats *trial_timing) {
+        PointStats trial_stats;
+        double trial_shift_norm2 = 0.0;
+        refine_workspace.prepare_trial(trial_comp_idx, trial_offsets_ref,
+                                       trial_points, trial_stats,
+                                       trial_shift_norm2, trial_timing, phase);
+        return score_component_placed_points_solution(
+            trial_points, trial_shift_norm2, local_edges, edge_set,
+            clash_cutoff, continuity_pairs, trial_anchor_indices,
+            continuity_cutoff, callbacks, incumbent, trial_timing,
+            run_ultraclash, phase, stage1_edge_context, edge_scan_soa,
+            edge_prune_threshold, anchor_backend, &trial_stats,
+            (&trial_anchor_indices == &exact_anchor_indices) ? anchor_context
+                                                             : nullptr,
+            &atoms, &atom_component_index,
+            anchor_context != nullptr ? anchor_context->rigid_anchor_mst.get()
+                                      : nullptr);
+      };
   auto score_refine_trial =
       [&](size_t trial_comp_idx, const vector<Int3> &trial_offsets_ref,
           const vector<size_t> &trial_anchor_indices, vector<Vec3> &trial_points,
@@ -991,21 +1158,31 @@ PbctopoCutCandidate improve_component_offsets_locally(
           const PbctopoStage1EdgeContext *stage1_edge_context,
           const PbctopoEdgeScanSoA *edge_scan_soa,
           const PbctopoCutCandidate *edge_prune_threshold) {
-        PointStats trial_stats;
-        double trial_shift_norm2 = 0.0;
-        refine_workspace.prepare_trial(trial_comp_idx, trial_offsets_ref,
-                                       trial_points, trial_stats,
-                                       trial_shift_norm2, timing, phase);
-        return score_component_placed_points_solution(
-            trial_points, trial_shift_norm2, local_edges, edge_set,
-            clash_cutoff, continuity_pairs, trial_anchor_indices,
-            continuity_cutoff, callbacks, incumbent, timing, run_ultraclash,
-            phase, stage1_edge_context, edge_scan_soa, edge_prune_threshold,
-            anchor_backend, &trial_stats,
-            (&trial_anchor_indices == &exact_anchor_indices) ? anchor_context
-                                                             : nullptr,
-            &atoms, &atom_component_index);
+        return score_refine_trial_timed(
+            trial_comp_idx, trial_offsets_ref, trial_anchor_indices,
+            trial_points, incumbent, run_ultraclash, phase,
+            stage1_edge_context, edge_scan_soa, edge_prune_threshold, timing);
       };
+  // Speculative stage-1 trials (see above): one task per trial of a window,
+  // each with its own points, timing block and lattice-query audit.
+  struct Stage1Task {
+    vector<Vec3> points;
+    PbctopoCutCandidate candidate;
+    PbctopoTimingStats timing;
+    PbctopoLatticeQueryAudit audit;
+  };
+  const bool speculative_stage1 =
+      refine_speculation_enabled() && executor != nullptr &&
+      executor->capacity() > 1 && !executor->in_worker() &&
+      anchor_backend != AnchorBackend::SpatialAll;
+  const size_t stage1_workers =
+      speculative_stage1 ? executor->capacity() : 1;
+  vector<Stage1Task> stage1_tasks(speculative_stage1 ? 2 * stage1_workers : 0);
+  // The workspace finds a points buffer's state by address: registered here,
+  // so that the tasks only read the workspace's list of states.
+  for (auto &task : stage1_tasks)
+    refine_workspace.scratch_state(task.points);
+  vector<vector<Int3>> stage1_trial_offsets;
   auto capture_component_hint_offsets =
       [](const vector<PbctopoRefineTrialCandidate> &source_trials,
          size_t comp_idx, vector<vector<Int3>> &target_offsets) {
@@ -1146,6 +1323,93 @@ PbctopoCutCandidate improve_component_offsets_locally(
       } else {
         vector<PbctopoRefineTrialCandidate> sparse_top_trials;
         sparse_top_trials.reserve(stage1_keep);
+        if (speculative_stage1) {
+          // The trials the serial loop scores, in its order.
+          stage1_trial_offsets.clear();
+          for (size_t shift_pos : ordered_shift_indices) {
+            const auto &shift = shifts[shift_pos];
+            trial_offsets = offsets;
+            if (!checked_int3_add(offsets[comp_idx],
+                                  Int3{shift.ix, shift.iy, shift.iz},
+                                  trial_offsets[comp_idx])) {
+              continue;
+            }
+            bool rebase_ok = false;
+            if (timing != nullptr) {
+              const auto rebase_started = chrono::steady_clock::now();
+              rebase_ok = rebase_component_offsets(trial_offsets, Box);
+              timing->component_graph_refine_rebase_s +=
+                  chrono::duration<double>(chrono::steady_clock::now() -
+                                           rebase_started)
+                      .count();
+            } else {
+              rebase_ok = rebase_component_offsets(trial_offsets, Box);
+            }
+            if (rebase_ok)
+              stage1_trial_offsets.push_back(trial_offsets);
+          }
+          size_t first = 0;
+          size_t window_limit = stage1_workers;
+          while (first < stage1_trial_offsets.size()) {
+            const size_t window =
+                min(window_limit, stage1_trial_offsets.size() - first);
+            const PbctopoCutCandidate *stage1_prune_threshold =
+                (sparse_top_trials.size() >= stage1_keep)
+                    ? &sparse_top_trials.back().candidate
+                    : nullptr;
+            executor->parallel_for(
+                window, stage1_workers, 1,
+                [&](size_t, size_t begin, size_t end) {
+                  for (size_t t = begin; t < end; ++t) {
+                    Stage1Task &task = stage1_tasks[t];
+                    const PbctopoLatticeQueryAudit audit_before =
+                        pbctopo_lattice_query_audit();
+                    if (timing != nullptr)
+                      reset_refine_trial_timing(task.timing);
+                    task.candidate = score_refine_trial_timed(
+                        comp_idx, stage1_trial_offsets[first + t],
+                        tapered_stage1_anchor_indices, task.points, nullptr,
+                        false, PbctopoRefineScorePhase::CoarseStage1,
+                        &stage1_edge_context, &edge_scan_soa,
+                        stage1_prune_threshold,
+                        timing != nullptr ? &task.timing : nullptr);
+                    task.audit = pbctopo_lattice_query_audit_delta(
+                        audit_before, pbctopo_lattice_query_audit());
+                    pbctopo_reset_lattice_query_audit();
+                    pbctopo_add_lattice_query_audit(audit_before);
+                  }
+                });
+            g_speculative_stage1_scored.fetch_add(window,
+                                                  memory_order_relaxed);
+            size_t committed = 0;
+            bool threshold_changed = false;
+            for (size_t t = 0; t < window && !threshold_changed; ++t) {
+              Stage1Task &task = stage1_tasks[t];
+              ++committed;
+              pbctopo_add_lattice_query_audit(task.audit);
+              if (timing != nullptr) {
+                const bool check = refine_speculation_check();
+                add_refine_stage1_trial_timing(*timing, task.timing, check);
+                if (check)
+                  check_refine_trial_timing_carried(task.timing);
+              }
+              const bool list_changed = push_top_refine_trial(
+                  sparse_top_trials, stage1_trial_offsets[first + t],
+                  task.candidate, stage1_keep,
+                  callbacks.better_stage1_cut_candidate);
+              // The next trial's threshold is the list's last entry once the
+              // list is full: it differs from this window's exactly when the
+              // list changed and is full now.
+              threshold_changed =
+                  list_changed && sparse_top_trials.size() >= stage1_keep;
+            }
+            g_speculative_stage1_committed.fetch_add(committed,
+                                                     memory_order_relaxed);
+            first += committed;
+            window_limit = (committed == window) ? 2 * stage1_workers
+                                                 : stage1_workers;
+          }
+        } else
         for (size_t shift_pos : ordered_shift_indices) {
           const auto &shift = shifts[shift_pos];
           trial_offsets = offsets;

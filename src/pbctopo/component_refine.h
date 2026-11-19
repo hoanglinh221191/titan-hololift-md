@@ -11,6 +11,8 @@
 #include <unordered_set>
 #include <vector>
 
+class TitanExecutor;
+
 namespace titan_pbctopo {
 
 struct PbctopoRefineScoringCallbacks {
@@ -56,6 +58,15 @@ struct PbctopoRefineScoringCallbacks {
   EdgeThresholdFn edge_scan_cannot_beat_threshold = nullptr;
   CandidateCloseEnoughFn candidate_close_enough_to_skip_search = nullptr;
 };
+
+// Process-wide counts of the speculative stage-1 trials, for the run log:
+// scored on the executor, and of those committed (the rest were scored again
+// against a newer threshold).
+struct PbctopoRefineSpeculationCounters {
+  std::uint64_t scored = 0;
+  std::uint64_t committed = 0;
+};
+PbctopoRefineSpeculationCounters pbctopo_refine_speculation_counters();
 
 void clear_component_trial_hints(PbctopoWarmState &warm_state);
 bool component_trial_hints_compatible(const PbctopoWarmState &warm_state,
@@ -105,7 +116,10 @@ PbctopoCutCandidate score_component_placed_points_solution(
     const titan_gyration::PointStats *precomputed_stats = nullptr,
     const PbctopoAnchorGraphContext *anchor_context = nullptr,
     const std::vector<PbctopoAtom> *clash_atoms = nullptr,
-    const std::vector<std::size_t> *atom_component_index = nullptr);
+    const std::vector<std::size_t> *atom_component_index = nullptr,
+    // For an anchor list scored without anchor_context (the refine's
+    // sub-sampled lists): the rigid spanning-tree cache of the atoms.
+    const PbctopoRigidAnchorMst *rigid_anchor_mst = nullptr);
 
 PbctopoCutCandidate score_component_offset_solution(
     const std::vector<PbctopoAtom> &atoms,
@@ -140,7 +154,11 @@ PbctopoCutCandidate improve_component_offsets_locally(
     AnchorBackend anchor_backend = AnchorBackend::Auto,
     PbctopoTimingStats *timing = nullptr, PbctopoWarmState *warm_state = nullptr,
     const PbctopoCutCandidate *warm_reference_candidate = nullptr,
-    const PbctopoAnchorGraphContext *anchor_context = nullptr);
+    const PbctopoAnchorGraphContext *anchor_context = nullptr,
+    // With an executor of more than one worker, the stage-1 trials of a
+    // component are scored on it, speculatively, and committed in the serial
+    // order: the result and the counters are those of the serial loop.
+    TitanExecutor *executor = nullptr);
 
 } // namespace titan_pbctopo
 

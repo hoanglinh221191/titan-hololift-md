@@ -23,7 +23,8 @@ bool anchor_graph_metrics_enhanced(
     double &max_d2, PbctopoAnchorGraphScore &anchor_graph,
     const PbctopoCutCandidate *incumbent, PbctopoRefineScorePhase phase,
     AnchorBackend backend, PbctopoTimingStats *timing = nullptr,
-    const PbctopoAnchorGraphContext *anchor_context = nullptr);
+    const PbctopoAnchorGraphContext *anchor_context = nullptr,
+    const PbctopoRigidAnchorMst *rigid_anchor_mst = nullptr);
 
 int compare_anchor_graph_score(const PbctopoAnchorGraphScore &lhs,
                                const PbctopoAnchorGraphScore &rhs);

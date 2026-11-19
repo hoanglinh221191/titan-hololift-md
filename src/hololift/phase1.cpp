@@ -783,8 +783,14 @@ private:
           break;
         }
       }
-      if (remaining_workers_.fetch_sub(1, std::memory_order_acq_rel) == 1)
-        work_done_.notify_one();
+      // The count reaches zero under the mutex that run() holds while it
+      // tests the count: a decrement and notify between that test and the
+      // wait would otherwise be lost and run() would sleep for good.
+      {
+        std::lock_guard lock(mutex_);
+        if (remaining_workers_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+          work_done_.notify_one();
+      }
     }
   }
 

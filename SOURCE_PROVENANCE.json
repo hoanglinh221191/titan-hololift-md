@@ -1,7 +1,7 @@
 {
- "package": "HoloLift 1.2.0",
- "titan_commit": "8758139ee1637ab977b407679aa385f58246b0b7",
- "titan_build_stamp": "0.2.0-dev.458+g8758139ee163",
+ "package": "HoloLift 1.2.1",
+ "titan_commit": "d859c145c36b290611bfbcd27877862c0fd79a87",
+ "titan_build_stamp": "0.2.0-dev.464+gd859c145c36b",
  "exported_paths": [
   "src",
   "Makefile",

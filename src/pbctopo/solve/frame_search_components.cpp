@@ -302,7 +302,8 @@ void PbctopoFrameSolver::search_components() {
           runtime_cutoffs.clash_cutoff,
           runtime_cutoffs.continuity_cutoff, component_points,
           make_component_refine_callbacks(), anchor_backend, &timing,
-          &warm_state, component_warm_reference, &base_anchor_context);
+          &warm_state, component_warm_reference, &base_anchor_context,
+          executor);
       PbctopoOwnerPairSplitDetail warm_cut_split_detail;
       size_t warm_cut_split_owner_pairs = 0;
       double warm_cut_split_gap = 0.0;

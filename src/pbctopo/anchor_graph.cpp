@@ -1,5 +1,6 @@
 #include "anchor_graph.h"
 #include "anchor_mst.h"
+#include "anchor_mst_rigid.h"
 
 #include "evidence_audit.h"
 
@@ -693,11 +694,20 @@ bool anchor_graph_metrics_spatial_or_dense(
     const vector<PbctopoContinuityPair> &continuity_pairs, double &mst2,
     double &max_d2, const PbctopoCutCandidate *incumbent,
     PbctopoRefineScorePhase phase, AnchorBackend backend,
-    PbctopoTimingStats *timing) {
+    PbctopoTimingStats *timing, const PbctopoRigidAnchorMst *rigid_mst) {
   const bool allow_spatial =
       backend == AnchorBackend::SpatialAll &&
       anchor_indices.size() >= kPbctopoSpatialAnchorThreshold;
   if (!allow_spatial) {
+    // Points that are rigid translations of the components: the same result
+    // from the sparse scan of anchor_mst_rigid.cpp.
+    bool rigid_ok = false;
+    if (rigid_mst != nullptr &&
+        pbctopo_rigid_anchor_mst_metrics(*rigid_mst, placed_points,
+                                         anchor_indices, mst2, max_d2,
+                                         incumbent, rigid_ok)) {
+      return rigid_ok;
+    }
     return anchor_graph_metrics_ok(placed_points, anchor_indices, mst2, max_d2,
                                    incumbent);
   }
@@ -807,11 +817,14 @@ bool anchor_graph_metrics_enhanced(
     double &max_d2, PbctopoAnchorGraphScore &anchor_graph,
     const PbctopoCutCandidate *incumbent, PbctopoRefineScorePhase phase,
     AnchorBackend backend, PbctopoTimingStats *timing,
-    const PbctopoAnchorGraphContext *anchor_context) {
+    const PbctopoAnchorGraphContext *anchor_context,
+    const PbctopoRigidAnchorMst *rigid_anchor_mst) {
   anchor_graph = {};
   if (!anchor_graph_metrics_spatial_or_dense(
           placed_points, anchor_indices, continuity_pairs, mst2, max_d2,
-          incumbent, phase, backend, timing)) {
+          incumbent, phase, backend, timing,
+          anchor_context != nullptr ? anchor_context->rigid_anchor_mst.get()
+                                    : rigid_anchor_mst)) {
     return false;
   }
   anchor_graph.mst_mean_d2 =

@@ -19,6 +19,7 @@ namespace titan_pbctopo {
 using pbctopo_hull::Vec3;
 
 class PbctopoLatticeMetric;
+class PbctopoRigidAnchorMst;
 
 struct PbctopoHash128 {
   std::uint64_t lo = 0;
@@ -1232,6 +1233,10 @@ struct PbctopoAnchorGraphContext {
   // The lattice metric of box_m/box_inv, built once with the context instead
   // of once per endpoint edge and score (anchor_endpoint_image_gap).
   std::shared_ptr<const PbctopoLatticeMetric> box_lattice;
+  // Set when the scored points are these atoms translated component by
+  // component: the anchor spanning tree then reuses what the translations
+  // leave unchanged (anchor_mst_rigid.h).  Null: the dense scan.
+  std::shared_ptr<PbctopoRigidAnchorMst> rigid_anchor_mst;
 };
 
 } // namespace titan_pbctopo

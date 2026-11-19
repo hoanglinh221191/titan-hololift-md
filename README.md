@@ -13,13 +13,13 @@ reconstructed trajectory. (Up to version 1.1.0 the method was called HoloLift-MD
 
 ## Quick start (Windows)
 
-1. Download `HoloLift-1.2.0-windows-x64.zip` from the
+1. Download `HoloLift-1.2.1-windows-x64.zip` from the
    [release page](https://github.com/hoanglinh221191/titan-hololift-md/releases) and unzip it. It needs Windows on
    x86-64 with AVX2 and FMA, and nothing else.
 2. Run the example in PowerShell:
 
    ```powershell
-   cd HoloLift-1.2.0\examples\01_separation
+   cd HoloLift-1.2.1\examples\01_separation
    ..\..\titan.exe -a arg.in
    python check_example.py
    ```
@@ -43,8 +43,8 @@ should receive the output:
 -g=1-1
 -common_topo=topol.top
 -ff=charmm36
--path-a=C:/HoloLift-1.2.0/forcefields
--path-n=C:/HoloLift-1.2.0/forcefields
+-path-a=C:/HoloLift-1.2.1/forcefields
+-path-n=C:/HoloLift-1.2.1/forcefields
 -pbctopo=true
 -pbctopo-temporal=hololift
 -nocal=true
@@ -103,7 +103,8 @@ changes any output.
 | `docs/TITAN_MANUAL.txt` | TITAN's full manual (`titan.exe -h`) |
 | `tools/hololift_temporal_value_runner.cpp` | The standalone runner (below) |
 | `test/` | Two smoke tests |
-| `RELEASE_NOTES_v1.2.0.md` | What changed in this version |
+| `RELEASE_NOTES_v1.2.1.md` | What changed in this version |
+| `RELEASE_NOTES_v1.2.0.md` | What changed in version 1.2.0 |
 
 The release zip holds `titan.exe`, `examples/`, `forcefields/`, `docs/`, this README, the release notes, the
 licenses and `SHA256SUMS.txt`.

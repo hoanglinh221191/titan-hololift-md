@@ -1,6 +1,7 @@
 #include "pbctopo/solve/solver.h"
 
 #include "pbctopo/anchor_mst.h"
+#include "pbctopo/anchor_mst_rigid.h"
 
 #include "Multi_MOL.h"
 #include "titan_executor.h"
@@ -848,6 +849,22 @@ int PbctopoSolveRun::finish() {
       ", fused_calls=" + to_string(anchor_mst.fused_calls) +
       ", fused_incumbent_exits=" +
       to_string(anchor_mst.fused_incumbent_exits));
+  const titan_pbctopo::PbctopoRigidAnchorMstCounters rigid_mst =
+      titan_pbctopo::pbctopo_rigid_anchor_mst_counters();
+  append_pbctopo_log_line(
+      "[pbctopo anchor-mst rigid] calls=" + to_string(rigid_mst.calls) +
+      ", not_rigid=" + to_string(rigid_mst.not_rigid) +
+      ", not_covered=" + to_string(rigid_mst.not_covered) +
+      ", anchor_sets=" + to_string(rigid_mst.anchor_sets) +
+      ", cross_tables=" + to_string(rigid_mst.cross_tables) +
+      ", cross_edges=" + to_string(rigid_mst.cross_edges) +
+      ", checked=" + to_string(rigid_mst.checked));
+  const titan_pbctopo::PbctopoRefineSpeculationCounters refine_speculation =
+      titan_pbctopo::pbctopo_refine_speculation_counters();
+  append_pbctopo_log_line(
+      "[pbctopo refine speculative] stage1_scored=" +
+      to_string(refine_speculation.scored) + ", stage1_committed=" +
+      to_string(refine_speculation.committed));
   append_pbctopo_log_line("[pbctopo] Valid candidate evaluations: " +
                           to_string(valid_candidates));
   append_pbctopo_log_line("[pbctopo] end run");

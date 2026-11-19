@@ -16,8 +16,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
+#include <iterator>
 #include <limits>
+#include <new>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 
@@ -276,6 +282,279 @@ bool consume_search_continuity_prefix_from_assignment(
     }
   }
   return finish(true);
+}
+
+// The pairs that close at one depth of the beam, when every one of them lies
+// inside the depth's component: their d2, strain and hard test then depend on
+// that component's shift only, not on the beam state, so they are computed
+// once per shift and every state adds the same terms to its own running sum.
+// The values are those of consume_search_continuity_prefix_from_assignment
+// for the same pairs in the same order (same expressions); what a state adds
+// is still one sequential sum, so every path prefix is the one that function
+// returns.
+struct PbctopoSearchPrefixShiftTable {
+  bool built = false;
+  // Pairs consumed before the scan ends: all of them, or those before the
+  // first hard violation.
+  std::size_t stop = 0;
+  bool hard_violation = false;
+  // Largest d2 of the hard pairs among the consumed ones.
+  double hard_max_d2 = -std::numeric_limits<double>::infinity();
+  // weight * strain >= 0 for every consumed pair: the running sum never
+  // decreases, so it exceeds a bound at some pair iff it does at the end.
+  bool monotone = true;
+  std::vector<double> weight;
+  std::vector<double> strain;
+};
+
+struct PbctopoSearchPrefixDepthTables {
+  bool usable = false;
+  // The pairs of the depth that the scan does not skip, in order.
+  std::vector<std::size_t> pair_indices;
+  std::vector<PbctopoSearchPrefixShiftTable> by_shift;
+};
+
+PbctopoSearchPrefixDepthTables build_search_prefix_depth_tables(
+    const std::vector<PbctopoAtom> &atoms,
+    const std::vector<std::size_t> &atom_component_index,
+    const std::vector<PbctopoContinuityPair> &continuity_pairs,
+    const std::vector<std::size_t> &pair_indices, std::size_t comp_idx,
+    std::size_t component_count, std::size_t shift_count) {
+  PbctopoSearchPrefixDepthTables tables;
+  if (pair_indices.empty() || comp_idx >= component_count)
+    return tables;
+  tables.pair_indices.reserve(pair_indices.size());
+  for (std::size_t pair_idx : pair_indices) {
+    if (pair_idx >= continuity_pairs.size())
+      continue;
+    const auto &pair = continuity_pairs[pair_idx];
+    if (pair.a >= atoms.size() || pair.b >= atoms.size() ||
+        pair.a >= atom_component_index.size() ||
+        pair.b >= atom_component_index.size()) {
+      continue;
+    }
+    if (atom_component_index[pair.a] != comp_idx ||
+        atom_component_index[pair.b] != comp_idx) {
+      return tables;
+    }
+    tables.pair_indices.push_back(pair_idx);
+  }
+  tables.by_shift.resize(shift_count);
+  tables.usable = true;
+  return tables;
+}
+
+void build_search_prefix_shift_table(
+    const std::vector<PbctopoAtom> &atoms, const PbctopoShift &shift,
+    const std::vector<PbctopoContinuityPair> &continuity_pairs,
+    const std::vector<std::size_t> &pair_indices, double hard_cutoff2,
+    PbctopoSearchPrefixShiftTable &table) {
+  table.built = true;
+  table.weight.reserve(pair_indices.size());
+  table.strain.reserve(pair_indices.size());
+  const auto &shift_a = shift;
+  const auto &shift_b = shift;
+  for (std::size_t pair_idx : pair_indices) {
+    const auto &pair = continuity_pairs[pair_idx];
+    const double dx = atoms[pair.a].x + shift_a.tx -
+                      atoms[pair.b].x - shift_b.tx;
+    const double dy = atoms[pair.a].y + shift_a.ty -
+                      atoms[pair.b].y - shift_b.ty;
+    const double dz = atoms[pair.a].z + shift_a.tz -
+                      atoms[pair.b].z - shift_b.tz;
+    const double d2 = dx * dx + dy * dy + dz * dz;
+    const bool hard_pair = pbctopo_continuity_is_hard(pair.kind);
+    if (hard_pair)
+      table.hard_max_d2 = std::max(table.hard_max_d2, d2);
+    if (pbctopo_continuity_hard_violation(pair, d2, hard_cutoff2)) {
+      table.hard_violation = true;
+      break;
+    }
+    const double strain = pbctopo_symmetric_reference_strain(d2, pair.ref_d2);
+    if (!(pair.weight * strain >= 0.0))
+      table.monotone = false;
+    table.weight.push_back(pair.weight);
+    table.strain.push_back(strain);
+  }
+  table.stop = table.weight.size();
+}
+
+// The running sums of up to four tables from one start value, each over its
+// own consumed pairs, without the incumbent test.  The sums are independent
+// chains, so four of them advance together.
+void accumulate_search_prefix_paths(
+    const PbctopoSearchPrefixShiftTable *const *tables, std::size_t count,
+    double start, double *path) {
+  std::size_t common = 0;
+  if (count == 4) {
+    common = std::min(std::min(tables[0]->stop, tables[1]->stop),
+                      std::min(tables[2]->stop, tables[3]->stop));
+    double p0 = start, p1 = start, p2 = start, p3 = start;
+    const double *w0 = tables[0]->weight.data();
+    const double *w1 = tables[1]->weight.data();
+    const double *w2 = tables[2]->weight.data();
+    const double *w3 = tables[3]->weight.data();
+    const double *s0 = tables[0]->strain.data();
+    const double *s1 = tables[1]->strain.data();
+    const double *s2 = tables[2]->strain.data();
+    const double *s3 = tables[3]->strain.data();
+    for (std::size_t k = 0; k < common; ++k) {
+      p0 += w0[k] * s0[k];
+      p1 += w1[k] * s1[k];
+      p2 += w2[k] * s2[k];
+      p3 += w3[k] * s3[k];
+    }
+    path[0] = p0;
+    path[1] = p1;
+    path[2] = p2;
+    path[3] = p3;
+  } else {
+    for (std::size_t t = 0; t < count; ++t)
+      path[t] = start;
+  }
+  for (std::size_t t = 0; t < count; ++t) {
+    const double *weight = tables[t]->weight.data();
+    const double *strain = tables[t]->strain.data();
+    double path_sum = path[t];
+    for (std::size_t k = common; k < tables[t]->stop; ++k)
+      path_sum += weight[k] * strain[k];
+    path[t] = path_sum;
+  }
+}
+
+// What consume_search_continuity_prefix_from_assignment does for one state
+// and one shift of the depth's component, from the shift's table.  path is
+// the state's sum over the table's consumed pairs without the incumbent
+// test.  Returns whether the child survives; on success path_sum and max_d2
+// are updated as that function updates them, and the counters as it counts.
+bool consume_search_prefix_table(const PbctopoSearchPrefixShiftTable &table,
+                                 const PbctopoComponentCandidate *incumbent,
+                                 double path, double &path_sum,
+                                 double &max_d2, PbctopoTimingStats *timing) {
+  const bool has_incumbent = incumbent != nullptr && incumbent->valid &&
+                             std::isfinite(incumbent->continuity_path);
+  if (has_incumbent &&
+      (!table.monotone || path > incumbent->continuity_path + 1.0e-6)) {
+    // The scan as written, with the incumbent test after every pair: it
+    // ends at the first pair whose sum exceeds the bound.
+    const double *weight = table.weight.data();
+    const double *strain = table.strain.data();
+    double running = path_sum;
+    for (std::size_t k = 0; k < table.stop; ++k) {
+      running += weight[k] * strain[k];
+      if (running > incumbent->continuity_path + 1.0e-6) {
+        if (timing != nullptr) {
+          timing->component_search_prefix_continuity_checks += k + 1;
+          ++timing->component_search_prefix_continuity_prunes;
+        }
+        return false;
+      }
+    }
+    path = running;
+  }
+  if (table.hard_violation) {
+    if (timing != nullptr) {
+      timing->component_search_prefix_continuity_checks += table.stop + 1;
+      ++timing->component_search_prefix_continuity_prunes;
+      ++timing->component_search_prefix_continuity_hard_rejects;
+    }
+    return false;
+  }
+  if (timing != nullptr)
+    timing->component_search_prefix_continuity_checks += table.stop;
+  path_sum = path;
+  max_d2 = std::max(max_d2, table.hard_max_d2);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Beam expansion on the executor.
+//
+// At one depth every beam state is expanded independently of the others: its
+// shift options are ordered, each option's continuity prefix is consumed, and
+// the surviving children are appended in option order.  The states read the
+// same pair table, prefix tables and incumbent and write nothing shared, so
+// one task per state runs on the executor and the children are concatenated
+// in state order: the same list the serial loop builds.  Each task counts
+// into its own timing block, added to the run's in state order.
+// ---------------------------------------------------------------------------
+bool beam_env_flag(const char *name, bool fallback) noexcept {
+  const char *value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0')
+    return fallback;
+  return !(value[0] == '0' || value[0] == 'n' || value[0] == 'N' ||
+           value[0] == 'f' || value[0] == 'F');
+}
+
+// TITAN_PBCTOPO_BEAM_PARALLEL=0 keeps the serial expansion;
+// TITAN_PBCTOPO_BEAM_PARALLEL_CHECK=1 stops the program if a state's
+// expansion wrote a timing field that add_beam_expansion_timing does not
+// carry over.
+bool beam_parallel_enabled() noexcept {
+  static const bool enabled = beam_env_flag("TITAN_PBCTOPO_BEAM_PARALLEL", true);
+  return enabled;
+}
+bool beam_parallel_check() noexcept {
+  static const bool check =
+      beam_env_flag("TITAN_PBCTOPO_BEAM_PARALLEL_CHECK", false);
+  return check;
+}
+
+// A timing block with every byte defined, so that two can be compared as
+// bytes.
+void reset_beam_task_timing(PbctopoTimingStats &timing) noexcept {
+  static_assert(std::is_trivially_copyable_v<PbctopoTimingStats>);
+  std::memset(static_cast<void *>(&timing), 0, sizeof(timing));
+  new (&timing) PbctopoTimingStats();
+}
+
+// The fields the expansion of one state writes
+// (build_component_search_shift_order and the option loop).  With move = true
+// the fields are also cleared in from.  A field the expansion starts writing
+// must be added here, or the parallel expansion drops it; the check flag
+// above finds such a field.
+void add_beam_expansion_timing(PbctopoTimingStats &into,
+                               PbctopoTimingStats &from, bool move) {
+  auto carry = [move](auto &dst, auto &src) {
+    dst += src;
+    if (move)
+      src = {};
+  };
+  carry(into.component_pair_table_prunes, from.component_pair_table_prunes);
+  carry(into.component_search_zero_current_mask_prunes,
+        from.component_search_zero_current_mask_prunes);
+  carry(into.component_search_zero_future_mask_prunes,
+        from.component_search_zero_future_mask_prunes);
+  carry(into.component_search_shift_warm_hits,
+        from.component_search_shift_warm_hits);
+  carry(into.component_shift_trials, from.component_shift_trials);
+  carry(into.component_large_mode_beam_expanded,
+        from.component_large_mode_beam_expanded);
+  carry(into.component_search_prefix_continuity_s,
+        from.component_search_prefix_continuity_s);
+  carry(into.component_search_prefix_continuity_checks,
+        from.component_search_prefix_continuity_checks);
+  carry(into.component_search_prefix_continuity_prunes,
+        from.component_search_prefix_continuity_prunes);
+  carry(into.component_search_prefix_continuity_hard_rejects,
+        from.component_search_prefix_continuity_hard_rejects);
+}
+
+void check_beam_task_timing_carried(PbctopoTimingStats &task_timing) {
+  PbctopoTimingStats sink;
+  reset_beam_task_timing(sink);
+  add_beam_expansion_timing(sink, task_timing, true);
+  PbctopoTimingStats untouched;
+  reset_beam_task_timing(untouched);
+  if (std::memcmp(static_cast<const void *>(&task_timing),
+                  static_cast<const void *>(&untouched),
+                  sizeof(PbctopoTimingStats)) != 0) {
+    std::fprintf(stderr, "[pbctopo] a beam expansion task wrote a timing "
+                         "field that is not carried to the run's timing "
+                         "(add_beam_expansion_timing)\n");
+    std::fflush(stderr);
+    std::abort();
+  }
 }
 
 PbctopoComponentPairShiftEntry compute_component_pair_shift_entry(
@@ -1236,19 +1515,78 @@ PbctopoComponentCandidate search_component_shift_candidate_beam(
     provisional_children.reserve(
         beam_states.size() * std::min<std::size_t>(beam_width, shifts.size()));
     const std::size_t actual_comp_idx = search_order[depth];
-    for (std::size_t state_idx = 0; state_idx < beam_states.size(); ++state_idx) {
+    // Pairs that close here and lie inside this depth's component cost the
+    // same for every state: one table per shift (see the tables above).
+    PbctopoSearchPrefixDepthTables prefix_tables;
+    if (depth < continuity_prefix.pairs_closing_at_depth.size()) {
+      prefix_tables = build_search_prefix_depth_tables(
+          atoms, atom_component_index, continuity_pairs,
+          continuity_prefix.pairs_closing_at_depth[depth], actual_comp_idx,
+          components.size(), shifts.size());
+    }
+    if (timing != nullptr &&
+        depth < timing->component_search_depth_visits.size()) {
+      timing->component_search_depth_visits[depth] += beam_states.size();
+    }
+    // The expansion of one state: its surviving children, in option order,
+    // appended to provisional_children; its counters go to timing.  The
+    // parameters named as the enclosing variables are the ones a task passes
+    // (its own block and list); the serial loop passes the enclosing ones.
+    const auto expand_state =
+        [&](std::size_t state_idx, PbctopoTimingStats *timing,
+            std::vector<const PbctopoSearchPrefixShiftTable *> &option_tables,
+            std::vector<double> &option_paths,
+            std::vector<PbctopoProvisionalBeamChild> &provisional_children) {
       const auto &state = beam_states[state_idx];
-      if (timing != nullptr &&
-          depth < timing->component_search_depth_visits.size()) {
-        ++timing->component_search_depth_visits[depth];
-      }
       const std::vector<PbctopoComponentSearchShiftOption> ordered_shifts =
           build_component_search_shift_order(
               shifts, actual_comp_idx, depth, search_order, state.selected_shift,
               state.allowed_masks, pair_table, state.min_pair_d2,
               state.clash_atom_a, state.clash_atom_b,
               normalized_warm_offsets_ptr, timing);
-      for (const auto &option : ordered_shifts) {
+      // With tables: the path sum of every option from this state first,
+      // four independent sums at a time.
+      bool use_prefix_tables =
+          prefix_tables.usable &&
+          actual_comp_idx < state.selected_shift.size();
+      if (use_prefix_tables) {
+        const auto prefix_started = std::chrono::steady_clock::now();
+        option_tables.assign(ordered_shifts.size(), nullptr);
+        option_paths.assign(ordered_shifts.size(), 0.0);
+        for (std::size_t o = 0; o < ordered_shifts.size(); ++o) {
+          const std::size_t shift_idx = ordered_shifts[o].shift_idx;
+          if (shift_idx >= shifts.size()) {
+            use_prefix_tables = false;
+            break;
+          }
+          PbctopoSearchPrefixShiftTable &table =
+              prefix_tables.by_shift[shift_idx];
+          if (!table.built) {
+            build_search_prefix_shift_table(
+                atoms, shifts[shift_idx], continuity_pairs,
+                prefix_tables.pair_indices, continuity_cutoff2, table);
+          }
+          option_tables[o] = &table;
+        }
+        if (use_prefix_tables) {
+          for (std::size_t o = 0; o < option_tables.size(); o += 4) {
+            const std::size_t count =
+                std::min<std::size_t>(4, option_tables.size() - o);
+            accumulate_search_prefix_paths(option_tables.data() + o, count,
+                                           state.continuity_path_prefix,
+                                           option_paths.data() + o);
+          }
+        }
+        if (timing != nullptr) {
+          timing->component_search_prefix_continuity_s +=
+              std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                            prefix_started)
+                  .count();
+        }
+      }
+      for (std::size_t option_idx = 0; option_idx < ordered_shifts.size();
+           ++option_idx) {
+        const auto &option = ordered_shifts[option_idx];
         if (timing != nullptr) {
           ++timing->component_shift_trials;
           ++timing->component_large_mode_beam_expanded;
@@ -1265,7 +1603,14 @@ PbctopoComponentCandidate search_component_shift_candidate_beam(
         child.warm_hits = state.warm_hits + (option.warm_priority ? 1u : 0u);
         child.continuity_path_prefix = state.continuity_path_prefix;
         child.continuity_max_d2_prefix = state.continuity_max_d2_prefix;
-        if (depth < continuity_prefix.pairs_closing_at_depth.size() &&
+        if (use_prefix_tables) {
+          if (!consume_search_prefix_table(
+                  *option_tables[option_idx], best.valid ? &best : nullptr,
+                  option_paths[option_idx], child.continuity_path_prefix,
+                  child.continuity_max_d2_prefix, timing)) {
+            continue;
+          }
+        } else if (depth < continuity_prefix.pairs_closing_at_depth.size() &&
             !consume_search_continuity_prefix_from_assignment(
                 atoms, atom_component_index, shifts, state.selected_shift,
                 continuity_pairs,
@@ -1277,6 +1622,88 @@ PbctopoComponentCandidate search_component_shift_candidate_beam(
           continue;
         }
         provisional_children.push_back(std::move(child));
+      }
+    };
+    TitanExecutor *expansion_executor = callbacks.executor;
+    const bool parallel_expansion =
+        beam_parallel_enabled() && expansion_executor != nullptr &&
+        expansion_executor->capacity() > 1 &&
+        !expansion_executor->in_worker() && beam_states.size() >= 4;
+    if (!parallel_expansion) {
+      std::vector<const PbctopoSearchPrefixShiftTable *> option_tables;
+      std::vector<double> option_paths;
+      for (std::size_t state_idx = 0; state_idx < beam_states.size();
+           ++state_idx) {
+        expand_state(state_idx, timing, option_tables, option_paths,
+                     provisional_children);
+      }
+    } else {
+      // What the tasks share is completed first, so that they only read it:
+      // the prefix table of every shift some state may try, and the pair
+      // table's cached masks of those shifts against the later components.
+      std::vector<unsigned char> shift_in_use(shifts.size(), 0);
+      for (const auto &state : beam_states) {
+        if (actual_comp_idx >= state.allowed_masks.size())
+          continue;
+        state.allowed_masks[actual_comp_idx].for_each_set_bit(
+            [&](std::size_t shift_idx) {
+              if (shift_idx < shift_in_use.size())
+                shift_in_use[shift_idx] = 1;
+            });
+      }
+      for (std::size_t shift_idx = 0; shift_idx < shifts.size(); ++shift_idx) {
+        if (shift_in_use[shift_idx] == 0)
+          continue;
+        if (prefix_tables.usable && !prefix_tables.by_shift[shift_idx].built) {
+          build_search_prefix_shift_table(
+              atoms, shifts[shift_idx], continuity_pairs,
+              prefix_tables.pair_indices, continuity_cutoff2,
+              prefix_tables.by_shift[shift_idx]);
+        }
+        for (std::size_t future_depth = depth + 1;
+             future_depth < search_order.size(); ++future_depth) {
+          (void)pair_table.compat_mask(actual_comp_idx, shift_idx,
+                                       search_order[future_depth]);
+        }
+      }
+      struct ExpansionTask {
+        std::vector<PbctopoProvisionalBeamChild> children;
+        PbctopoTimingStats timing;
+        PbctopoLatticeQueryAudit audit;
+      };
+      std::vector<ExpansionTask> tasks(beam_states.size());
+      expansion_executor->parallel_for(
+          tasks.size(), expansion_executor->capacity(), 1,
+          [&](std::size_t, std::size_t begin, std::size_t end) {
+            std::vector<const PbctopoSearchPrefixShiftTable *> option_tables;
+            std::vector<double> option_paths;
+            for (std::size_t state_idx = begin; state_idx < end; ++state_idx) {
+              ExpansionTask &task = tasks[state_idx];
+              const PbctopoLatticeQueryAudit audit_before =
+                  pbctopo_lattice_query_audit();
+              if (timing != nullptr)
+                reset_beam_task_timing(task.timing);
+              expand_state(state_idx,
+                           timing != nullptr ? &task.timing : nullptr,
+                           option_tables, option_paths, task.children);
+              task.audit = pbctopo_lattice_query_audit_delta(
+                  audit_before, pbctopo_lattice_query_audit());
+              pbctopo_reset_lattice_query_audit();
+              pbctopo_add_lattice_query_audit(audit_before);
+            }
+          });
+      for (ExpansionTask &task : tasks) {
+        pbctopo_add_lattice_query_audit(task.audit);
+        if (timing != nullptr) {
+          const bool check = beam_parallel_check();
+          add_beam_expansion_timing(*timing, task.timing, check);
+          if (check)
+            check_beam_task_timing_carried(task.timing);
+        }
+        provisional_children.insert(
+            provisional_children.end(),
+            std::make_move_iterator(task.children.begin()),
+            std::make_move_iterator(task.children.end()));
       }
     }
     if (provisional_children.empty()) {

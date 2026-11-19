@@ -1,5 +1,7 @@
 #include "pbctopo/solve/solver.h"
 
+#include "pbctopo/anchor_mst_rigid.h"
+
 #include "Multi_MOL.h"
 #include "titan_executor.h"
 
@@ -36,6 +38,12 @@ void PbctopoFrameSolver::ensure_component_context() {
             static_cast<size_t>(component_context_shell_radius));
     timing.component_image_shell_max_shift_count =
         max(timing.component_image_shell_max_shift_count, shifts.size());
+    // Component placements translate component_atoms component by component.
+    base_anchor_context.rigid_anchor_mst =
+        titan_pbctopo::make_pbctopo_rigid_anchor_mst(component_atoms,
+                                                     components);
+  } else {
+    base_anchor_context.rigid_anchor_mst.reset();
   }
   component_context_ready = true;
   ++timing.component_context_builds;

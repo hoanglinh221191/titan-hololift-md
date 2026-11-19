@@ -4,13 +4,13 @@
 # Tích hợp Auto Dependency Tracking (.d)
 # ==========================================
 
-# Source export of TITAN commit 8758139ee163 for HoloLift 1.2.0: the build stamp names that commit,
+# Source export of TITAN commit d859c145c36b for HoloLift 1.2.1: the build stamp names that commit,
 # and the portable profile (AVX2/FMA) is the default.
-export TITAN_GIT_COMMIT = 8758139ee1637ab977b407679aa385f58246b0b7
-export TITAN_BUILD_NUMBER = 458
+export TITAN_GIT_COMMIT = d859c145c36b290611bfbcd27877862c0fd79a87
+export TITAN_BUILD_NUMBER = 464
 export TITAN_GIT_DIRTY = false
 export TITAN_RELEASE_BUILD = false
-export SOURCE_DATE_EPOCH = 1795001813
+export SOURCE_DATE_EPOCH = 1795098715
 PROFILE ?= portable
 TOOLCHAIN ?= auto
 TITAN_CXX23_FLOOR ?= clang20-gxx13

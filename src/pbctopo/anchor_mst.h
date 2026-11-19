@@ -36,6 +36,17 @@ bool anchor_graph_metrics_dense_prim(
 
 inline constexpr std::size_t kAnchorMstFusedMinAnchors = 256;
 
+// The relaxation kernel of the dense scan, best[i] = min(best[i], |s - p_i|^2)
+// for i < n, as the scan dispatches it; for code that must reproduce the
+// scan's keys (anchor_mst_rigid.cpp).
+void pbctopo_anchor_relax_keys(double *best, const double *px,
+                               const double *py, const double *pz,
+                               std::size_t n, double sx, double sy,
+                               double sz) noexcept;
+
+// Whether that kernel is the AVX2+FMA one.
+bool pbctopo_anchor_kernel_is_avx2_fma() noexcept;
+
 // Process-wide counters of the two paths, for the run log.
 struct PbctopoAnchorMstCounters {
   std::uint64_t dense_calls = 0;
